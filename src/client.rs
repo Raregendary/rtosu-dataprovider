@@ -86,6 +86,11 @@ pub fn is_tournament_manager_cmd(cmd: &str) -> bool {
     lower.contains("-go") || lower.contains("/go") || lower.contains("tourney") || lower.contains("tournament")
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ModEntry {
+    pub acronym: String,
+}
+
 pub fn format_mods(mods: u32) -> String {
     let mut res = String::new();
     if mods & 1 != 0 { res.push_str("NF"); }
@@ -93,7 +98,11 @@ pub fn format_mods(mods: u32) -> String {
     if mods & 4 != 0 { res.push_str("TD"); }
     if mods & 8 != 0 { res.push_str("HD"); }
     if mods & 16 != 0 { res.push_str("HR"); }
-    if mods & 32 != 0 { res.push_str("SD"); }
+    if mods & 16384 != 0 {
+        res.push_str("PF");
+    } else if mods & 32 != 0 {
+        res.push_str("SD");
+    }
     if mods & 512 != 0 {
         res.push_str("NC");
     } else if mods & 64 != 0 {
@@ -102,13 +111,41 @@ pub fn format_mods(mods: u32) -> String {
     if mods & 128 != 0 { res.push_str("RX"); }
     if mods & 256 != 0 { res.push_str("HT"); }
     if mods & 1024 != 0 { res.push_str("FL"); }
-    if mods & 2048 != 0 { res.push_str("AT"); }
+    if mods & (1 << 22) != 0 {
+        res.push_str("CN");
+    } else if mods & 2048 != 0 {
+        res.push_str("AT");
+    }
     if mods & 4096 != 0 { res.push_str("SO"); }
     if mods & 8192 != 0 { res.push_str("AP"); }
-    if mods & 16384 != 0 { res.push_str("PF"); }
-    if mods & (1 << 22) != 0 { res.push_str("CN"); }
+    if mods & (1 << 15) != 0 { res.push_str("4K"); }
+    if mods & (1 << 16) != 0 { res.push_str("5K"); }
+    if mods & (1 << 17) != 0 { res.push_str("6K"); }
+    if mods & (1 << 18) != 0 { res.push_str("7K"); }
+    if mods & (1 << 19) != 0 { res.push_str("8K"); }
+    if mods & (1 << 20) != 0 { res.push_str("FI"); }
+    if mods & (1 << 21) != 0 { res.push_str("RD"); }
+    if mods & (1 << 23) != 0 { res.push_str("TG"); }
+    if mods & (1 << 24) != 0 { res.push_str("9K"); }
+    if mods & (1 << 25) != 0 { res.push_str("10K"); }
+    if mods & (1 << 26) != 0 { res.push_str("1K"); }
+    if mods & (1 << 27) != 0 { res.push_str("3K"); }
+    if mods & (1 << 28) != 0 { res.push_str("2K"); }
     if mods & (1 << 29) != 0 { res.push_str("V2"); }
+    if mods & (1 << 30) != 0 { res.push_str("MR"); }
     res
+}
+
+pub fn mod_acronyms(mods: u32) -> Vec<ModEntry> {
+    let s = format_mods(mods);
+    let mut entries = Vec::new();
+    let mut chars = s.chars().peekable();
+    while let (Some(a), Some(b)) = (chars.next(), chars.next()) {
+        entries.push(ModEntry {
+            acronym: format!("{a}{b}"),
+        });
+    }
+    entries
 }
 
 pub fn calculate_grade(
