@@ -1,0 +1,42 @@
+{
+  "id": "tournament",
+  "display_name": "osu! tournament client",
+  "process_names": ["osu!.Tourney.exe", "osu!.Tournament.exe", "osu!Arcade.exe", "osu!.exe"],
+  "module_names": ["osu!.Tourney.exe", "osu!.Tournament.exe", "osu!Arcade.exe", "osu!.exe"],
+  "source_revision": "61c2581",
+  "pointer_width": 4,
+  "pointer_chains": {},
+  "patterns": {
+    "base_addr": "F8 01 74 04 83 65",
+    "play_time_addr": "5E 5F 5D C3 A1 ?? ?? ?? ?? 89 ?? 04",
+    "chat_checker_ptr": "8B CE 83 3D ?? ?? ?? ?? 00 75 ?? 80",
+    "skin_data_addr": "74 2C 85 FF 75 28 A1 ?? ?? ?? ?? 8D 15",
+    "settings_class_addr": "83 E0 20 85 C0 7E 2F",
+    "configuration_addr": "8D 45 EC 50 8B 0D ?? ?? ?? ?? 8B D7 39 09 E8 ?? ?? ?? ?? 85 C0 74 ?? 8B 4D EC",
+    "bindings_addr": "8D 7D D0 B9 08 00 00 00 33 C0 F3 AB 8B CE 89 4D DC B9",
+    "rulesets_addr": "7D 15 A1 ?? ?? ?? ?? 85 C0",
+    "can_run_slowly_addr": "55 8B EC 80 3D ?? ?? ?? ?? 00 75 26 80 3D",
+    "status_ptr": "48 83 F8 04 73 1E",
+    "menu_mods_ptr": "C8 FF ?? ?? ?? ?? ?? 81 0D ?? ?? ?? ?? ?? 08 00 00",
+    "get_audio_length_ptr": "55 8B EC 83 EC 08 A1 ?? ?? ?? ?? 85 C0",
+    "user_profile_ptr": "FF 15 ?? ?? ?? ?? A1 ?? ?? ?? ?? 8B 48 54 33 D2",
+    "raw_login_status_ptr": "B8 0B 00 00 8B 35",
+    "spectating_user_ptr": "8B 0D ?? ?? ?? ?? 85 C0 74 05 8B 50 30",
+    "game_time_ptr": "A1 ?? ?? ?? ?? 89 46 04 8B D6 E8",
+    "tournament_chat_engine": "A1 ?? ?? ?? ?? 89 45 F0 8B D1 85 C9 75",
+    "mania_speed": "A3 ?? ?? ?? ?? EB ?? DD 45 08 DB 5D E8 8B 45 E8 83 F8 28"
+  },
+  "pattern_offsets": {
+    "chat_checker_ptr": 4,
+    "configuration_addr": 6,
+    "bindings_addr": 42,
+    "status_ptr": -4,
+    "menu_mods_ptr": 9,
+    "get_audio_length_ptr": 7,
+    "user_profile_ptr": 7,
+    "raw_login_status_ptr": -11,
+    "spectating_user_ptr": -4,
+    "game_time_ptr": 1,
+    "tournament_chat_engine": 1
+  }
+}

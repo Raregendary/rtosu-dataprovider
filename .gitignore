@@ -1,0 +1,4 @@
+/target
+/references/tosu
+__pycache__/
+!/Cargo.lock

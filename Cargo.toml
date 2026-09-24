@@ -1,0 +1,28 @@
+[package]
+name = "osumemoryreading"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+default = []
+rosu-mem = ["dep:rosu-mem"]
+rosu-memory = ["rosu-mem"]
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rosu-mem = { version = "3.0", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
