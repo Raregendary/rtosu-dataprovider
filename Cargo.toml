@@ -6,6 +6,7 @@ publish = false
 
 [features]
 default = []
+pp = ["dep:rosu-pp", "dep:rosu-mods"]
 rosu-mem = ["dep:rosu-mem"]
 rosu-memory = ["rosu-mem"]
 
@@ -16,6 +17,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = "0.8"
 rosu-mem = { version = "3.0", optional = true }
+rosu-pp = { git = "https://github.com/Raregendary/rosu-pp-gemini", optional = true }
+rosu-mods = { version = "0.4.1", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
