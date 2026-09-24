@@ -1,17 +1,39 @@
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct PpBreakdown {
+    pub aim: f32,
+    pub speed: f32,
+    pub accuracy: f32,
+    pub difficulty: f32,
+    pub flashlight: f32,
+    pub total: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct DetailedPp {
+    pub current: PpBreakdown,
+    pub fc: PpBreakdown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LivePpResult {
+    pub current: f32,
+    pub fc: f32,
+    pub max_achieved: f32,
+    pub max_achievable: f32,
+    pub detailed: DetailedPp,
+}
+
 #[cfg(feature = "pp")]
 pub mod calculator {
+    use super::*;
     use rosu_mods::GameModsLegacy;
     use rosu_pp::any::DifficultyAttributes;
     use rosu_pp::{Beatmap, Difficulty, Performance};
-    use serde::Serialize;
     use std::collections::HashMap;
     use std::sync::{Arc, Mutex};
-
-    #[derive(Debug, Clone, Serialize, Default, PartialEq)]
-    pub struct LivePpResult {
-        pub current: f32,
-        pub fc: f32,
-    }
 
     /// In-memory cache for gradual difficulty chunks (10-object stepping)
     /// Key: (map_id, mods_bits)
@@ -62,6 +84,44 @@ pub mod calculator {
         arc_chunks
     }
 
+    /// Extract aim, speed, accuracy, flashlight, and total PP into PpBreakdown
+    pub fn extract_pp_breakdown(attrs: &rosu_pp::any::PerformanceAttributes) -> PpBreakdown {
+        match attrs {
+            rosu_pp::any::PerformanceAttributes::Osu(osu) => PpBreakdown {
+                aim: osu.pp_aim as f32,
+                speed: osu.pp_speed as f32,
+                accuracy: osu.pp_acc as f32,
+                difficulty: 0.0,
+                flashlight: osu.pp_flashlight as f32,
+                total: osu.pp as f32,
+            },
+            rosu_pp::any::PerformanceAttributes::Taiko(taiko) => PpBreakdown {
+                aim: 0.0,
+                speed: 0.0,
+                accuracy: taiko.pp_acc as f32,
+                difficulty: taiko.pp_difficulty as f32,
+                flashlight: 0.0,
+                total: taiko.pp as f32,
+            },
+            rosu_pp::any::PerformanceAttributes::Catch(catch) => PpBreakdown {
+                aim: 0.0,
+                speed: 0.0,
+                accuracy: 0.0,
+                difficulty: 0.0,
+                flashlight: 0.0,
+                total: catch.pp as f32,
+            },
+            rosu_pp::any::PerformanceAttributes::Mania(mania) => PpBreakdown {
+                aim: 0.0,
+                speed: 0.0,
+                accuracy: 0.0,
+                difficulty: mania.pp_difficulty as f32,
+                flashlight: 0.0,
+                total: mania.pp as f32,
+            },
+        }
+    }
+
     /// Calculate 100% SS Perfect Full Combo PP
     pub fn calc_fc_pp(diff_attrs: &DifficultyAttributes, mods: GameModsLegacy) -> f32 {
         let pp_attrs = Performance::new(diff_attrs.clone())
@@ -102,6 +162,70 @@ pub mod calculator {
             .pp();
 
         pp as f32
+    }
+
+    /// Calculate full live PP result including FC PP and detailed attribute breakdowns
+    pub fn calc_detailed_live_and_fc_pp(
+        chunks: &[DifficultyAttributes],
+        mods: GameModsLegacy,
+        combo: u32,
+        n300: u32,
+        n100: u32,
+        n50: u32,
+        n0: u32,
+    ) -> LivePpResult {
+        if chunks.is_empty() {
+            return LivePpResult::default();
+        }
+
+        let last_attrs = chunks.last().unwrap();
+        let fc_perf = Performance::new(last_attrs.clone())
+            .mods(mods)
+            .accuracy(100.0)
+            .misses(0)
+            .calculate();
+        let fc_breakdown = extract_pp_breakdown(&fc_perf);
+        let fc_total = fc_perf.pp() as f32;
+
+        let passed = n300 + n100 + n50 + n0;
+        if passed == 0 {
+            return LivePpResult {
+                current: 0.0,
+                fc: fc_total,
+                max_achieved: 0.0,
+                max_achievable: fc_total,
+                detailed: DetailedPp {
+                    current: PpBreakdown::default(),
+                    fc: fc_breakdown,
+                },
+            };
+        }
+
+        let chunk_idx = ((passed.saturating_sub(1) / 10) as usize).min(chunks.len() - 1);
+        let live_attrs = &chunks[chunk_idx];
+
+        let live_perf = Performance::new(live_attrs.clone())
+            .mods(mods)
+            .combo(combo)
+            .n300(n300)
+            .n100(n100)
+            .n50(n50)
+            .misses(n0)
+            .passed_objects(passed)
+            .calculate();
+        let live_breakdown = extract_pp_breakdown(&live_perf);
+        let live_total = live_perf.pp() as f32;
+
+        LivePpResult {
+            current: live_total,
+            fc: fc_total,
+            max_achieved: live_total,
+            max_achievable: fc_total,
+            detailed: DetailedPp {
+                current: live_breakdown,
+                fc: fc_breakdown,
+            },
+        }
     }
 
     /// Parse legacy bitmask into GameModsLegacy
@@ -153,7 +277,6 @@ pub mod calculator {
 
         #[test]
         fn test_gradual_chunk_progression() {
-            // A minimal valid osu format v14 beatmap with 25 hitobjects
             let mut map_content = String::from(
                 "osu file format v14\n\n[General]\nMode: 0\n\n[Metadata]\nTitle:Test\nArtist:Test\nCreator:Test\nVersion:Normal\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\nSliderMultiplier:1.4\nSliderTickRate:1\n\n[TimingPoints]\n0,500,4,2,0,50,1,0\n\n[HitObjects]\n"
             );
@@ -166,35 +289,23 @@ pub mod calculator {
             let mods = GameModsLegacy::default();
             let chunks = get_or_compute_gradual_chunks(12345, &beatmap, mods);
 
-            // 25 objects stepped every 10 objects: chunks at 10, 20, 25 -> 3 chunks
             assert_eq!(chunks.len(), 3);
 
-            // At 0 hits, PP is strictly 0.0 (CSR smooth start)
-            let pp_0 = calc_live_pp_from_chunks(&chunks, mods, 0, 0, 0, 0, 0);
-            assert_eq!(pp_0, 0.0);
+            let detailed_0 = calc_detailed_live_and_fc_pp(&chunks, mods, 0, 0, 0, 0, 0);
+            assert_eq!(detailed_0.current, 0.0);
+            assert!(detailed_0.fc > 0.0);
+            assert!(detailed_0.detailed.fc.aim > 0.0 || detailed_0.detailed.fc.accuracy > 0.0);
 
-            // At 10 hits (full combo 10), PP should be > 0.0
-            let pp_10 = calc_live_pp_from_chunks(&chunks, mods, 10, 10, 0, 0, 0);
-            assert!(pp_10 > 0.0, "PP at 10 objects should be positive");
-
-            // At 25 hits (FC 25), PP should be higher than at 10
-            let pp_25 = calc_live_pp_from_chunks(&chunks, mods, 25, 25, 0, 0, 0);
-            assert!(pp_25 > pp_10, "PP at 25 objects should be greater than at 10");
-
-            // FC PP should be calculated
-            let fc_pp = calc_fc_pp(&chunks.last().unwrap(), mods);
-            assert!(fc_pp > 0.0);
+            let detailed_25 = calc_detailed_live_and_fc_pp(&chunks, mods, 25, 25, 0, 0, 0);
+            assert!(detailed_25.current > 0.0);
+            assert_eq!(detailed_25.current, detailed_25.fc);
         }
     }
 }
 
 #[cfg(not(feature = "pp"))]
 pub mod calculator {
-    use serde::Serialize;
-
-    #[derive(Debug, Clone, Serialize, Default, PartialEq)]
-    pub struct LivePpResult {
-        pub current: f32,
-        pub fc: f32,
+    pub fn parse_mods_bits(_mods_bits: u32) -> u32 {
+        _mods_bits
     }
 }

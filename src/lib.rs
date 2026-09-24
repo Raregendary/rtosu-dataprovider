@@ -1,4 +1,5 @@
 pub mod address;
+pub mod beatmap;
 pub mod client;
 pub mod config;
 pub mod pattern;
