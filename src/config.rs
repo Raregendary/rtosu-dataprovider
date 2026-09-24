@@ -52,8 +52,6 @@ pub struct FeatureConfig {
     pub enable_mods_decryption: bool,
     /// Optional real-time PP calculation (requires feature 'rosu-mem' or 'pp')
     pub enable_pp: bool,
-    /// Custom osu! songs folder path (leave empty for auto-detection)
-    pub songs_folder: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,7 +103,6 @@ impl Default for FeatureConfig {
             enable_chat: true,
             enable_mods_decryption: true,
             enable_pp: false,
-            songs_folder: None,
         }
     }
 }
@@ -247,10 +244,6 @@ enable_mods_decryption = true
 # Enable real-time PP calculation (requires 'pp' feature).
 # Default: false
 enable_pp = false
-
-# Optional path to your osu! Songs directory (leave blank for automatic detection).
-# Example: "D:\\osu\\Songs"
-# songs_folder = ""
 
 
 [logging]

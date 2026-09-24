@@ -64,10 +64,6 @@ enable_mods_decryption = true
 # Default: false
 enable_pp = false
 
-# Optional path to your osu! Songs directory (leave blank for automatic detection).
-# Example: "D:\\osu\\Songs"
-# songs_folder = ""
-
 
 [logging]
 # Logging verbosity level.
