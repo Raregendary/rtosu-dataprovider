@@ -7,6 +7,7 @@ use osumemoryreading::client::{snapshot_process, snapshot_processes};
 use osumemoryreading::pattern::BytePattern;
 use osumemoryreading::process::{ProcessMemory, list_modules, list_processes, module_or_main};
 use osumemoryreading::profile::{available_profiles, load_profile};
+use osumemoryreading::config::{AppConfig, DEFAULT_CONFIG_FILE};
 use osumemoryreading::session::TournamentSession;
 use osumemoryreading::tournament::read_tournament_state;
 use std::time::Duration;
@@ -15,11 +16,13 @@ use std::time::Duration;
 #[command(
     name = "osumemoryreading",
     version,
-    about = "Experimental osu! process memory reader"
+    about = "High-performance osu! process memory reader and tosu replacement"
 )]
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    #[arg(short, long, global = true, help = "Path to custom configuration file")]
+    config: Option<String>,
     #[arg(long, global = true, value_parser = parse_pointer_width)]
     pointer_width: Option<usize>,
 }
@@ -140,6 +143,24 @@ enum Command {
         process: String,
         pattern: String,
     },
+    /// View, validate, or generate configuration file
+    Config {
+        #[command(subcommand)]
+        action: Option<ConfigAction>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ConfigAction {
+    /// Display the currently active configuration
+    Show,
+    /// Create a fresh documented config.toml file
+    Init {
+        #[arg(default_value = DEFAULT_CONFIG_FILE)]
+        path: String,
+    },
+    /// Validate the active configuration file
+    Validate,
 }
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
@@ -154,10 +175,17 @@ enum ValueKind {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    execute(cli.command, cli.pointer_width)
+    let config_path = cli.config.as_deref().unwrap_or(DEFAULT_CONFIG_FILE);
+    let config = AppConfig::load_or_init(config_path)?;
+    execute(cli.command, cli.pointer_width, config, cli.config.as_deref())
 }
 
-fn execute(command: Command, pointer_width: Option<usize>) -> Result<()> {
+fn execute(
+    command: Command,
+    pointer_width: Option<usize>,
+    config: AppConfig,
+    custom_config_path: Option<&str>,
+) -> Result<()> {
     match command {
         Command::Processes { name } => {
             let processes = list_processes(name.as_deref())?;
@@ -445,6 +473,24 @@ fn execute(command: Command, pointer_width: Option<usize>) -> Result<()> {
         Command::RosuMemSignature { process, pattern } => {
             let address = osumemoryreading::rosu_mem::find_signature(&process, &pattern)?;
             println!("{}", format_address(address));
+        }
+        Command::Config { action } => {
+            let active_path = custom_config_path.unwrap_or(DEFAULT_CONFIG_FILE);
+            match action.unwrap_or(ConfigAction::Show) {
+                ConfigAction::Show => {
+                    println!("Active configuration (from '{}'):\n", active_path);
+                    let toml_str = toml::to_string_pretty(&config)?;
+                    println!("{toml_str}");
+                }
+                ConfigAction::Init { path } => {
+                    config.save_default_template(&path)?;
+                    println!("Created documented configuration template at: {path}");
+                }
+                ConfigAction::Validate => {
+                    config.validate()?;
+                    println!("Configuration at '{}' is valid and within safe limits!", active_path);
+                }
+            }
         }
     }
     Ok(())

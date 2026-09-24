@@ -1,0 +1,80 @@
+# ==============================================================================
+# OsuMemoryReading - Configuration File
+# A high-performance native Rust memory reader and drop-in tosu replacement.
+# ==============================================================================
+
+[server]
+# Network interface host address to bind to.
+# Default: "127.0.0.1" (localhost)
+# Use "0.0.0.0" to allow other devices on your local network to access the overlay.
+host = "127.0.0.1"
+
+# Listening port for tosu HTTP and WebSocket replacement.
+# Default: 24050
+# Range: 1024 to 65535
+port = 24050
+
+# Allow Cross-Origin Resource Sharing (CORS) from any origin.
+# Necessary for browser-based stream overlays (OBS, Streamlabs, Chrome).
+# Default: true
+cors_allow_all = true
+
+# Enable real-time WebSocket streaming on ws://<host>:<port>/websocket/v2
+# Default: true
+enable_websocket = true
+
+# Enable HTTP REST endpoints on http://<host>:<port>/json/v2 and /health
+# Default: true
+enable_http = true
+
+
+[poll]
+# Polling update frequency in Hertz (updates per second).
+# 60 Hz = ~16.6 ms per update
+# 120 Hz = ~8.3 ms per update
+# Default: 60
+# Range: 1 to 1000 Hz
+poll_rate_hz = 60
+
+# Maximum memory scan search budget in Megabytes per osu! process.
+# Default: 128 MB
+# Range: 16 to 1024 MB
+scan_budget_mb = 128
+
+# Memory signature profile to load.
+# Options: "tournament", "stable"
+# Default: "tournament"
+default_profile = "tournament"
+
+# Automatically detect and switch between Single-Player Mode and Tournament Mode.
+# Default: true
+auto_mode = true
+
+
+[features]
+# Extract and parse multiplayer tournament chat logs from memory.
+# Default: true
+enable_chat = true
+
+# Decode XOR-encrypted active mods in memory (HD, HR, DT, FL, AT, ScoreV2, etc.).
+# Default: true
+enable_mods_decryption = true
+
+# Enable real-time PP calculation (requires 'pp' feature).
+# Default: false
+enable_pp = false
+
+# Optional path to your osu! Songs directory (leave blank for automatic detection).
+# Example: "D:\\osu\\Songs"
+# songs_folder = ""
+
+
+[logging]
+# Logging verbosity level.
+# Options: "trace", "debug", "info", "warn", "error"
+# Default: "info"
+level = "info"
+
+# Save logs to a file in the logs/ directory.
+# Default: false
+log_to_file = false

@@ -10,11 +10,17 @@ This roadmap outlines the milestones required to transform `osumemoryreading` in
   - [x] Ultra-fast PEB command-line extraction via `NtQueryInformationProcess(ProcessWow64Information)` (<0.05 ms).
   - [x] IPC client extraction, automatic `ipc_id` sorting (0..5), and left/right team splitting.
   - [x] Mod decryption via XOR formula `(scoreBase + 0x1c) + 0xc ^ (scoreBase + 0x1c) + 0x8` and ScoreV2 bitflag (`1 << 29`).
+  - [x] Complete 31-bit mod flag table with mutual exclusivity (NC overrides DT, PF overrides SD, CN overrides AT) and tosu `play.mods.array` support.
   - [x] Accurate grade/rank calculation (SS, S, A, B, C, D) based on accuracy, hits, and HP.
   - [x] Tournament manager state (IPC states 1, 3, 4; best of, scores, star counts, team names).
   - [x] `#multiplayer` tournament chat extraction and automatic team message attribution.
   - [x] High-performance `TournamentSession` caching: steady-state poll latency reduced from **14,000 ms -> 9.4 ms** (~1,500x speedup).
   - [x] Live end-to-end comparison vs tosu (`cargo run --release -- compare-tosu`) validated on active 3v3 match.
+- [x] **Configuration System (`config.toml`)**:
+  - [x] TOML-based configuration file (`config.toml`) with serde serialization/deserialization.
+  - [x] Exhaustive in-file comments explaining every variable, default values, and valid min/max ranges.
+  - [x] CLI commands: `config show`, `config init`, and `config validate`.
+  - [x] Global `--config <path>` flag support.
 
 ---
 

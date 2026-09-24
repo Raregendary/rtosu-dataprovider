@@ -1,5 +1,6 @@
 pub mod address;
 pub mod client;
+pub mod config;
 pub mod pattern;
 pub mod process;
 pub mod profile;
