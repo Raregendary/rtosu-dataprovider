@@ -118,8 +118,7 @@ pub mod calculator {
         let stripped = clean
             .replace("SCOREV2", "")
             .replace("SV2", "")
-            .replace("V2", "")
-            .replace("NF", "");
+            .replace("V2", "");
         stripped.trim().parse().unwrap_or_default()
     }
 
@@ -140,6 +139,10 @@ pub mod calculator {
             assert!(hdhr.contains(GameModsLegacy::Hidden));
             assert!(hdhr.contains(GameModsLegacy::HardRock));
             assert!(!hdhr.contains(GameModsLegacy::DoubleTime));
+
+            let nf = parse_legacy_mods("HDNF");
+            assert!(nf.contains(GameModsLegacy::Hidden));
+            assert!(nf.contains(GameModsLegacy::NoFail));
 
             let nm = parse_legacy_mods("NM");
             assert_eq!(nm.bits(), 0);
