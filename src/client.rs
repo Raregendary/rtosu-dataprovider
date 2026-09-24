@@ -99,10 +99,14 @@ pub fn format_mods(mods: u32) -> String {
     } else if mods & 64 != 0 {
         res.push_str("DT");
     }
+    if mods & 128 != 0 { res.push_str("RX"); }
     if mods & 256 != 0 { res.push_str("HT"); }
     if mods & 1024 != 0 { res.push_str("FL"); }
+    if mods & 2048 != 0 { res.push_str("AT"); }
     if mods & 4096 != 0 { res.push_str("SO"); }
+    if mods & 8192 != 0 { res.push_str("AP"); }
     if mods & 16384 != 0 { res.push_str("PF"); }
+    if mods & (1 << 22) != 0 { res.push_str("CN"); }
     if mods & (1 << 29) != 0 { res.push_str("V2"); }
     res
 }
