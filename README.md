@@ -16,7 +16,7 @@ A lightweight native Rust data provider emitting **[tosu](https://github.com/Kot
 - **Low CPU Overhead**: Uses **~3x–5x less CPU** than tosu during active gameplay.
 - **tosu v2 Compatible**: Serves the exact tosu v2 JSON payload on `GET /json/v2` and broadcasts 60 Hz real-time state updates over `WS /websocket/v2`.
 - **Solo & Tournament Support**: Supports both standard gameplay and multi-client tournament setups (3v3, 4v4, etc.) with automatic team splitting (`left` / `right`), score aggregation, and `#multiplayer` chat extraction.
-- **Modern Performance Calculation**: Optional gradual PP calculation powered by `rosu-pp` with modern Combo Scaling Removal (CSR) rework support.
+- **Modern Performance Calculation**: Built-in gradual PP calculation powered by `rosu-pp` with modern Combo Scaling Removal (CSR) rework support.
 
 ---
 
@@ -40,7 +40,7 @@ A lightweight native Rust data provider emitting **[tosu](https://github.com/Kot
   - Team score aggregation, star counts, and match status.
   - `#multiplayer` tournament chat extraction with team attribution.
 - **Performance Engine**:
-  - Optional `pp` feature with `rosu-pp`.
+  - Built-in PP calculation powered by `rosu-pp`.
   - 10-object stepping gradual PP calculation.
   - Precalculated 90%–100% accuracy table and strain graph generation.
 
@@ -58,17 +58,17 @@ A lightweight native Rust data provider emitting **[tosu](https://github.com/Kot
 git clone https://github.com/Raregendary/rtosu-dataprovider.git
 cd rtosu-dataprovider
 
-# Build the release binary with PP calculation support
-cargo build --release --features pp
+# Build the release binary
+cargo build --release
 ```
 
 ### Running the Server
 ```powershell
 # Run on default port 24050 (drop-in tosu port)
-cargo run --release --features pp -- serve --port 24050
+cargo run --release -- serve --port 24050
 
 # Or run on a custom port
-cargo run --release --features pp -- serve --port 24055
+cargo run --release -- serve --port 24055
 ```
 
 ---
@@ -100,7 +100,7 @@ You can embed `rtosu-dataprovider` directly into other Rust applications:
 
 ```toml
 [dependencies]
-rtosu-dataprovider = { git = "https://github.com/Raregendary/rtosu-dataprovider", features = ["pp"] }
+rtosu-dataprovider = { git = "https://github.com/Raregendary/rtosu-dataprovider" }
 ```
 
 ```rust

@@ -11,7 +11,7 @@ keywords = ["osu", "tosu", "overlay", "tournament", "memory-reader"]
 categories = ["games", "command-line-utilities", "multimedia"]
 
 [features]
-default = []
+default = ["pp"]
 pp = ["dep:rosu-pp", "dep:rosu-mods"]
 rosu-mem = ["dep:rosu-mem"]
 rosu-memory = ["rosu-mem"]
