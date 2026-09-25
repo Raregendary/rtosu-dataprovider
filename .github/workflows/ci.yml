@@ -1,10 +1,8 @@
 name: CI
 
+# Only run when manually triggered via GitHub Actions web UI; disabled for git push/PR
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 jobs:
   test:
