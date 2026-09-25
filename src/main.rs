@@ -20,7 +20,7 @@ use std::time::Duration;
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
     #[arg(short, long, global = true, help = "Path to custom configuration file")]
     config: Option<String>,
     #[arg(long, global = true, value_parser = parse_pointer_width)]
@@ -186,7 +186,12 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = cli.config.as_deref().unwrap_or(DEFAULT_CONFIG_FILE);
     let config = AppConfig::load_or_init(config_path)?;
-    execute(cli.command, cli.pointer_width, config, cli.config.as_deref())
+    let command = cli.command.unwrap_or(Command::Serve {
+        host: None,
+        port: None,
+        poll_rate: None,
+    });
+    execute(command, cli.pointer_width, config, cli.config.as_deref())
 }
 
 fn execute(
