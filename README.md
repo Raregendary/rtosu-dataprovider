@@ -98,8 +98,7 @@ auto_mode = true          # Auto-detect tournament vs single-player mode
 
 [features]
 enable_chat = true        # Attributed multiplayer tournament chat
-enable_mods_decryption = true
-enable_pp = false         # Real-time gradual PP calculation
+enable_pp = true          # Real-time gradual PP calculation
 
 [logging]
 level = "info"            # "trace", "debug", "info", "warn", "error"

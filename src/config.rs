@@ -48,8 +48,6 @@ pub struct PollConfig {
 pub struct FeatureConfig {
     /// Read and attribution of multiplayer tournament chat messages from memory
     pub enable_chat: bool,
-    /// Decrypt XOR encrypted active mods in memory (HD, HR, DT, etc.)
-    pub enable_mods_decryption: bool,
     /// Optional real-time PP calculation (requires feature 'rosu-mem' or 'pp')
     pub enable_pp: bool,
 }
@@ -103,7 +101,6 @@ impl Default for FeatureConfig {
     fn default() -> Self {
         Self {
             enable_chat: true,
-            enable_mods_decryption: true,
             enable_pp: true,
         }
     }
@@ -257,11 +254,6 @@ auto_mode = true
 # Extract and parse multiplayer tournament chat logs from memory.
 # Default: true
 enable_chat = true
-
-# Decode XOR-encrypted active mods in memory (HD, HR, DT, FL, AT, ScoreV2, etc.).
-# (Negligible ~5ns CPU cost; required for accurate active mod reporting).
-# Default: true
-enable_mods_decryption = true
 
 # Enable real-time gradual PP calculation.
 # Default: true

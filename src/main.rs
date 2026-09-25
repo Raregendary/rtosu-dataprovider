@@ -623,10 +623,9 @@ async fn run_serve_loop(
         rtosu_dataprovider::OsuReaderMode::Solo => "Locked to Single-Player Mode",
     });
     println!(
-        " Features: pp_calc={}, chat_attribution={}, mods_decryption={}",
+        " Features: pp_calc={}, chat_attribution={}",
         config.features.enable_pp,
-        config.features.enable_chat,
-        config.features.enable_mods_decryption
+        config.features.enable_chat
     );
     println!("===========================================================");
 
