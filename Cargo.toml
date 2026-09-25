@@ -2,7 +2,7 @@
 name = "rtosu-dataprovider"
 version = "1.0.1"
 edition = "2024"
-authors = ["Raregendary <thehellpuma@gmail.com>"]
+authors = ["Raregendary <raregendary@gmail.com>"]
 license = "MIT"
 description = "A lightweight native Rust data provider emitting tosu-compatible v2 JSON and WebSocket feeds for osu!"
 repository = "https://github.com/Raregendary/rtosu-dataprovider"
@@ -30,7 +30,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 rosu-mem = { version = "3.0", optional = true }
-rosu-pp = { git = "https://github.com/Raregendary/rosu-pp-gemini", optional = true }
+rosu-pp = { package = "rosu-pp-gemini", version = "5.0.1", optional = true }
 rosu-mods = { version = "0.4.1", optional = true }
 
 [dev-dependencies]
