@@ -103,7 +103,7 @@ enable_pp = true          # Real-time gradual PP calculation
 
 [logging]
 level = "info"            # "trace", "debug", "info", "warn", "error"
-log_to_file = false       # Save logs to daily rolling files
+log_to_file = true        # Save logs to daily rolling files
 max_log_files = 7         # Maximum daily log files to retain before pruning
 ```
 

@@ -76,8 +76,8 @@ enable_pp = true
 level = "info"
 
 # Save logs to daily files in the logs/ directory.
-# Default: false
-log_to_file = false
+# Default: true
+log_to_file = true
 
 # Maximum number of daily log files to retain before pruning oldest.
 # Default: 7

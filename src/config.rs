@@ -110,7 +110,7 @@ impl Default for LoggingConfig {
     fn default() -> Self {
         Self {
             level: "info".to_string(),
-            log_to_file: false,
+            log_to_file: true,
             max_log_files: 7,
         }
     }
@@ -270,8 +270,8 @@ enable_pp = true
 level = "info"
 
 # Save logs to daily files in the logs/ directory.
-# Default: false
-log_to_file = false
+# Default: true
+log_to_file = true
 
 # Maximum number of daily log files to retain before pruning oldest.
 # Default: 7
