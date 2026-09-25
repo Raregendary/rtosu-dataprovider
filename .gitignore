@@ -2,3 +2,14 @@
 /references/tosu
 __pycache__/
 !/Cargo.lock
+
+# Test & scratch dumps
+*.json
+!references/**/*.json
+!profiles/**/*.json
+
+# Logs & temp files
+*.log
+.DS_Store
+Thumbs.db
+*.tmp

@@ -1,22 +1,22 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
-use osumemoryreading::address::{
+use rtosu_dataprovider::address::{
     checked_add, checked_add_signed, format_address, parse_i64, parse_u64, parse_u128_as_u64,
 };
-use osumemoryreading::client::{
+use rtosu_dataprovider::client::{
     GameplayState, LocalProfile, is_tournament_manager_cmd, snapshot_process, snapshot_processes,
 };
-use osumemoryreading::config::{AppConfig, DEFAULT_CONFIG_FILE};
-use osumemoryreading::pattern::BytePattern;
-use osumemoryreading::process::{ProcessMemory, list_modules, list_processes, module_or_main};
-use osumemoryreading::profile::{available_profiles, load_profile};
-use osumemoryreading::session::TournamentSession;
-use osumemoryreading::tournament::read_tournament_state;
+use rtosu_dataprovider::config::{AppConfig, DEFAULT_CONFIG_FILE};
+use rtosu_dataprovider::pattern::BytePattern;
+use rtosu_dataprovider::process::{ProcessMemory, list_modules, list_processes, module_or_main};
+use rtosu_dataprovider::profile::{available_profiles, load_profile};
+use rtosu_dataprovider::session::TournamentSession;
+use rtosu_dataprovider::tournament::read_tournament_state;
 use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(
-    name = "osumemoryreading",
+    name = "rtosu_dataprovider",
     version,
     about = "High-performance osu! process memory reader and tosu replacement"
 )]
@@ -504,12 +504,12 @@ fn execute(
             length,
         } => {
             let value =
-                osumemoryreading::rosu_mem::read_bytes(&process, parse_address(&address)?, length)?;
+                rtosu_dataprovider::rosu_mem::read_bytes(&process, parse_address(&address)?, length)?;
             print_bytes(&value);
         }
         #[cfg(feature = "rosu-mem")]
         Command::RosuMemSignature { process, pattern } => {
-            let address = osumemoryreading::rosu_mem::find_signature(&process, &pattern)?;
+            let address = rtosu_dataprovider::rosu_mem::find_signature(&process, &pattern)?;
             println!("{}", format_address(address));
         }
         Command::Config { action } => {
@@ -555,11 +555,11 @@ async fn run_serve_loop(
     pointer_width: Option<usize>,
     config: AppConfig,
 ) -> Result<()> {
-    let (tx, rx) = tokio::sync::watch::channel(osumemoryreading::v2::TosuV2Packet::default());
+    let (tx, rx) = tokio::sync::watch::channel(rtosu_dataprovider::v2::TosuV2Packet::default());
     let host_str = host.to_string();
 
     tokio::spawn(async move {
-        if let Err(e) = osumemoryreading::server::start_server(&host_str, port, rx).await {
+        if let Err(e) = rtosu_dataprovider::server::start_server(&host_str, port, rx).await {
             eprintln!("tosu Server error: {e}");
         }
     });
@@ -585,7 +585,7 @@ async fn run_serve_loop(
     let mut tourney_session =
         TournamentSession::new(&config.poll.default_profile, pointer_width, limit)?;
     let mut solo_session =
-        osumemoryreading::session::SoloSession::new("stable", pointer_width, limit)?;
+        rtosu_dataprovider::session::SoloSession::new("stable", pointer_width, limit)?;
     let mut cached_pids: Vec<u32> = Vec::new();
     let mut is_tournament = false;
     let mut last_proc_check = Instant::now() - Duration::from_secs(10);
@@ -601,7 +601,7 @@ async fn run_serve_loop(
             let new_pids: Vec<u32> = osu_procs.iter().map(|p| p.pid).collect();
             if new_pids.is_empty() {
                 cached_pids.clear();
-                let mut packet = osumemoryreading::v2::TosuV2Packet::default();
+                let mut packet = rtosu_dataprovider::v2::TosuV2Packet::default();
                 packet.client = "none".to_string();
                 packet.state.name = "notRunning".to_string();
                 let _ = tx.send(packet);
@@ -623,11 +623,11 @@ async fn run_serve_loop(
 
         if is_tournament {
             if let Ok(snap) = tourney_session.poll() {
-                let mut packet = osumemoryreading::v2::TosuV2Packet {
+                let mut packet = rtosu_dataprovider::v2::TosuV2Packet {
                     client: "stable".to_string(),
                     server: "ppy.sh".to_string(),
                     profile: guest_profile(),
-                    state: osumemoryreading::v2::OsuStatusState {
+                    state: rtosu_dataprovider::v2::OsuStatusState {
                         number: 22,
                         name: "tourney".to_string(),
                     },
@@ -673,7 +673,7 @@ async fn run_serve_loop(
                 for client in snap.clients {
                     let user = client
                         .user
-                        .map(|u| osumemoryreading::v2::TourneyUser {
+                        .map(|u| rtosu_dataprovider::v2::TourneyUser {
                             id: u.id,
                             name: u.name,
                             country: u.country.to_ascii_uppercase(),
@@ -685,18 +685,18 @@ async fn run_serve_loop(
                         })
                         .unwrap_or_default();
                     let play = gameplay_to_play(client.gameplay);
-                    let beatmap = osumemoryreading::v2::TourneyClientBeatmap {
+                    let beatmap = rtosu_dataprovider::v2::TourneyClientBeatmap {
                         stats: client.beatmap.map(|value| value.stats).unwrap_or_default(),
                     };
 
                     packet
                         .tourney
                         .clients
-                        .push(osumemoryreading::v2::TourneyIpcClient {
+                        .push(rtosu_dataprovider::v2::TourneyIpcClient {
                             ipc_id: client.ipc_id,
                             team: client.team,
-                            settings: osumemoryreading::v2::TourneyClientSettings {
-                                mania: osumemoryreading::v2::TourneyManiaSettings {
+                            settings: rtosu_dataprovider::v2::TourneyClientSettings {
+                                mania: rtosu_dataprovider::v2::TourneyManiaSettings {
                                     scroll_speed: 12,
                                 },
                             },
@@ -717,24 +717,24 @@ async fn run_serve_loop(
     }
 }
 
-fn gameplay_to_play(gameplay: Option<GameplayState>) -> osumemoryreading::v2::PlayState {
+fn gameplay_to_play(gameplay: Option<GameplayState>) -> rtosu_dataprovider::v2::PlayState {
     let Some(g) = gameplay else {
-        return osumemoryreading::v2::PlayState::default();
+        return rtosu_dataprovider::v2::PlayState::default();
     };
-    let mut play = osumemoryreading::v2::PlayState {
+    let mut play = rtosu_dataprovider::v2::PlayState {
         failed: g.player_hp <= 0.0,
         player_name: g.player_name,
-        mode: osumemoryreading::v2::OsuStatusState {
+        mode: rtosu_dataprovider::v2::OsuStatusState {
             number: g.mode,
             name: ruleset_name(g.mode).to_string(),
         },
         score: g.score,
         accuracy: g.accuracy,
-        health_bar: osumemoryreading::v2::HealthBarState {
+        health_bar: rtosu_dataprovider::v2::HealthBarState {
             normal: g.player_hp / 2.0,
             smooth: g.player_hp_smooth / 2.0,
         },
-        hits: osumemoryreading::v2::HitsState {
+        hits: rtosu_dataprovider::v2::HitsState {
             n0: g.hit_miss as i32,
             n50: g.hit_50 as i32,
             n100: g.hit_100 as i32,
@@ -745,35 +745,35 @@ fn gameplay_to_play(gameplay: Option<GameplayState>) -> osumemoryreading::v2::Pl
             ..Default::default()
         },
         hit_error_array: g.hit_error_array,
-        combo: osumemoryreading::v2::ComboState {
+        combo: rtosu_dataprovider::v2::ComboState {
             current: g.combo as i32,
             max: g.max_combo as i32,
         },
-        mods: osumemoryreading::v2::create_mods_state(g.mods, &g.mods_str),
-        rank: osumemoryreading::v2::RankState {
+        mods: rtosu_dataprovider::v2::create_mods_state(g.mods, &g.mods_str),
+        rank: rtosu_dataprovider::v2::RankState {
             current: g.grade.clone(),
             max_this_play: g.grade_max,
         },
         unstable_rate: g.unstable_rate,
         ..Default::default()
     };
-    play.pp = osumemoryreading::pp::LivePpResult::default();
+    play.pp = rtosu_dataprovider::pp::LivePpResult::default();
     play
 }
 
-fn profile_state(profile: &LocalProfile) -> osumemoryreading::v2::ProfileState {
-    osumemoryreading::v2::ProfileState {
-        user_status: osumemoryreading::v2::OsuStatusState {
+fn profile_state(profile: &LocalProfile) -> rtosu_dataprovider::v2::ProfileState {
+    rtosu_dataprovider::v2::ProfileState {
+        user_status: rtosu_dataprovider::v2::OsuStatusState {
             number: profile.raw_login_status,
             name: login_status_name(profile.raw_login_status).to_string(),
         },
-        bancho_status: osumemoryreading::v2::OsuStatusState {
+        bancho_status: rtosu_dataprovider::v2::OsuStatusState {
             number: profile.raw_bancho_status,
             name: bancho_status_name(profile.raw_bancho_status).to_string(),
         },
         id: profile.id,
         name: profile.name.clone(),
-        mode: osumemoryreading::v2::OsuStatusState {
+        mode: rtosu_dataprovider::v2::OsuStatusState {
             number: profile.play_mode,
             name: ruleset_name(profile.play_mode).to_string(),
         },
@@ -783,7 +783,7 @@ fn profile_state(profile: &LocalProfile) -> osumemoryreading::v2::ProfileState {
         pp: profile.performance_points,
         play_count: profile.play_count,
         global_rank: profile.rank,
-        country_code: osumemoryreading::v2::OsuStatusState {
+        country_code: rtosu_dataprovider::v2::OsuStatusState {
             number: profile.country_code,
             name: country_name(profile.country_code).to_ascii_uppercase(),
         },
@@ -792,19 +792,19 @@ fn profile_state(profile: &LocalProfile) -> osumemoryreading::v2::ProfileState {
     }
 }
 
-fn guest_profile() -> osumemoryreading::v2::ProfileState {
-    osumemoryreading::v2::ProfileState {
-        user_status: osumemoryreading::v2::OsuStatusState {
+fn guest_profile() -> rtosu_dataprovider::v2::ProfileState {
+    rtosu_dataprovider::v2::ProfileState {
+        user_status: rtosu_dataprovider::v2::OsuStatusState {
             number: 256,
             name: "guest".to_string(),
         },
-        bancho_status: osumemoryreading::v2::OsuStatusState {
+        bancho_status: rtosu_dataprovider::v2::OsuStatusState {
             number: 0,
             name: "idle".to_string(),
         },
         id: -1,
         name: "Guest".to_string(),
-        mode: osumemoryreading::v2::OsuStatusState {
+        mode: rtosu_dataprovider::v2::OsuStatusState {
             number: 0,
             name: "osu".to_string(),
         },

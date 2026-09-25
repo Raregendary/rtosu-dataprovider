@@ -1,8 +1,14 @@
 [package]
-name = "osumemoryreading"
+name = "rtosu-dataprovider"
 version = "0.1.0"
 edition = "2024"
-publish = false
+authors = ["Raregendary <thehellpuma@gmail.com>"]
+license = "MIT"
+description = "A blazingly fast, ultra-low latency native Rust drop-in replacement for tosu and osu! memory data provider"
+repository = "https://github.com/Raregendary/rtosu-dataprovider"
+readme = "README.md"
+keywords = ["osu", "tosu", "overlay", "tournament", "memory-reader"]
+categories = ["games", "command-line-utilities", "multimedia"]
 
 [features]
 default = []

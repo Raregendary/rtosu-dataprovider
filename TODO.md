@@ -1,6 +1,6 @@
-# OsuMemoryReading - Development Roadmap & ToDo
+# rtosu-dataprovider - Development Roadmap & ToDo
 
-This roadmap outlines the milestones required to transform `osumemoryreading` into a full-featured, zero-overhead, production-grade drop-in replacement for **tosu**.
+This roadmap outlines the milestones required to transform `rtosu-dataprovider` into a full-featured, zero-overhead, production-grade drop-in replacement for **tosu**.
 
 ---
 
