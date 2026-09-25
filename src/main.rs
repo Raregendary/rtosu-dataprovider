@@ -148,6 +148,15 @@ enum Command {
         #[command(subcommand)]
         action: Option<ConfigAction>,
     },
+    /// Run the high-performance drop-in tosu HTTP & WebSocket streaming server
+    Serve {
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        poll_rate: Option<u64>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -492,8 +501,165 @@ fn execute(
                 }
             }
         }
+        Command::Serve { host, port, poll_rate } => {
+            let host = host.unwrap_or(config.server.host.clone());
+            let port = port.unwrap_or(config.server.port);
+            let poll_hz = poll_rate.unwrap_or(config.poll.poll_rate_hz as u64);
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(run_serve_loop(&host, port, poll_hz, pointer_width, config))?;
+        }
     }
     Ok(())
+}
+
+async fn run_serve_loop(
+    host: &str,
+    port: u16,
+    poll_rate_hz: u64,
+    pointer_width: Option<usize>,
+    config: AppConfig,
+) -> Result<()> {
+    let (tx, rx) = tokio::sync::watch::channel(osumemoryreading::v2::TosuV2Packet::default());
+    let host_str = host.to_string();
+
+    tokio::spawn(async move {
+        if let Err(e) = osumemoryreading::server::start_server(&host_str, port, rx).await {
+            eprintln!("tosu Server error: {e}");
+        }
+    });
+
+    println!("===========================================================");
+    println!(" tosu Rust Native Replacement Server running on http://{}:{}", host, port);
+    println!(" Live Endpoints:");
+    println!("   - HTTP JSON:        http://{}:{}/json/v2", host, port);
+    println!("   - WebSocket Stream: ws://{}:{}/websocket/v2", host, port);
+    println!("   - Health check:     http://{}:{}/health", host, port);
+    println!(" Polling rate: {} Hz ({} ms interval)", poll_rate_hz, 1000 / poll_rate_hz.max(1));
+    println!("===========================================================");
+
+    let interval = Duration::from_millis(1000 / poll_rate_hz.max(1));
+    let limit = (config.poll.scan_budget_mb * 1024 * 1024) as usize;
+    let mut tourney_session = TournamentSession::new(
+        &config.poll.default_profile,
+        pointer_width,
+        limit,
+    )?;
+
+    loop {
+        tokio::time::sleep(interval).await;
+
+        let osu_procs = list_processes(Some("osu!.exe")).unwrap_or_default();
+        if osu_procs.is_empty() {
+            let mut packet = osumemoryreading::v2::TosuV2Packet::default();
+            packet.client = "none".to_string();
+            packet.state.name = "notRunning".to_string();
+            let _ = tx.send(packet);
+            continue;
+        }
+
+        let is_tournament = osu_procs.len() > 1 || osu_procs.iter().any(|p| {
+            let cmd = ProcessMemory::open(p.pid).and_then(|m| m.command_line()).unwrap_or_default();
+            cmd.contains("-spectateclient") || cmd.contains("-tournament")
+        });
+
+        if is_tournament {
+            if let Ok(snap) = tourney_session.poll() {
+                let mut packet = osumemoryreading::v2::TosuV2Packet::default();
+                packet.client = "tournament".to_string();
+                packet.state.number = 19;
+                packet.state.name = "tourney".to_string();
+
+                if let Some(mgr) = snap.manager {
+                    packet.tourney.ipc_state = mgr.ipc_state;
+                    packet.tourney.best_of = mgr.best_of;
+                    packet.tourney.score_visible = mgr.score_visible;
+                    packet.tourney.stars_visible = mgr.stars_visible;
+                    packet.tourney.points.left = mgr.left_stars;
+                    packet.tourney.points.right = mgr.right_stars;
+                    packet.tourney.total_score.left = mgr.left_score as i64;
+                    packet.tourney.total_score.right = mgr.right_score as i64;
+                    packet.tourney.team.left = mgr.first_team_name;
+                    packet.tourney.team.right = mgr.second_team_name;
+                    packet.tourney.chat = mgr.chat;
+                }
+
+                for client in snap.clients {
+                    let team = client.team;
+                    let ipc_id = client.ipc_id;
+                    let user = client.user.map(|u| osumemoryreading::v2::TourneyUser {
+                        id: u.id,
+                        name: u.name,
+                        country: u.country,
+                        accuracy: u.accuracy as f32,
+                        ranked_score: u.ranked_score,
+                        play_count: u.play_count,
+                        global_rank: u.global_rank,
+                        total_pp: u.pp,
+                    }).unwrap_or_default();
+
+                    let gameplay = client.gameplay.map(|g| {
+                        let mut play = osumemoryreading::v2::PlayState::default();
+                        play.player_name = g.player_name;
+                        play.score = g.score;
+                        play.accuracy = g.accuracy;
+                        play.combo.current = g.combo as i32;
+                        play.combo.max = g.max_combo as i32;
+                        play.hits.n300 = g.hit_300 as i32;
+                        play.hits.n100 = g.hit_100 as i32;
+                        play.hits.n50 = g.hit_50 as i32;
+                        play.hits.n0 = g.hit_miss as i32;
+                        play.hits.geki = g.hit_geki as i32;
+                        play.hits.katu = g.hit_katu as i32;
+                        play.health_bar.normal = g.player_hp;
+                        play.health_bar.smooth = g.player_hp_smooth;
+                        play.rank.current = g.grade;
+                        play.mods = osumemoryreading::v2::create_mods_state(g.mods, &g.mods_str);
+                        play
+                    }).unwrap_or_default();
+
+                    packet.tourney.clients.push(osumemoryreading::v2::TourneyIpcClient {
+                        ipc_id,
+                        team,
+                        user,
+                        beatmap: osumemoryreading::beatmap::BeatmapSnapshot::default(),
+                        gameplay,
+                    });
+                }
+
+                let _ = tx.send(packet);
+            }
+        } else {
+            // Solo osu! instance
+            let pid = osu_procs[0].pid;
+            let profile_name = "stable";
+            if let Ok(snap) = snapshot_process(pid, profile_name, pointer_width, limit) {
+                let mut packet = osumemoryreading::v2::TosuV2Packet::default();
+                packet.client = "stable".to_string();
+                packet.state.number = 2;
+                packet.state.name = "play".to_string();
+
+                if let Some(g) = snap.gameplay {
+                    packet.play.player_name = g.player_name;
+                    packet.play.score = g.score;
+                    packet.play.accuracy = g.accuracy;
+                    packet.play.combo.current = g.combo as i32;
+                    packet.play.combo.max = g.max_combo as i32;
+                    packet.play.hits.n300 = g.hit_300 as i32;
+                    packet.play.hits.n100 = g.hit_100 as i32;
+                    packet.play.hits.n50 = g.hit_50 as i32;
+                    packet.play.hits.n0 = g.hit_miss as i32;
+                    packet.play.hits.geki = g.hit_geki as i32;
+                    packet.play.hits.katu = g.hit_katu as i32;
+                    packet.play.health_bar.normal = g.player_hp;
+                    packet.play.health_bar.smooth = g.player_hp_smooth;
+                    packet.play.rank.current = g.grade;
+                    packet.play.mods = osumemoryreading::v2::create_mods_state(g.mods, &g.mods_str);
+                }
+
+                let _ = tx.send(packet);
+            }
+        }
+    }
 }
 
 fn http_get_localhost(port: u16, path: &str) -> Result<String> {
