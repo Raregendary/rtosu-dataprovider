@@ -4,7 +4,7 @@ use crate::process::{ProcessMemory, list_processes};
 use crate::profile::{ClientProfile, load_profile};
 use crate::tournament::{TournamentState, read_tournament_state};
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -86,7 +86,7 @@ pub fn is_tournament_manager_cmd(cmd: &str) -> bool {
     lower.contains("-go") || lower.contains("/go") || lower.contains("tourney") || lower.contains("tournament")
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct ModEntry {
     pub acronym: String,
 }

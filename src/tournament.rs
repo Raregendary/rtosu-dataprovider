@@ -1,7 +1,7 @@
 use crate::address::checked_add;
 use crate::process::ProcessMemory;
 use anyhow::{Context, Result, bail};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 pub const TEAM_LEFT_POINTER_OFFSET: u64 = 0x1c;
@@ -14,7 +14,7 @@ pub const STARS_VISIBLE_OFFSET: u64 = 0x38;
 pub const SCORE_VISIBLE_OFFSET: u64 = 0x39;
 pub const FINALIZED_OFFSET: u64 = 0x3a;
 
-#[derive(Debug, Clone, Serialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct TournamentChatMessage {
     pub time: String,
     pub name: String,

@@ -8,6 +8,7 @@ pub mod process;
 pub mod profile;
 pub mod session;
 pub mod tournament;
+pub mod v2;
 
 #[cfg(feature = "rosu-mem")]
 pub mod rosu_mem;
