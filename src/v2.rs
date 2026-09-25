@@ -430,8 +430,13 @@ pub fn osu_state_name(state_num: i32) -> &'static str {
 }
 
 fn md5_hex(input: &[u8]) -> String {
+    use std::fmt::Write;
     let digest = md5::Md5::digest(input);
-    format!("{digest:x}")
+    let mut hex = String::with_capacity(32);
+    for byte in digest {
+        let _ = write!(hex, "{:02x}", byte);
+    }
+    hex
 }
 
 #[cfg(test)]

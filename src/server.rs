@@ -84,7 +84,7 @@ async fn handle_ws_stream(mut socket: WebSocket, mut packet_rx: watch::Receiver<
     };
 
     if !initial_json.is_empty() {
-        if socket.send(Message::Text(initial_json)).await.is_err() {
+        if socket.send(Message::Text(initial_json.into())).await.is_err() {
             tracing::debug!("WebSocket client disconnected during initial handshake");
             return;
         }
@@ -97,7 +97,7 @@ async fn handle_ws_stream(mut socket: WebSocket, mut packet_rx: watch::Receiver<
             serde_json::to_string(&*packet).unwrap_or_default()
         };
 
-        if socket.send(Message::Text(json_str)).await.is_err() {
+        if socket.send(Message::Text(json_str.into())).await.is_err() {
             break;
         }
     }
