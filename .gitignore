@@ -1,7 +1,8 @@
 /target
 /references/tosu
 __pycache__/
-!/Cargo.lock
+Cargo.lock
+/scripts/
 
 # Test & scratch dumps
 *.json
