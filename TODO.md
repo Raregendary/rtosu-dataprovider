@@ -94,17 +94,17 @@ Make the binary / library zero-configuration and resilient to game restarts.
 
 Provide a clean, idiomatic Rust crate that other projects (like `osu_tournament_overlay`) can import directly.
 
-- [ ] **4.1. Clean Public API**:
+- [x] **4.1. Clean Public API**:
   - [x] Public crate structure (`session::SoloSession`, `session::TournamentSession`, `server::start_server`, `v2::TosuV2Packet`).
-  - [ ] Optional high-level `OsuReaderBuilder` convenience wrapper:
+  - [x] High-level `OsuReaderBuilder` and `OsuReader` convenience wrapper:
     ```rust
     let mut reader = OsuReader::builder()
-        .enable_tournament(true)
         .poll_interval(Duration::from_millis(16))
         .build()?;
-    let snapshot = reader.poll()?;
+    let packet = reader.poll()?;
     ```
-  - [ ] Optional asynchronous Tokio stream helper.
+  - [x] Asynchronous Tokio stream helper (`reader.into_stream()`).
+  - [x] In-process direct memory reading without running the HTTP or WebSocket server by default.
 - [x] **4.2. Feature Flags**:
   - [x] `default = ["pp"]`: PP calculation enabled by default with zero extra flags needed.
   - [x] `rosu-mem` / `rosu-memory`: optional integration with external memory scanner crates.

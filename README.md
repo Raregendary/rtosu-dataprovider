@@ -94,32 +94,70 @@ rtosu-dataprovider processes
 
 ---
 
-## 📦 Using as a Rust Crate
+## 📦 Using as a Rust Library Crate
 
-You can embed `rtosu-dataprovider` directly into other Rust applications:
+`rtosu-dataprovider` can be imported directly into other Rust applications (like native tournament overlays, analytics engines, or bots). When used as a library, **no HTTP or WebSocket server is started**—it reads memory directly in-process with minimal CPU overhead (~0.1%) and ~6-10 MB RAM footprint.
 
+### Cargo.toml
 ```toml
 [dependencies]
 rtosu-dataprovider = { git = "https://github.com/Raregendary/rtosu-dataprovider" }
 ```
 
+### High-Level API (`OsuReader`)
+The `OsuReader` handles automatic solo vs. tournament detection, process lifecycle management (attaching and hot-reconnecting on game restarts), and returning complete `TosuV2Packet` snapshots:
+
 ```rust
-use rtosu_dataprovider::session::SoloSession;
+use rtosu_dataprovider::OsuReader;
+use std::time::Duration;
 
 fn main() -> anyhow::Result<()> {
-    let mut session = SoloSession::new("stable", 4, 128 * 1024 * 1024)?;
+    // Zero-config builder with automatic solo vs tournament detection
+    let mut reader = OsuReader::builder()
+        .poll_interval(Duration::from_millis(16)) // 60 Hz polling
+        .build()?;
 
     loop {
-        let packet = session.update()?;
-        println!("State: {} | Song: {} | Score: {}", 
-            packet.state.name, 
-            packet.beatmap.title, 
-            packet.play.score
-        );
-        std::thread::sleep(std::time::Duration::from_millis(16)); // ~60 Hz
+        let packet = reader.poll()?;
+        if packet.is_tournament() {
+            println!("Tournament match: {} clients connected", packet.tourney.clients.len());
+        } else {
+            println!("Solo play: {} - {} [{}] | Score: {} | Live PP: {:.2}",
+                packet.beatmap.artist,
+                packet.beatmap.title,
+                packet.beatmap.version,
+                packet.play.score,
+                packet.pp.current
+            );
+        }
+        std::thread::sleep(Duration::from_millis(16));
     }
 }
 ```
+
+### Async Tokio Stream
+For async applications, convert the reader into a `Stream`:
+
+```rust
+use rtosu_dataprovider::OsuReader;
+use tokio_stream::StreamExt;
+use std::time::Duration;
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let mut stream = OsuReader::builder()
+        .poll_interval(Duration::from_millis(16))
+        .build()?
+        .into_stream();
+
+    while let Some(packet) = stream.next().await {
+        // Handle live packet...
+    }
+    Ok(())
+}
+```
+
+*(Optional: Lower-level structs like `SoloSession`, `TournamentSession`, and `ProcessMemory` remain fully accessible for custom pipelines).*
 
 ---
 

@@ -3,16 +3,14 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rtosu_dataprovider::address::{
     checked_add, checked_add_signed, format_address, parse_i64, parse_u64, parse_u128_as_u64,
 };
-use rtosu_dataprovider::client::{
-    GameplayState, LocalProfile, is_tournament_manager_cmd, snapshot_process, snapshot_processes,
-};
+use rtosu_dataprovider::client::{snapshot_process, snapshot_processes};
 use rtosu_dataprovider::config::{AppConfig, DEFAULT_CONFIG_FILE};
 use rtosu_dataprovider::pattern::BytePattern;
 use rtosu_dataprovider::process::{ProcessMemory, list_modules, list_processes, module_or_main};
 use rtosu_dataprovider::profile::{available_profiles, load_profile};
 use rtosu_dataprovider::session::TournamentSession;
 use rtosu_dataprovider::tournament::read_tournament_state;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 #[derive(Parser)]
 #[command(
@@ -582,297 +580,20 @@ async fn run_serve_loop(
 
     let interval = Duration::from_millis(1000 / poll_rate_hz.max(1));
     let limit = (config.poll.scan_budget_mb * 1024 * 1024) as usize;
-    let mut tourney_session =
-        TournamentSession::new(&config.poll.default_profile, pointer_width, limit)?;
-    let mut solo_session =
-        rtosu_dataprovider::session::SoloSession::new("stable", pointer_width, limit)?;
-    let mut cached_pids: Vec<u32> = Vec::new();
-    let mut is_tournament = false;
-    let mut last_proc_check = Instant::now() - Duration::from_secs(10);
+    let mut reader = rtosu_dataprovider::OsuReader::builder()
+        .tournament_profile(&config.poll.default_profile)
+        .solo_profile("stable")
+        .opt_pointer_width(pointer_width)
+        .scan_limit_bytes(limit)
+        .poll_interval(interval)
+        .build()?;
 
     loop {
         tokio::time::sleep(interval).await;
-
-        let should_check_procs =
-            cached_pids.is_empty() || last_proc_check.elapsed() >= Duration::from_millis(1500);
-        if should_check_procs {
-            last_proc_check = Instant::now();
-            let osu_procs = list_processes(Some("osu!.exe")).unwrap_or_default();
-            let new_pids: Vec<u32> = osu_procs.iter().map(|p| p.pid).collect();
-            if new_pids.is_empty() {
-                cached_pids.clear();
-                let mut packet = rtosu_dataprovider::v2::TosuV2Packet::default();
-                packet.client = "none".to_string();
-                packet.state.name = "notRunning".to_string();
-                let _ = tx.send(packet);
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                continue;
-            }
-
-            if new_pids != cached_pids {
-                cached_pids = new_pids;
-                is_tournament = cached_pids.len() > 1
-                    || osu_procs.iter().any(|p| {
-                        let cmd = ProcessMemory::open(p.pid)
-                            .and_then(|m| m.command_line())
-                            .unwrap_or_default();
-                        cmd.contains("-spectateclient") || is_tournament_manager_cmd(&cmd)
-                    });
-            }
-        }
-
-        if is_tournament {
-            if let Ok(snap) = tourney_session.poll() {
-                let mut packet = rtosu_dataprovider::v2::TosuV2Packet {
-                    client: "stable".to_string(),
-                    server: "ppy.sh".to_string(),
-                    profile: guest_profile(),
-                    state: rtosu_dataprovider::v2::OsuStatusState {
-                        number: 22,
-                        name: "tourney".to_string(),
-                    },
-                    ..Default::default()
-                };
-
-                if let Some(profile) = snap.profile.as_ref() {
-                    packet.profile = profile_state(profile);
-                }
-                packet.folders.game = snap.game_folder.clone();
-                packet.folders.songs = snap.songs_folder.clone();
-                packet.folders.skin = snap.skin_folder.clone();
-                packet.direct_path.skin_folder = snap.skin_folder.clone();
-                packet.session.play_time = snap.game_time;
-                if let Some(beatmap) = snap.beatmap.as_ref() {
-                    packet.folders.beatmap = beatmap.folder.clone();
-                    packet.files.beatmap = beatmap.filename.clone();
-                    packet.files.background = beatmap.background_filename.clone();
-                    packet.files.audio = beatmap.audio_filename.clone();
-                    packet.direct_path.beatmap_folder = beatmap.folder.clone();
-                    packet.direct_path.beatmap_file = join_path(&beatmap.folder, &beatmap.filename);
-                    packet.direct_path.beatmap_background =
-                        join_path(&beatmap.folder, &beatmap.background_filename);
-                    packet.direct_path.beatmap_audio =
-                        join_path(&beatmap.folder, &beatmap.audio_filename);
-                    packet.beatmap = beatmap.clone();
-                }
-
-                if let Some(mgr) = snap.manager {
-                    packet.tourney.ipc_state = mgr.ipc_state;
-                    packet.tourney.best_of = mgr.best_of;
-                    packet.tourney.score_visible = mgr.score_visible;
-                    packet.tourney.stars_visible = mgr.stars_visible;
-                    packet.tourney.points.left = mgr.left_stars;
-                    packet.tourney.points.right = mgr.right_stars;
-                    packet.tourney.total_score.left = mgr.left_score as i64;
-                    packet.tourney.total_score.right = mgr.right_score as i64;
-                    packet.tourney.team.left = mgr.first_team_name;
-                    packet.tourney.team.right = mgr.second_team_name;
-                    packet.tourney.chat = mgr.chat;
-                }
-
-                for client in snap.clients {
-                    let user = client
-                        .user
-                        .map(|u| rtosu_dataprovider::v2::TourneyUser {
-                            id: u.id,
-                            name: u.name,
-                            country: u.country.to_ascii_uppercase(),
-                            accuracy: u.accuracy as f32,
-                            ranked_score: u.ranked_score,
-                            play_count: u.play_count,
-                            global_rank: u.global_rank,
-                            total_pp: u.pp,
-                        })
-                        .unwrap_or_default();
-                    let play = gameplay_to_play(client.gameplay);
-                    let beatmap = rtosu_dataprovider::v2::TourneyClientBeatmap {
-                        stats: client.beatmap.map(|value| value.stats).unwrap_or_default(),
-                    };
-
-                    packet
-                        .tourney
-                        .clients
-                        .push(rtosu_dataprovider::v2::TourneyIpcClient {
-                            ipc_id: client.ipc_id,
-                            team: client.team,
-                            settings: rtosu_dataprovider::v2::TourneyClientSettings {
-                                mania: rtosu_dataprovider::v2::TourneyManiaSettings {
-                                    scroll_speed: 12,
-                                },
-                            },
-                            user,
-                            beatmap,
-                            play,
-                        });
-                }
-
-                let _ = tx.send(packet);
-            }
-        } else {
-            // Solo osu! instance
-            if let Ok(packet) = solo_session.poll() {
-                let _ = tx.send(packet);
-            }
+        if let Ok(packet) = reader.poll() {
+            let _ = tx.send(packet);
         }
     }
-}
-
-fn gameplay_to_play(gameplay: Option<GameplayState>) -> rtosu_dataprovider::v2::PlayState {
-    let Some(g) = gameplay else {
-        return rtosu_dataprovider::v2::PlayState::default();
-    };
-    let mut play = rtosu_dataprovider::v2::PlayState {
-        failed: g.player_hp <= 0.0,
-        player_name: g.player_name,
-        mode: rtosu_dataprovider::v2::OsuStatusState {
-            number: g.mode,
-            name: ruleset_name(g.mode).to_string(),
-        },
-        score: g.score,
-        accuracy: g.accuracy,
-        health_bar: rtosu_dataprovider::v2::HealthBarState {
-            normal: g.player_hp / 2.0,
-            smooth: g.player_hp_smooth / 2.0,
-        },
-        hits: rtosu_dataprovider::v2::HitsState {
-            n0: g.hit_miss as i32,
-            n50: g.hit_50 as i32,
-            n100: g.hit_100 as i32,
-            n300: g.hit_300 as i32,
-            geki: g.hit_geki as i32,
-            katu: g.hit_katu as i32,
-            slider_breaks: g.slider_breaks,
-            ..Default::default()
-        },
-        hit_error_array: g.hit_error_array,
-        combo: rtosu_dataprovider::v2::ComboState {
-            current: g.combo as i32,
-            max: g.max_combo as i32,
-        },
-        mods: rtosu_dataprovider::v2::create_mods_state(g.mods, &g.mods_str),
-        rank: rtosu_dataprovider::v2::RankState {
-            current: g.grade.clone(),
-            max_this_play: g.grade_max,
-        },
-        unstable_rate: g.unstable_rate,
-        ..Default::default()
-    };
-    play.pp = rtosu_dataprovider::pp::LivePpResult::default();
-    play
-}
-
-fn profile_state(profile: &LocalProfile) -> rtosu_dataprovider::v2::ProfileState {
-    rtosu_dataprovider::v2::ProfileState {
-        user_status: rtosu_dataprovider::v2::OsuStatusState {
-            number: profile.raw_login_status,
-            name: login_status_name(profile.raw_login_status).to_string(),
-        },
-        bancho_status: rtosu_dataprovider::v2::OsuStatusState {
-            number: profile.raw_bancho_status,
-            name: bancho_status_name(profile.raw_bancho_status).to_string(),
-        },
-        id: profile.id,
-        name: profile.name.clone(),
-        mode: rtosu_dataprovider::v2::OsuStatusState {
-            number: profile.play_mode,
-            name: ruleset_name(profile.play_mode).to_string(),
-        },
-        ranked_score: profile.ranked_score,
-        level: profile.level as f64,
-        accuracy: profile.accuracy,
-        pp: profile.performance_points,
-        play_count: profile.play_count,
-        global_rank: profile.rank,
-        country_code: rtosu_dataprovider::v2::OsuStatusState {
-            number: profile.country_code,
-            name: country_name(profile.country_code).to_ascii_uppercase(),
-        },
-        background_colour: format!("{:x}", profile.background_colour),
-        matchmaking: None,
-    }
-}
-
-fn guest_profile() -> rtosu_dataprovider::v2::ProfileState {
-    rtosu_dataprovider::v2::ProfileState {
-        user_status: rtosu_dataprovider::v2::OsuStatusState {
-            number: 256,
-            name: "guest".to_string(),
-        },
-        bancho_status: rtosu_dataprovider::v2::OsuStatusState {
-            number: 0,
-            name: "idle".to_string(),
-        },
-        id: -1,
-        name: "Guest".to_string(),
-        mode: rtosu_dataprovider::v2::OsuStatusState {
-            number: 0,
-            name: "osu".to_string(),
-        },
-        background_colour: "ff010101".to_string(),
-        ..Default::default()
-    }
-}
-
-fn join_path(folder: &str, file: &str) -> String {
-    if folder.is_empty() {
-        file.to_string()
-    } else if file.is_empty() {
-        folder.to_string()
-    } else {
-        format!("{}\\{}", folder, file)
-    }
-}
-
-fn login_status_name(value: i32) -> &'static str {
-    match value {
-        0 => "reconnecting",
-        256 => "guest",
-        257 => "recieving_data",
-        65537 => "disconnected",
-        65793 => "connected",
-        _ => "",
-    }
-}
-
-fn bancho_status_name(value: i32) -> &'static str {
-    match value {
-        0 => "idle",
-        1 => "afk",
-        2 => "playing",
-        3 => "editing",
-        4 => "modding",
-        5 => "multiplayer",
-        6 => "watching",
-        7 => "unknown",
-        8 => "testing",
-        9 => "submitting",
-        10 => "paused",
-        11 => "lobby",
-        12 => "multiplaying",
-        13 => "osuDirect",
-        _ => "",
-    }
-}
-
-fn ruleset_name(value: i32) -> &'static str {
-    match value {
-        0 => "osu",
-        1 => "taiko",
-        2 => "fruits",
-        3 => "mania",
-        _ => "",
-    }
-}
-
-fn country_name(value: i32) -> &'static str {
-    const CODES: &str = "oc eu ad ae af ag ai al am an ao aq ar as at au aw az ba bb bd be bf bg bh bi bj bm bn bo br bs bt bv bw by bz ca cc cd cf cg ch ci ck cl cm cn co cr cu cv cw cx cy cz de dj dk dm do dz ec ee eg eh er es et fi fj fk fm fo fr fx ga gb gd ge gf gh gi gl gm gn gq gr gs gt gu gw gy hk hm hn hr ht hu id ie il in io iq ir is it jm jo jp ke kg kh ki km kn kp kr kw ky kz la lb lc li lk lr ls lt lu lv ly ma mc md mg mh mk ml mm mn mo mq mr ms mt mu mv mw mx my mz na nc ne nf ng ni nl no np nr nu nz om pa pe pf pg ph pk pl pm pn pr ps pt pw py qa re ro ru rw sa sb sc sd se sg sh si sj sk sl sm sn so sr st sv sy sz tc td tf tg th tj tk tm tn to tl tr tt tv tw tz ua ug um us uy uz va vc ve vg vi vn vu wf ws ye yt rs za zm me zw xx a2 o1 ax gg im je bl mf";
-    if value < 1 {
-        return "";
-    }
-    CODES
-        .split_whitespace()
-        .nth((value - 1) as usize)
-        .unwrap_or("")
 }
 
 fn http_get_localhost(port: u16, path: &str) -> Result<String> {
