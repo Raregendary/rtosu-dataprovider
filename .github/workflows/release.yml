@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build & Package Windows Release
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run test suite
+        run: cargo test --release
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Prepare release archive
+        shell: powershell
+        run: |
+          $Tag = "${{ github.ref_name }}"
+          $ArchiveName = "rtosu-dataprovider-$Tag-windows-x86_64.zip"
+          $StageDir = "staging"
+          New-Item -ItemType Directory -Force -Path $StageDir | Out-Null
+          
+          Copy-Item "target/release/rtosu-dataprovider.exe" -Destination "$StageDir/"
+          Copy-Item "config.toml" -Destination "$StageDir/"
+          Copy-Item "README.md" -Destination "$StageDir/"
+          Copy-Item "LICENSE" -Destination "$StageDir/"
+          
+          Compress-Archive -Path "$StageDir/*" -DestinationPath $ArchiveName
+          
+          # Compute SHA-256 Checksum
+          $Hash = (Get-FileHash -Path $ArchiveName -Algorithm SHA256).Hash
+          "$Hash  $ArchiveName" | Out-File -FilePath "$ArchiveName.sha256" -Encoding ascii
+          
+          Write-Output "Created $ArchiveName with SHA256: $Hash"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            rtosu-dataprovider-*-windows-x86_64.zip
+            rtosu-dataprovider-*-windows-x86_64.zip.sha256
+          generate_release_notes: true
+          draft: false
+          prerelease: false
