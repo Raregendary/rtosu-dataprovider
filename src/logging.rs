@@ -145,13 +145,42 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for DailyLogWriter {
     }
 }
 
+#[cfg(windows)]
+fn enable_ansi_support() -> bool {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        STD_OUTPUT_HANDLE,
+    };
+    unsafe {
+        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let mut mode = 0u32;
+        if GetConsoleMode(handle, &mut mode) == 0 {
+            return false;
+        }
+        if (mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0 {
+            return true;
+        }
+        SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
+    }
+}
+
+#[cfg(not(windows))]
+fn enable_ansi_support() -> bool {
+    true
+}
+
 /// Initialize global tracing subscriber respecting logging configuration.
 pub fn init_logging(config: &LoggingConfig) -> Result<()> {
     let filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new(config.level.to_ascii_lowercase()));
 
+    let ansi_enabled = enable_ansi_support();
     let stdout_layer = tracing_subscriber::fmt::layer()
-        .with_ansi(true)
+        .with_ansi(ansi_enabled)
         .with_target(false);
 
     if config.log_to_file {

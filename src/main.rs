@@ -555,16 +555,45 @@ async fn run_serve_loop(
     config: AppConfig,
 ) -> Result<()> {
     let (tx, rx) = tokio::sync::watch::channel(rtosu_dataprovider::v2::TosuV2Packet::default());
-    let host_str = host.to_string();
     let enable_http = config.server.enable_http;
     let enable_ws = config.server.enable_websocket;
     let cors_allow_all = config.server.cors_allow_all;
 
-    if enable_http || enable_ws {
+    let listener = if enable_http || enable_ws {
+        match rtosu_dataprovider::server::bind_listener(host, port).await {
+            Ok(listener) => Some(listener),
+            Err(err) => {
+                let err_msg = format!("{err:#}");
+                eprintln!("===========================================================");
+                eprintln!(" [FATAL] Server startup failed: http://{}:{}", host, port);
+                eprintln!("===========================================================");
+                if err_msg.contains("os error 10048")
+                    || err_msg.contains("Address already in use")
+                    || err_msg.contains("address already in use")
+                {
+                    eprintln!(" Port {} is already in use by another application!", port);
+                    eprintln!(" (e.g. tosu, another running instance of rtosu, or another web server)");
+                    eprintln!();
+                    eprintln!(" How to fix:");
+                    eprintln!("   1. Close conflicting instances (tosu / rtosu-dataprovider.exe).");
+                    eprintln!("   2. Or run on a different port: rtosu-dataprovider.exe serve --port 24051");
+                    eprintln!("   3. Or change port = 24051 under [server] in config.toml");
+                } else {
+                    eprintln!(" Reason: {}", err_msg);
+                }
+                eprintln!("===========================================================");
+                tracing::error!("Failed to bind server listener to {}:{}: {:#}", host, port, err);
+                return Err(err);
+            }
+        }
+    } else {
+        None
+    };
+
+    if let Some(listener) = listener {
         tokio::spawn(async move {
-            if let Err(e) = rtosu_dataprovider::server::start_server(
-                &host_str,
-                port,
+            if let Err(e) = rtosu_dataprovider::server::serve_with_listener(
+                listener,
                 enable_http,
                 enable_ws,
                 cors_allow_all,
@@ -572,7 +601,7 @@ async fn run_serve_loop(
             )
             .await
             {
-                tracing::error!("tosu Server error: {e}");
+                tracing::error!("tosu Server error: {e:#}");
             }
         });
     } else {

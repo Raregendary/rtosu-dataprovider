@@ -124,18 +124,35 @@ pub async fn start_server(
         return Ok(());
     }
 
-    let state = AppState { packet_rx };
-    let app = create_router(state, enable_http, enable_ws, cors_allow_all);
+    let listener = bind_listener(host, port).await?;
+    serve_with_listener(listener, enable_http, enable_ws, cors_allow_all, packet_rx).await
+}
 
+/// Bind a TCP listener to the configured host and port.
+pub async fn bind_listener(host: &str, port: u16) -> Result<tokio::net::TcpListener> {
     let addr: SocketAddr = format!("{}:{}", host, port)
         .parse()
         .with_context(|| format!("invalid host:port '{}:{}'", host, port))?;
 
-    let listener = tokio::net::TcpListener::bind(addr)
+    tokio::net::TcpListener::bind(addr)
         .await
-        .with_context(|| format!("binding TCP listener to {}", addr))?;
+        .with_context(|| format!("binding TCP listener to {}", addr))
+}
 
-    tracing::info!("Listening on TCP socket {}", addr);
+/// Run Axum HTTP and WebSocket serving loop on an already bound TCP listener.
+pub async fn serve_with_listener(
+    listener: tokio::net::TcpListener,
+    enable_http: bool,
+    enable_ws: bool,
+    cors_allow_all: bool,
+    packet_rx: watch::Receiver<TosuV2Packet>,
+) -> Result<()> {
+    let state = AppState { packet_rx };
+    let app = create_router(state, enable_http, enable_ws, cors_allow_all);
+
+    if let Ok(addr) = listener.local_addr() {
+        tracing::info!("Listening on TCP socket {}", addr);
+    }
 
     axum::serve(listener, app)
         .with_graceful_shutdown(async {
