@@ -71,6 +71,7 @@ pub struct TournamentSession {
     scan_limit_bytes: usize,
     clients: BTreeMap<u32, CachedClientState>,
     last_proc_scan: Instant,
+    pub enable_chat: bool,
 }
 
 impl TournamentSession {
@@ -87,6 +88,7 @@ impl TournamentSession {
             scan_limit_bytes,
             clients: BTreeMap::new(),
             last_proc_scan: Instant::now() - std::time::Duration::from_secs(10),
+            enable_chat: true,
         })
     }
 
@@ -259,11 +261,13 @@ impl TournamentSession {
                     && let Ok(mut tourney) = read_tournament_state(&client.memory, ruleset_addr)
                 {
                     client.is_manager = true;
-                    if let Some(chat_pat) = client.chat_engine_pattern_addr {
-                        if let Ok(chat) =
-                            read_tournament_chat(&client.memory, chat_pat, &spectator_teams)
-                        {
-                            tourney.chat = chat;
+                    if self.enable_chat {
+                        if let Some(chat_pat) = client.chat_engine_pattern_addr {
+                            if let Ok(chat) =
+                                read_tournament_chat(&client.memory, chat_pat, &spectator_teams)
+                            {
+                                tourney.chat = chat;
+                            }
                         }
                     }
                     manager_state = Some(tourney);
@@ -815,6 +819,7 @@ pub struct SoloSession {
     cached_stats: crate::beatmap::BeatmapStats,
     last_scan_attempt: Instant,
     pub cached_packet: crate::v2::TosuV2Packet,
+    pub enable_pp: bool,
 }
 
 impl SoloSession {
@@ -874,6 +879,7 @@ impl SoloSession {
                 profile: guest_profile_state(),
                 ..Default::default()
             },
+            enable_pp: true,
         })
     }
 
@@ -1248,37 +1254,41 @@ impl SoloSession {
                         crate::v2::create_mods_state(g.mods, &g.mods_str);
 
                     #[cfg(feature = "pp")]
-                    if let Some(map) = &self.cached_beatmap {
-                        let current_hits = (
-                            g.combo as u32,
-                            g.hit_300 as u32,
-                            g.hit_100 as u32,
-                            g.hit_50 as u32,
-                            g.hit_miss as u32,
-                            g.mods,
-                        );
-                        if self.cached_gameplay_hits != current_hits || self.cached_live_pp.is_none() {
-                            self.cached_gameplay_hits = current_hits;
-                            let mods_legacy = crate::pp::calculator::parse_mods_bits(g.mods);
-                            let chunks = crate::pp::calculator::get_or_compute_gradual_chunks(
-                                self.cached_packet.beatmap.id as u32,
-                                map,
-                                mods_legacy,
-                            );
-                            let live_pp = crate::pp::calculator::calc_detailed_live_and_fc_pp(
-                                &chunks,
-                                mods_legacy,
+                    if self.enable_pp {
+                        if let Some(map) = &self.cached_beatmap {
+                            let current_hits = (
                                 g.combo as u32,
                                 g.hit_300 as u32,
                                 g.hit_100 as u32,
                                 g.hit_50 as u32,
                                 g.hit_miss as u32,
+                                g.mods,
                             );
-                            self.cached_live_pp = Some(live_pp);
+                            if self.cached_gameplay_hits != current_hits || self.cached_live_pp.is_none() {
+                                self.cached_gameplay_hits = current_hits;
+                                let mods_legacy = crate::pp::calculator::parse_mods_bits(g.mods);
+                                let chunks = crate::pp::calculator::get_or_compute_gradual_chunks(
+                                    self.cached_packet.beatmap.id as u32,
+                                    map,
+                                    mods_legacy,
+                                );
+                                let live_pp = crate::pp::calculator::calc_detailed_live_and_fc_pp(
+                                    &chunks,
+                                    mods_legacy,
+                                    g.combo as u32,
+                                    g.hit_300 as u32,
+                                    g.hit_100 as u32,
+                                    g.hit_50 as u32,
+                                    g.hit_miss as u32,
+                                );
+                                self.cached_live_pp = Some(live_pp);
+                            }
+                            if let Some(pp) = &self.cached_live_pp {
+                                self.cached_packet.play.pp = pp.clone();
+                            }
                         }
-                        if let Some(pp) = &self.cached_live_pp {
-                            self.cached_packet.play.pp = pp.clone();
-                        }
+                    } else {
+                        self.cached_packet.play.pp = crate::pp::LivePpResult::default();
                     }
                 }
             }
@@ -1373,7 +1383,8 @@ impl SoloSession {
                     };
 
                     #[cfg(feature = "pp")]
-                    if let Some(map) = &self.cached_beatmap {
+                    if self.enable_pp {
+                        if let Some(map) = &self.cached_beatmap {
                         let results_hits = (
                             res.max_combo as u32,
                             res.hit_300 as u32,
@@ -1407,6 +1418,7 @@ impl SoloSession {
                             self.cached_packet.results_screen.pp.fc = live_res.fc;
                         }
                     }
+                }
                 }
             }
         }

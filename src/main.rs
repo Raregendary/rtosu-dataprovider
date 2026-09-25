@@ -583,17 +583,21 @@ async fn run_serve_loop(
 
     println!("===========================================================");
     if enable_http || enable_ws {
+        let display_host = if host == "0.0.0.0" { "127.0.0.1" } else { host };
         println!(
             " tosu Rust Native Replacement Server running on http://{}:{}",
             host, port
         );
+        if host == "0.0.0.0" {
+            println!(" (Bound to 0.0.0.0:{} - accessible locally and via your LAN IP)", port);
+        }
         println!(" Live Endpoints:");
         if enable_http {
-            println!("   - HTTP JSON:        http://{}:{}/json/v2", host, port);
-            println!("   - Health check:     http://{}:{}/health", host, port);
+            println!("   - HTTP JSON:        http://{}:{}/json/v2", display_host, port);
+            println!("   - Health check:     http://{}:{}/health", display_host, port);
         }
         if enable_ws {
-            println!("   - WebSocket Stream: ws://{}:{}/websocket/v2", host, port);
+            println!("   - WebSocket Stream: ws://{}:{}/websocket/v2", display_host, port);
         }
     } else {
         println!(" tosu Rust Native Data Provider running in headless reader mode");
@@ -604,6 +608,26 @@ async fn run_serve_loop(
         poll_rate_hz,
         1000 / poll_rate_hz.max(1)
     );
+
+    let mode = if config.poll.auto_mode {
+        rtosu_dataprovider::OsuReaderMode::Auto
+    } else if config.poll.default_profile.eq_ignore_ascii_case("tournament") {
+        rtosu_dataprovider::OsuReaderMode::Tournament
+    } else {
+        rtosu_dataprovider::OsuReaderMode::Solo
+    };
+
+    println!(" Mode: {}", match mode {
+        rtosu_dataprovider::OsuReaderMode::Auto => "Auto-detection (Single-Player & Tournament)",
+        rtosu_dataprovider::OsuReaderMode::Tournament => "Locked to Tournament Mode",
+        rtosu_dataprovider::OsuReaderMode::Solo => "Locked to Single-Player Mode",
+    });
+    println!(
+        " Features: pp_calc={}, chat_attribution={}, mods_decryption={}",
+        config.features.enable_pp,
+        config.features.enable_chat,
+        config.features.enable_mods_decryption
+    );
     println!("===========================================================");
 
     let interval = Duration::from_millis(1000 / poll_rate_hz.max(1));
@@ -611,6 +635,9 @@ async fn run_serve_loop(
     let mut reader = rtosu_dataprovider::OsuReader::builder()
         .tournament_profile(&config.poll.default_profile)
         .solo_profile("stable")
+        .mode(mode)
+        .enable_pp(config.features.enable_pp)
+        .enable_chat(config.features.enable_chat)
         .opt_pointer_width(pointer_width)
         .scan_limit_bytes(limit)
         .poll_interval(interval)

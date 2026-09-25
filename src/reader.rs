@@ -22,6 +22,8 @@ pub struct OsuReaderBuilder {
     poll_interval: Duration,
     proc_check_interval: Duration,
     mode: OsuReaderMode,
+    enable_pp: bool,
+    enable_chat: bool,
 }
 
 impl Default for OsuReaderBuilder {
@@ -34,6 +36,8 @@ impl Default for OsuReaderBuilder {
             poll_interval: Duration::from_millis(16),
             proc_check_interval: Duration::from_millis(1500),
             mode: OsuReaderMode::Auto,
+            enable_pp: true,
+            enable_chat: true,
         }
     }
 }
@@ -94,6 +98,16 @@ impl OsuReaderBuilder {
         self
     }
 
+    pub fn enable_pp(mut self, enable: bool) -> Self {
+        self.enable_pp = enable;
+        self
+    }
+
+    pub fn enable_chat(mut self, enable: bool) -> Self {
+        self.enable_chat = enable;
+        self
+    }
+
     pub fn build(self) -> Result<OsuReader> {
         OsuReader::from_builder(self)
     }
@@ -115,16 +129,19 @@ impl OsuReader {
     }
 
     pub fn from_builder(builder: OsuReaderBuilder) -> Result<Self> {
-        let solo_session = SoloSession::new(
+        let mut solo_session = SoloSession::new(
             &builder.solo_profile,
             Some(builder.pointer_width),
             builder.scan_limit_bytes,
         )?;
-        let tourney_session = TournamentSession::new(
+        solo_session.enable_pp = builder.enable_pp;
+
+        let mut tourney_session = TournamentSession::new(
             &builder.tournament_profile,
             Some(builder.pointer_width),
             builder.scan_limit_bytes,
         )?;
+        tourney_session.enable_chat = builder.enable_chat;
 
         let mut reader = Self {
             builder,

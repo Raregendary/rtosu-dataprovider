@@ -37,6 +37,9 @@ enable_http = true
 poll_rate_hz = 60
 
 # Maximum memory scan search budget in Megabytes per osu! process.
+# NOTE: This is NOT the RAM consumption of rtosu (rtosu runs at ~10 MB RAM).
+# This is the memory search ceiling inside the osu! process virtual address space
+# when scanning for memory signatures/pointers to avoid scanning unbound allocations.
 # Default: 128 MB
 # Range: 16 to 1024 MB
 scan_budget_mb = 128
@@ -47,6 +50,8 @@ scan_budget_mb = 128
 default_profile = "tournament"
 
 # Automatically detect and switch between Single-Player Mode and Tournament Mode.
+# When set to false, the reader locks exclusively to default_profile (e.g. "tournament"
+# will only read tournament spectator/manager clients and ignore any background solo osu!).
 # Default: true
 auto_mode = true
 
@@ -57,12 +62,13 @@ auto_mode = true
 enable_chat = true
 
 # Decode XOR-encrypted active mods in memory (HD, HR, DT, FL, AT, ScoreV2, etc.).
+# (Negligible ~5ns CPU cost; required for accurate active mod reporting).
 # Default: true
 enable_mods_decryption = true
 
-# Enable real-time PP calculation (requires 'pp' feature).
-# Default: false
-enable_pp = false
+# Enable real-time gradual PP calculation.
+# Default: true
+enable_pp = true
 
 
 [logging]
