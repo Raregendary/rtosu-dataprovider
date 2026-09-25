@@ -69,8 +69,17 @@ enable_pp = false
 # Logging verbosity level.
 # Options: "trace", "debug", "info", "warn", "error"
 # Default: "info"
+# WARNING: "info" is recommended for regular production and tournament use.
+# Setting this to "debug" or "trace" emits high-volume internal runtime logs
+# which may increase CPU usage and impact high-frequency (60-120 Hz) poll timing.
 level = "info"
 
-# Save logs to a file in the logs/ directory.
+# Save logs to daily files in the logs/ directory.
 # Default: false
 log_to_file = false
+
+# Maximum number of daily log files to retain before pruning oldest.
+# Default: 7
+# Range: 1 to 365
+max_log_files = 7
+

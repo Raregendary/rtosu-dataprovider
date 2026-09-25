@@ -134,7 +134,7 @@ impl TournamentSession {
                                 let pid = pids[idx];
                                 match self.init_process(pid) {
                                     Ok(state) => initialized.lock().unwrap().push((pid, state)),
-                                    Err(e) => eprintln!("Process {pid} init error: {e}"),
+                                    Err(e) => tracing::warn!("Process {pid} init error: {e}"),
                                 }
                             }
                         });

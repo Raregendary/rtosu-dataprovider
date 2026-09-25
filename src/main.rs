@@ -186,6 +186,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = cli.config.as_deref().unwrap_or(DEFAULT_CONFIG_FILE);
     let config = AppConfig::load_or_init(config_path)?;
+    rtosu_dataprovider::logging::init_logging(&config.logging)?;
     let command = cli.command.unwrap_or(Command::Serve {
         host: None,
         port: None,
@@ -555,22 +556,47 @@ async fn run_serve_loop(
 ) -> Result<()> {
     let (tx, rx) = tokio::sync::watch::channel(rtosu_dataprovider::v2::TosuV2Packet::default());
     let host_str = host.to_string();
+    let enable_http = config.server.enable_http;
+    let enable_ws = config.server.enable_websocket;
 
-    tokio::spawn(async move {
-        if let Err(e) = rtosu_dataprovider::server::start_server(&host_str, port, rx).await {
-            eprintln!("tosu Server error: {e}");
-        }
-    });
+    if enable_http || enable_ws {
+        tokio::spawn(async move {
+            if let Err(e) = rtosu_dataprovider::server::start_server(
+                &host_str,
+                port,
+                enable_http,
+                enable_ws,
+                rx,
+            )
+            .await
+            {
+                tracing::error!("tosu Server error: {e}");
+            }
+        });
+    } else {
+        tracing::info!(
+            "Server feature toggles: HTTP and WebSocket are both disabled. Zero-port bypass active; skipping server spawn."
+        );
+    }
 
     println!("===========================================================");
-    println!(
-        " tosu Rust Native Replacement Server running on http://{}:{}",
-        host, port
-    );
-    println!(" Live Endpoints:");
-    println!("   - HTTP JSON:        http://{}:{}/json/v2", host, port);
-    println!("   - WebSocket Stream: ws://{}:{}/websocket/v2", host, port);
-    println!("   - Health check:     http://{}:{}/health", host, port);
+    if enable_http || enable_ws {
+        println!(
+            " tosu Rust Native Replacement Server running on http://{}:{}",
+            host, port
+        );
+        println!(" Live Endpoints:");
+        if enable_http {
+            println!("   - HTTP JSON:        http://{}:{}/json/v2", host, port);
+            println!("   - Health check:     http://{}:{}/health", host, port);
+        }
+        if enable_ws {
+            println!("   - WebSocket Stream: ws://{}:{}/websocket/v2", host, port);
+        }
+    } else {
+        println!(" tosu Rust Native Data Provider running in headless reader mode");
+        println!(" (Zero-port bypass active: HTTP and WebSocket servers are disabled)");
+    }
     println!(
         " Polling rate: {} Hz ({} ms interval)",
         poll_rate_hz,

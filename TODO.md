@@ -67,9 +67,15 @@ Allow any existing tosu overlay, browser widget, or external tool to connect dir
 - [x] **2.2. WebSocket Server (`ws://127.0.0.1:24050/websocket/v2`)**:
   - [x] High-frequency streaming WebSocket broadcasting JSON updates at 60 Hz.
   - [x] Low-latency broadcast channel with backpressure handling (Tokio + Tungstenite + Axum).
-- [x] **2.3. Configurable Port & Bindings**:
+- [x] **2.3. Configurable Port, Bindings & Zero-Port Bypass**:
   - [x] Default port `24050` with CLI overrides (e.g. `--port 24050 --host 127.0.0.1`).
   - [x] Port configurable in `config.toml` and CLI.
+  - [x] Conditional route mounting for `enable_http` and `enable_websocket`.
+  - [x] Zero-port bypass: when both are disabled, server skips binding any TCP socket or listener.
+- [x] **2.4. Production Structured Logging & Log Retention**:
+  - [x] Tracing structured logging system respecting `[logging.level]`.
+  - [x] Daily rolling log file writer emitting `logs/rtosu-YYYY-MM-DD.log`.
+  - [x] Automatic log retention pruner keeping up to `max_log_files` (default: 7) days of logs.
 
 ---
 

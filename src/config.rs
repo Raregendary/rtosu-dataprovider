@@ -59,8 +59,10 @@ pub struct FeatureConfig {
 pub struct LoggingConfig {
     /// Logging verbosity level ("trace", "debug", "info", "warn", "error")
     pub level: String,
-    /// Output logs to a timestamped file on disk
+    /// Output logs to daily files in the logs/ directory
     pub log_to_file: bool,
+    /// Maximum number of daily log files to retain before pruning oldest (default: 7, range: 1..=365)
+    pub max_log_files: usize,
 }
 
 impl Default for AppConfig {
@@ -112,6 +114,7 @@ impl Default for LoggingConfig {
         Self {
             level: "info".to_string(),
             log_to_file: false,
+            max_log_files: 7,
         }
     }
 }
@@ -155,6 +158,19 @@ impl AppConfig {
             anyhow::bail!(
                 "poll.scan_budget_mb must be between 16 and 2048 MB (got {})",
                 self.poll.scan_budget_mb
+            );
+        }
+        if self.logging.max_log_files == 0 || self.logging.max_log_files > 365 {
+            anyhow::bail!(
+                "logging.max_log_files must be between 1 and 365 (got {})",
+                self.logging.max_log_files
+            );
+        }
+        let valid_levels = ["trace", "debug", "info", "warn", "error"];
+        if !valid_levels.contains(&self.logging.level.to_ascii_lowercase().as_str()) {
+            anyhow::bail!(
+                "logging.level must be one of: trace, debug, info, warn, error (got '{}')",
+                self.logging.level
             );
         }
         Ok(())
@@ -250,11 +266,19 @@ enable_pp = false
 # Logging verbosity level.
 # Options: "trace", "debug", "info", "warn", "error"
 # Default: "info"
+# WARNING: "info" is recommended for regular production and tournament use.
+# Setting this to "debug" or "trace" emits high-volume internal runtime logs
+# which may increase CPU usage and impact high-frequency (60-120 Hz) poll timing.
 level = "info"
 
-# Save logs to a file in the logs/ directory.
+# Save logs to daily files in the logs/ directory.
 # Default: false
 log_to_file = false
+
+# Maximum number of daily log files to retain before pruning oldest.
+# Default: 7
+# Range: 1 to 365
+max_log_files = 7
 "#
     }
 }

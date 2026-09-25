@@ -26,6 +26,9 @@ toml = "0.8"
 tokio = { version = "1", features = ["full"] }
 axum = { version = "0.7", features = ["ws"] }
 tower-http = { version = "0.5", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 rosu-mem = { version = "3.0", optional = true }
 rosu-pp = { git = "https://github.com/Raregendary/rosu-pp-gemini", optional = true }
 rosu-mods = { version = "0.4.1", optional = true }
