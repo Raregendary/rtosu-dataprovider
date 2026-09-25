@@ -342,3 +342,207 @@ impl TournamentSession {
         })
     }
 }
+
+pub struct SoloSession {
+    profile: ClientProfile,
+    pointer_width: usize,
+    scan_limit_bytes: usize,
+    pid: Option<u32>,
+    memory: Option<ProcessMemory>,
+    base_pattern_addr: Option<u64>,
+    status_pattern_addr: Option<u64>,
+    play_time_pattern_addr: Option<u64>,
+    menu_mods_pattern_addr: Option<u64>,
+    ruleset_container_addr: Option<u64>,
+    pub cached_packet: crate::v2::TosuV2Packet,
+}
+
+impl SoloSession {
+    pub fn new(
+        profile_name: &str,
+        pointer_width: Option<usize>,
+        scan_limit_bytes: usize,
+    ) -> Result<Self> {
+        let profile = load_profile(profile_name)?;
+        let width = pointer_width.unwrap_or(if profile.pointer_width > 0 {
+            profile.pointer_width
+        } else {
+            4
+        });
+        Ok(Self {
+            profile,
+            pointer_width: width,
+            scan_limit_bytes,
+            pid: None,
+            memory: None,
+            base_pattern_addr: None,
+            status_pattern_addr: None,
+            play_time_pattern_addr: None,
+            menu_mods_pattern_addr: None,
+            ruleset_container_addr: None,
+            cached_packet: crate::v2::TosuV2Packet::default(),
+        })
+    }
+
+    pub fn poll(&mut self) -> Result<crate::v2::TosuV2Packet> {
+        // 1. Ensure we have a valid open process
+        let procs = list_processes(Some("osu!.exe"))?;
+        if procs.is_empty() {
+            self.pid = None;
+            self.memory = None;
+            self.cached_packet.client = "none".to_string();
+            self.cached_packet.state.name = "notRunning".to_string();
+            return Ok(self.cached_packet.clone());
+        }
+
+        let pid = procs[0].pid;
+        if self.pid != Some(pid) || self.memory.is_none() {
+            let mem = ProcessMemory::open_with_pointer_size(pid, Some(self.pointer_width))?;
+            self.pid = Some(pid);
+            self.memory = Some(mem);
+            self.base_pattern_addr = None;
+            self.status_pattern_addr = None;
+            self.play_time_pattern_addr = None;
+            self.menu_mods_pattern_addr = None;
+            self.ruleset_container_addr = None;
+        }
+
+        let memory = self.memory.as_ref().unwrap();
+
+        // 2. Scan status_ptr if not cached
+        if self.status_pattern_addr.is_none() {
+            if let Ok((pat_src, pat_off)) = self.profile.pattern("status_ptr") {
+                if let Ok(pat) = BytePattern::parse(pat_src) {
+                    if let Ok(matches) = memory.scan_pattern(&pat, None, 1, self.scan_limit_bytes) {
+                        if let Some(&first) = matches.first() {
+                            if let Ok(addr) = checked_add_signed(first, pat_off) {
+                                self.status_pattern_addr = Some(addr);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Scan base_addr if not cached
+        if self.base_pattern_addr.is_none() {
+            if let Ok((pat_src, _)) = self.profile.pattern("base_addr") {
+                if let Ok(pat) = BytePattern::parse(pat_src) {
+                    if let Ok(matches) = memory.scan_pattern(&pat, None, 1, self.scan_limit_bytes) {
+                        if let Some(&first) = matches.first() {
+                            self.base_pattern_addr = Some(first);
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4. Scan play_time_addr if not cached
+        if self.play_time_pattern_addr.is_none() {
+            if let Ok((pat_src, pat_off)) = self.profile.pattern("play_time_addr") {
+                if let Ok(pat) = BytePattern::parse(pat_src) {
+                    if let Ok(matches) = memory.scan_pattern(&pat, None, 1, self.scan_limit_bytes) {
+                        if let Some(&first) = matches.first() {
+                            if let Ok(addr) = checked_add_signed(first, pat_off) {
+                                self.play_time_pattern_addr = Some(addr);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 5. Scan menu_mods_ptr if not cached
+        if self.menu_mods_pattern_addr.is_none() {
+            if let Ok((pat_src, pat_off)) = self.profile.pattern("menu_mods_ptr") {
+                if let Ok(pat) = BytePattern::parse(pat_src) {
+                    if let Ok(matches) = memory.scan_pattern(&pat, None, 1, self.scan_limit_bytes) {
+                        if let Some(&first) = matches.first() {
+                            if let Ok(addr) = checked_add_signed(first, pat_off) {
+                                self.menu_mods_pattern_addr = Some(addr);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        self.cached_packet.client = "stable".to_string();
+        self.cached_packet.server = "ppy.sh".to_string();
+
+        // 6. Read state
+        let mut current_state_num = 0;
+        if let Some(status_addr) = self.status_pattern_addr {
+            if let Ok(status_ptr) = memory.read_pointer(status_addr) {
+                if status_ptr != 0 {
+                    if let Ok(val) = memory.read_i32(status_ptr) {
+                        current_state_num = val;
+                        self.cached_packet.state.number = val;
+                        self.cached_packet.state.name = crate::v2::osu_state_name(val).to_string();
+                    }
+                }
+            }
+        }
+
+        // 7. Read beatmap
+        if let Some(base_addr) = self.base_pattern_addr {
+            if let Ok(bm) = crate::beatmap::read_beatmap_memory(
+                memory,
+                base_addr,
+                self.play_time_pattern_addr,
+                self.pointer_width,
+            ) {
+                if bm.id > 0 || !bm.title.is_empty() {
+                    self.cached_packet.beatmap = bm;
+                }
+            }
+        }
+
+        // 8. Read gameplay if in play state (state 2)
+        if current_state_num == 2 {
+            if self.ruleset_container_addr.is_none() {
+                self.ruleset_container_addr = crate::client::resolve_ruleset(
+                    memory,
+                    &self.profile,
+                    self.scan_limit_bytes,
+                ).ok();
+            }
+
+            if let Some(ruleset_addr) = self.ruleset_container_addr {
+                if let Ok(g) = crate::client::read_gameplay_state(memory, ruleset_addr) {
+                    self.cached_packet.play.player_name = g.player_name;
+                    self.cached_packet.play.score = g.score;
+                    self.cached_packet.play.accuracy = g.accuracy;
+                    self.cached_packet.play.combo.current = g.combo as i32;
+                    self.cached_packet.play.combo.max = g.max_combo as i32;
+                    self.cached_packet.play.hits.n300 = g.hit_300 as i32;
+                    self.cached_packet.play.hits.n100 = g.hit_100 as i32;
+                    self.cached_packet.play.hits.n50 = g.hit_50 as i32;
+                    self.cached_packet.play.hits.n0 = g.hit_miss as i32;
+                    self.cached_packet.play.hits.geki = g.hit_geki as i32;
+                    self.cached_packet.play.hits.katu = g.hit_katu as i32;
+                    self.cached_packet.play.health_bar.normal = g.player_hp;
+                    self.cached_packet.play.health_bar.smooth = g.player_hp_smooth;
+                    self.cached_packet.play.rank.current = g.grade;
+                    self.cached_packet.play.mods = crate::v2::create_mods_state(g.mods, &g.mods_str);
+                }
+            }
+        } else if current_state_num != 7 {
+            // In song select or menu, read menu mods
+            if let Some(mods_addr) = self.menu_mods_pattern_addr {
+                if let Ok(mods_ptr) = memory.read_pointer(mods_addr) {
+                    if mods_ptr != 0 {
+                        if let Ok(mods_val) = memory.read_u32(mods_ptr) {
+                            self.cached_packet.play.mods = crate::v2::create_mods_state(
+                                mods_val,
+                                &crate::client::format_mods(mods_val),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(self.cached_packet.clone())
+    }
+}

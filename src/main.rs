@@ -549,6 +549,11 @@ async fn run_serve_loop(
         pointer_width,
         limit,
     )?;
+    let mut solo_session = osumemoryreading::session::SoloSession::new(
+        "stable",
+        pointer_width,
+        limit,
+    )?;
 
     loop {
         tokio::time::sleep(interval).await;
@@ -635,32 +640,7 @@ async fn run_serve_loop(
             }
         } else {
             // Solo osu! instance
-            let pid = osu_procs[0].pid;
-            let profile_name = "stable";
-            if let Ok(snap) = snapshot_process(pid, profile_name, pointer_width, limit) {
-                let mut packet = osumemoryreading::v2::TosuV2Packet::default();
-                packet.client = "stable".to_string();
-                packet.state.number = 2;
-                packet.state.name = "play".to_string();
-
-                if let Some(g) = snap.gameplay {
-                    packet.play.player_name = g.player_name;
-                    packet.play.score = g.score;
-                    packet.play.accuracy = g.accuracy;
-                    packet.play.combo.current = g.combo as i32;
-                    packet.play.combo.max = g.max_combo as i32;
-                    packet.play.hits.n300 = g.hit_300 as i32;
-                    packet.play.hits.n100 = g.hit_100 as i32;
-                    packet.play.hits.n50 = g.hit_50 as i32;
-                    packet.play.hits.n0 = g.hit_miss as i32;
-                    packet.play.hits.geki = g.hit_geki as i32;
-                    packet.play.hits.katu = g.hit_katu as i32;
-                    packet.play.health_bar.normal = g.player_hp;
-                    packet.play.health_bar.smooth = g.player_hp_smooth;
-                    packet.play.rank.current = g.grade;
-                    packet.play.mods = osumemoryreading::v2::create_mods_state(g.mods, &g.mods_str);
-                }
-
+            if let Ok(packet) = solo_session.poll() {
                 let _ = tx.send(packet);
             }
         }

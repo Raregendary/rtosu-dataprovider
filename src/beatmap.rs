@@ -166,21 +166,23 @@ pub fn read_beatmap_memory(
         0
     };
 
-    let id = memory.read_i32(checked_add_signed(beatmap_addr, 0x78)?).unwrap_or(0);
-    let set_id = memory.read_i32(checked_add_signed(beatmap_addr, 0x7C)?).unwrap_or(0);
-    let status_num = memory.read_i32(checked_add_signed(beatmap_addr, 0x80)?).unwrap_or(0);
+    let id = memory.read_i32(checked_add_signed(beatmap_addr, 0xC8)?).unwrap_or(0);
+    let set_id = memory.read_i32(checked_add_signed(beatmap_addr, 0xCC)?).unwrap_or(0);
+    let status_num = memory.read_i32(checked_add_signed(beatmap_addr, 0xEC)?).unwrap_or(0);
 
-    let ar = memory.read_f32(checked_add_signed(beatmap_addr, 0x90)?).unwrap_or(0.0);
-    let cs = memory.read_f32(checked_add_signed(beatmap_addr, 0x94)?).unwrap_or(0.0);
-    let hp = memory.read_f32(checked_add_signed(beatmap_addr, 0x98)?).unwrap_or(0.0);
-    let od = memory.read_f32(checked_add_signed(beatmap_addr, 0x9C)?).unwrap_or(0.0);
+    let ar = memory.read_f32(checked_add_signed(beatmap_addr, 0x2C)?).unwrap_or(0.0);
+    let cs = memory.read_f32(checked_add_signed(beatmap_addr, 0x30)?).unwrap_or(0.0);
+    let hp = memory.read_f32(checked_add_signed(beatmap_addr, 0x34)?).unwrap_or(0.0);
+    let od = memory.read_f32(checked_add_signed(beatmap_addr, 0x38)?).unwrap_or(0.0);
 
-    let title = read_net_string(memory, beatmap_addr, 0x64, pointer_width).unwrap_or_default();
-    let artist = read_net_string(memory, beatmap_addr, 0x68, pointer_width).unwrap_or_default();
-    let mapper = read_net_string(memory, beatmap_addr, 0x6C, pointer_width).unwrap_or_default();
-    let version = read_net_string(memory, beatmap_addr, 0x70, pointer_width).unwrap_or_default();
-    let folder = read_net_string(memory, beatmap_addr, 0x74, pointer_width).unwrap_or_default();
-    let checksum = read_net_string(memory, beatmap_addr, 0xB4, pointer_width).unwrap_or_default();
+    let checksum = read_net_string(memory, beatmap_addr, 0x6C, pointer_width).unwrap_or_default();
+    let folder = read_net_string(memory, beatmap_addr, 0x78, pointer_width).unwrap_or_default();
+    let mapper = read_net_string(memory, beatmap_addr, 0x7C, pointer_width).unwrap_or_default();
+    let artist = read_net_string(memory, beatmap_addr, 0x80, pointer_width).unwrap_or_default();
+    let artist_unicode = read_net_string(memory, beatmap_addr, 0x84, pointer_width).unwrap_or_default();
+    let title = read_net_string(memory, beatmap_addr, 0x88, pointer_width).unwrap_or_default();
+    let title_unicode = read_net_string(memory, beatmap_addr, 0x90, pointer_width).unwrap_or_default();
+    let version = read_net_string(memory, beatmap_addr, 0xAC, pointer_width).unwrap_or_default();
 
     Ok(BeatmapSnapshot {
         is_kiai: false,
@@ -203,10 +205,10 @@ pub fn read_beatmap_memory(
             number: 0,
             name: "osu".to_string(),
         },
-        artist: artist.clone(),
-        artist_unicode: artist,
-        title: title.clone(),
-        title_unicode: title,
+        artist,
+        artist_unicode,
+        title,
+        title_unicode,
         mapper,
         version,
         folder,
