@@ -1,6 +1,6 @@
 [package]
 name = "rtosu-dataprovider"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 authors = ["Raregendary <thehellpuma@gmail.com>"]
 license = "MIT"
@@ -47,3 +47,11 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true
+

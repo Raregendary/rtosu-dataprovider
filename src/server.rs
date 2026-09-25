@@ -15,7 +15,12 @@ pub struct AppState {
     pub packet_rx: watch::Receiver<TosuV2Packet>,
 }
 
-pub fn create_router(state: AppState, enable_http: bool, enable_ws: bool) -> Router {
+pub fn create_router(
+    state: AppState,
+    enable_http: bool,
+    enable_ws: bool,
+    cors_allow_all: bool,
+) -> Router {
     let mut router = Router::new();
 
     if enable_http {
@@ -32,9 +37,11 @@ pub fn create_router(state: AppState, enable_http: bool, enable_ws: bool) -> Rou
             .route("/websocket/v2/precise", get(handle_ws_upgrade));
     }
 
-    router
-        .layer(CorsLayer::permissive())
-        .with_state(state)
+    if cors_allow_all {
+        router = router.layer(CorsLayer::permissive());
+    }
+
+    router.with_state(state)
 }
 
 async fn handle_json_v2(State(state): State<AppState>) -> impl IntoResponse {
@@ -101,11 +108,13 @@ async fn handle_ws_stream(mut socket: WebSocket, mut packet_rx: watch::Receiver<
 /// Start the tosu-compatible HTTP and WebSocket server.
 /// If both `enable_http` and `enable_ws` are false, the function immediately
 /// returns `Ok(())` without binding any TCP port (zero-port bypass).
+/// Also configures graceful shutdown listening for termination signals.
 pub async fn start_server(
     host: &str,
     port: u16,
     enable_http: bool,
     enable_ws: bool,
+    cors_allow_all: bool,
     packet_rx: watch::Receiver<TosuV2Packet>,
 ) -> Result<()> {
     if !enable_http && !enable_ws {
@@ -116,7 +125,7 @@ pub async fn start_server(
     }
 
     let state = AppState { packet_rx };
-    let app = create_router(state, enable_http, enable_ws);
+    let app = create_router(state, enable_http, enable_ws, cors_allow_all);
 
     let addr: SocketAddr = format!("{}:{}", host, port)
         .parse()
@@ -129,6 +138,10 @@ pub async fn start_server(
     tracing::info!("Listening on TCP socket {}", addr);
 
     axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+            tracing::info!("Server received shutdown signal, closing active listeners");
+        })
         .await
         .context("running axum server")?;
 
@@ -151,7 +164,7 @@ mod tests {
         let (tx, rx) = watch::channel(sample);
         let rx_holder = rx.clone();
         let state = AppState { packet_rx: rx };
-        let app = create_router(state, true, true);
+        let app = create_router(state, true, true, true);
 
         let response = app
             .oneshot(
@@ -186,7 +199,7 @@ mod tests {
 
         let (_tx, rx) = watch::channel(sample);
         let state = AppState { packet_rx: rx };
-        let app = create_router(state, true, false);
+        let app = create_router(state, true, false, true);
 
         // HTTP endpoint should be 200 OK
         let http_res = app
@@ -221,7 +234,7 @@ mod tests {
 
         let (_tx, rx) = watch::channel(sample);
         let state = AppState { packet_rx: rx };
-        let app = create_router(state, false, true);
+        let app = create_router(state, false, true, true);
 
         // HTTP endpoint should be 404 NOT_FOUND
         let http_res = app
@@ -251,12 +264,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_router_cors_toggle() {
+        let mut sample = TosuV2Packet::default();
+        sample.client = "stable".to_string();
+
+        // 1. With CORS allowed
+        let (_tx, rx1) = watch::channel(sample.clone());
+        let app_cors_enabled = create_router(AppState { packet_rx: rx1 }, true, false, true);
+        let res1 = app_cors_enabled
+            .oneshot(
+                Request::builder()
+                    .uri("/json/v2")
+                    .header("Origin", "http://example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            res1.headers().get("access-control-allow-origin").unwrap(),
+            "*"
+        );
+
+        // 2. With CORS disabled
+        let (_tx, rx2) = watch::channel(sample);
+        let app_cors_disabled = create_router(AppState { packet_rx: rx2 }, true, false, false);
+        let res2 = app_cors_disabled
+            .oneshot(
+                Request::builder()
+                    .uri("/json/v2")
+                    .header("Origin", "http://example.com")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(res2.headers().get("access-control-allow-origin").is_none());
+    }
+
+    #[tokio::test]
     async fn test_start_server_zero_port_bypass() {
         let sample = TosuV2Packet::default();
         let (_tx, rx) = watch::channel(sample);
 
         // Even with an invalid or bound port, if both are false, it should succeed immediately
-        let res = start_server("127.0.0.1", 0, false, false, rx).await;
+        let res = start_server("127.0.0.1", 0, false, false, true, rx).await;
         assert!(res.is_ok());
     }
 }

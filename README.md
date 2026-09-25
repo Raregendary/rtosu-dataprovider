@@ -43,6 +43,11 @@ A lightweight native Rust data provider emitting **[tosu](https://github.com/Kot
   - Built-in PP calculation powered by `rosu-pp`.
   - 10-object stepping gradual PP calculation.
   - Precalculated 90%–100% accuracy table and strain graph generation.
+- **Production Architecture**:
+  - **Zero-Port Bypass**: Disable HTTP or WebSocket independently; if both are disabled, no TCP socket is bound.
+  - **Structured Logging**: `tracing`-based structured logging respecting configured level with daily rolling file logging (`logs/rtosu-YYYY-MM-DD.log`).
+  - **Log Retention**: Automatic log pruning keeping the newest `max_log_files` (default: 7) days of logs.
+  - **Graceful Shutdown**: Listens for `Ctrl+C` termination signal, draining connections and exiting cleanly.
 
 ---
 
@@ -67,8 +72,39 @@ cargo build --release
 # Run on default port 24050 (drop-in tosu port)
 cargo run --release -- serve --port 24050
 
-# Or run on a custom port
-cargo run --release -- serve --port 24055
+# Or run with a custom config file
+cargo run --release -- --config ./my-config.toml serve
+```
+
+---
+
+## ⚙️ Configuration (`config.toml`)
+
+`rtosu-dataprovider` is configured via `config.toml` in the working directory (or specified via `--config <path>`).
+
+```toml
+[server]
+host = "127.0.0.1"        # Bind host address
+port = 24050              # Drop-in tosu port (1024-65535)
+cors_allow_all = true     # Permissive CORS headers for browser overlays
+enable_websocket = true   # Mount /websocket/v2 stream
+enable_http = true        # Mount /json/v2 and /health REST endpoints
+
+[poll]
+poll_rate_hz = 60         # 60 Hz = ~16.6ms update interval (1-1000 Hz)
+scan_budget_mb = 128      # Memory signature scan limit (16-1024 MB)
+default_profile = "tournament"
+auto_mode = true          # Auto-detect tournament vs single-player mode
+
+[features]
+enable_chat = true        # Attributed multiplayer tournament chat
+enable_mods_decryption = true
+enable_pp = false         # Real-time gradual PP calculation
+
+[logging]
+level = "info"            # "trace", "debug", "info", "warn", "error"
+log_to_file = false       # Save logs to daily rolling files
+max_log_files = 7         # Maximum daily log files to retain before pruning
 ```
 
 ---
@@ -76,8 +112,13 @@ cargo run --release -- serve --port 24055
 ## 💻 CLI Commands
 
 ```powershell
-# Run the HTTP & WebSocket data provider
+# Run the HTTP & WebSocket data provider (default command)
 rtosu-dataprovider serve --port 24050
+
+# View, initialize, or validate configuration
+rtosu-dataprovider config show
+rtosu-dataprovider config init [path]
+rtosu-dataprovider config validate
 
 # Side-by-side comparison against an active tosu server
 rtosu-dataprovider compare-tosu --url http://127.0.0.1:24050/json/v2

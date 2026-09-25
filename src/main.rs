@@ -558,6 +558,7 @@ async fn run_serve_loop(
     let host_str = host.to_string();
     let enable_http = config.server.enable_http;
     let enable_ws = config.server.enable_websocket;
+    let cors_allow_all = config.server.cors_allow_all;
 
     if enable_http || enable_ws {
         tokio::spawn(async move {
@@ -566,6 +567,7 @@ async fn run_serve_loop(
                 port,
                 enable_http,
                 enable_ws,
+                cors_allow_all,
                 rx,
             )
             .await
@@ -615,11 +617,21 @@ async fn run_serve_loop(
         .build()?;
 
     loop {
-        tokio::time::sleep(interval).await;
-        if let Ok(packet) = reader.poll() {
-            let _ = tx.send(packet);
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Received shutdown signal (Ctrl+C). Terminating cleanly...");
+                println!("\nShutdown signal received. Exiting rtosu-dataprovider... Goodbye!");
+                break;
+            }
+            _ = tokio::time::sleep(interval) => {
+                if let Ok(packet) = reader.poll() {
+                    let _ = tx.send(packet);
+                }
+            }
         }
     }
+
+    Ok(())
 }
 
 fn http_get_localhost(port: u16, path: &str) -> Result<String> {
