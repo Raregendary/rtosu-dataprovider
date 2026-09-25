@@ -65,6 +65,7 @@ mod platform {
         GetExitCodeProcess, IsWow64Process, IsWow64Process2, OpenProcess, PROCESS_QUERY_INFORMATION,
         PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ, QueryFullProcessImageNameW,
     };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
 
     const MAXIMUM_USER_ADDRESS_64: usize = 0x0000_7fff_ffff_ffff;
     const SCAN_CHUNK_SIZE: usize = 1024 * 1024;
@@ -121,6 +122,18 @@ mod platform {
             let mut exit_code = 0u32;
             let result = unsafe { GetExitCodeProcess(self.handle, &mut exit_code) };
             result != 0 && exit_code == 259
+        }
+
+        pub fn is_foreground(&self) -> bool {
+            unsafe {
+                let hwnd = GetForegroundWindow();
+                if hwnd.is_null() {
+                    return false;
+                }
+                let mut pid = 0u32;
+                GetWindowThreadProcessId(hwnd, &mut pid);
+                pid == self.pid
+            }
         }
 
         pub fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>> {
@@ -634,6 +647,10 @@ mod platform {
         }
 
         pub fn is_alive(&self) -> bool {
+            false
+        }
+
+        pub fn is_foreground(&self) -> bool {
             false
         }
 

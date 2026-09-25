@@ -475,6 +475,29 @@ pub fn populate_beatmap_statistics_with_diff(
     snapshot.stats.objects.total = map.hit_objects.len() as i32;
     if let Some(last_object) = map.hit_objects.last() {
         let end_time = match &last_object.kind {
+            rosu_pp::model::hit_object::HitObjectKind::Slider(slider) => {
+                let span_count = slider.span_count() as f64;
+                let beat_len = map
+                    .timing_points
+                    .iter()
+                    .rev()
+                    .find(|tp| tp.time <= last_object.start_time)
+                    .map_or(60_000.0 / 120.0, |tp| tp.beat_len);
+                let slider_velocity = map
+                    .difficulty_points
+                    .iter()
+                    .rev()
+                    .find(|dp| dp.time <= last_object.start_time)
+                    .map_or(1.0, |dp| dp.slider_velocity);
+                let dist = slider.expected_dist.unwrap_or(0.0);
+                let velocity = 100.0 * map.slider_multiplier * slider_velocity / beat_len;
+                let duration = if velocity > 0.0 {
+                    (span_count * dist / velocity).round() as i32
+                } else {
+                    0
+                };
+                last_object.start_time as i32 + duration
+            }
             rosu_pp::model::hit_object::HitObjectKind::Spinner(spinner) => {
                 last_object.start_time as i32 + spinner.duration as i32
             }
@@ -486,16 +509,29 @@ pub fn populate_beatmap_statistics_with_diff(
         snapshot.time.last_object = end_time;
     }
     snapshot.stats.max_combo = diff.max_combo() as i32;
-    let bpm = map.bpm() as f32;
+    let clock_rate: f32 = if (mods & 64) != 0 || (mods & 512) != 0 {
+        1.5
+    } else if (mods & 256) != 0 {
+        0.75
+    } else {
+        1.0
+    };
+    let bpm = (map.bpm() as f32) * clock_rate;
     snapshot.stats.bpm.common = round_value(bpm, 4);
     if snapshot.stats.bpm.realtime == 0.0 {
         snapshot.stats.bpm.realtime = round_value(bpm, 4);
+    } else {
+        snapshot.stats.bpm.realtime = round_value(snapshot.stats.bpm.realtime * clock_rate, 4);
     }
     if snapshot.stats.bpm.min == 0.0 {
         snapshot.stats.bpm.min = round_value(bpm, 4);
+    } else {
+        snapshot.stats.bpm.min = round_value(snapshot.stats.bpm.min * clock_rate, 4);
     }
     if snapshot.stats.bpm.max == 0.0 {
         snapshot.stats.bpm.max = round_value(bpm, 4);
+    } else {
+        snapshot.stats.bpm.max = round_value(snapshot.stats.bpm.max * clock_rate, 4);
     }
     snapshot.stats.stars.total = round_value(diff.stars() as f32, 2);
     snapshot.stats.stars.live = snapshot.stats.stars.total;

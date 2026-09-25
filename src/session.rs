@@ -238,6 +238,7 @@ impl TournamentSession {
                     if beatmap_mut.time.mp3_length == 0 {
                         beatmap_mut.time.mp3_length = meta.time.mp3_length;
                     }
+                    beatmap_mut.stats.bpm = meta.stats.bpm.clone();
                 }
             }
             let ruleset_addr = match client.ruleset_container_addr {
@@ -1088,8 +1089,10 @@ impl SoloSession {
             current_state_num = state;
             self.cached_packet.state.number = state;
             self.cached_packet.state.name = crate::v2::osu_state_name(state).to_string();
-            self.cached_packet.game.focused = true;
+            self.cached_packet.game.focused = memory.is_foreground();
             self.cached_packet.game.paused = state == 7;
+        } else {
+            self.cached_packet.game.focused = memory.is_foreground();
         }
 
         if let Some(game_time_addr) = self.game_time_pattern_addr
@@ -1159,6 +1162,7 @@ impl SoloSession {
                         if bm.time.mp3_length == 0 {
                             bm.time.mp3_length = self.cached_beatmap_metadata.time.mp3_length;
                         }
+                        bm.stats.bpm = self.cached_beatmap_metadata.stats.bpm.clone();
                     }
 
                     #[cfg(feature = "pp")]
@@ -1171,6 +1175,7 @@ impl SoloSession {
                             let diff = rosu_pp::Difficulty::new().mods(mods_legacy).calculate(map);
                             crate::beatmap::populate_beatmap_statistics_with_diff(&mut bm, map, &diff, active_mods);
                             self.cached_stats = bm.stats.clone();
+                            self.cached_beatmap_metadata.time.last_object = bm.time.last_object;
                             self.cached_accuracy = crate::pp::calculator::calc_accuracy_table_from_diff(&diff);
                             self.cached_graph = performance_graph(
                                 map,
@@ -1181,6 +1186,7 @@ impl SoloSession {
                             self.cached_difficulty_attrs = Some(diff);
                         } else {
                             bm.stats = self.cached_stats.clone();
+                            bm.time.last_object = self.cached_beatmap_metadata.time.last_object;
                         }
                         self.cached_packet.performance.accuracy = self.cached_accuracy.clone();
                         self.cached_packet.performance.graph = self.cached_graph.clone();
