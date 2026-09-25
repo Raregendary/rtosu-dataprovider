@@ -16,6 +16,7 @@ pub const FINALIZED_OFFSET: u64 = 0x3a;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct TournamentChatMessage {
+    #[serde(rename = "timestamp")]
     pub time: String,
     pub name: String,
     pub message: String,
@@ -82,27 +83,57 @@ pub fn read_tournament_state(
 
     let (left_score, left_stars, first_team_name, left_finalized) = if left_team_address != 0 {
         (
-            memory.read_i32(field(left_team_address, SCORE_OFFSET)?).unwrap_or(0),
-            memory.read_i32(field(left_team_address, STARS_OFFSET)?).unwrap_or(0),
+            memory
+                .read_i32(field(left_team_address, SCORE_OFFSET)?)
+                .unwrap_or(0),
+            memory
+                .read_i32(field(left_team_address, STARS_OFFSET)?)
+                .unwrap_or(0),
             read_team_name(memory, left_team_address),
-            memory.read_u8(field(left_team_address, FINALIZED_OFFSET)?).unwrap_or(0) != 0,
+            memory
+                .read_u8(field(left_team_address, FINALIZED_OFFSET)?)
+                .unwrap_or(0)
+                != 0,
         )
     } else {
         (0, 0, String::new(), false)
     };
 
-    let (right_score, right_stars, second_team_name, right_stars_visible, right_score_visible, right_finalized, best_of) = if right_team_address != 0 {
+    let (
+        right_score,
+        right_stars,
+        second_team_name,
+        right_stars_visible,
+        right_score_visible,
+        right_finalized,
+        best_of,
+    ) = if right_team_address != 0 {
         (
-            memory.read_i32(field(right_team_address, SCORE_OFFSET)?).unwrap_or(0),
-            memory.read_i32(field(right_team_address, STARS_OFFSET)?).unwrap_or(0),
+            memory
+                .read_i32(field(right_team_address, SCORE_OFFSET)?)
+                .unwrap_or(0),
+            memory
+                .read_i32(field(right_team_address, STARS_OFFSET)?)
+                .unwrap_or(0),
             read_team_name(memory, right_team_address),
-            memory.read_u8(field(right_team_address, STARS_VISIBLE_OFFSET)?).unwrap_or(0) != 0,
-            memory.read_u8(field(right_team_address, SCORE_VISIBLE_OFFSET)?).unwrap_or(0) != 0,
-            memory.read_u8(field(right_team_address, FINALIZED_OFFSET)?).unwrap_or(0) != 0,
-            memory.read_i32(field(right_team_address, TEAM_BEST_OF_OFFSET)?).unwrap_or(1),
+            memory
+                .read_u8(field(right_team_address, STARS_VISIBLE_OFFSET)?)
+                .unwrap_or(0)
+                != 0,
+            memory
+                .read_u8(field(right_team_address, SCORE_VISIBLE_OFFSET)?)
+                .unwrap_or(0)
+                != 0,
+            memory
+                .read_u8(field(right_team_address, FINALIZED_OFFSET)?)
+                .unwrap_or(0)
+                != 0,
+            memory
+                .read_i32(field(right_team_address, TEAM_BEST_OF_OFFSET)?)
+                .unwrap_or(0),
         )
     } else {
-        (0, 0, String::new(), false, false, false, 1)
+        (0, 0, String::new(), false, false, false, 0)
     };
 
     Ok(TournamentState {

@@ -3,11 +3,13 @@ use clap::{Parser, Subcommand, ValueEnum};
 use osumemoryreading::address::{
     checked_add, checked_add_signed, format_address, parse_i64, parse_u64, parse_u128_as_u64,
 };
-use osumemoryreading::client::{snapshot_process, snapshot_processes};
+use osumemoryreading::client::{
+    GameplayState, LocalProfile, is_tournament_manager_cmd, snapshot_process, snapshot_processes,
+};
+use osumemoryreading::config::{AppConfig, DEFAULT_CONFIG_FILE};
 use osumemoryreading::pattern::BytePattern;
 use osumemoryreading::process::{ProcessMemory, list_modules, list_processes, module_or_main};
 use osumemoryreading::profile::{available_profiles, load_profile};
-use osumemoryreading::config::{AppConfig, DEFAULT_CONFIG_FILE};
 use osumemoryreading::session::TournamentSession;
 use osumemoryreading::tournament::read_tournament_state;
 use std::time::Duration;
@@ -299,7 +301,11 @@ fn execute(
             // Second poll demonstrates steady-state cached reading speed
             let snapshot = session.poll()?;
             println!("{}", serde_json::to_string_pretty(&snapshot)?);
-            eprintln!("\nSteady-state poll latency: {} µs ({:.3} ms)", snapshot.poll_duration_us, snapshot.poll_duration_us as f64 / 1000.0);
+            eprintln!(
+                "\nSteady-state poll latency: {} µs ({:.3} ms)",
+                snapshot.poll_duration_us,
+                snapshot.poll_duration_us as f64 / 1000.0
+            );
         }
         Command::TournamentWatch {
             profile,
@@ -310,21 +316,33 @@ fn execute(
             let mut session = TournamentSession::new(&profile, pointer_width, limit)?;
             println!("Initializing session and scanning patterns once...");
             let init_snapshot = session.poll()?;
-            println!("Attached {} clients (Manager: {}) in {:.2} ms",
+            println!(
+                "Attached {} clients (Manager: {}) in {:.2} ms",
                 init_snapshot.clients.len(),
                 init_snapshot.manager.is_some(),
                 init_snapshot.poll_duration_us as f64 / 1000.0
             );
 
             let mut latencies_us = Vec::new();
-            println!("\nStreaming {} polls at {} ms intervals:", count, interval_ms);
-            println!("{:<6} {:<10} {:<12} {:<12} {:<10}", "ITER", "LATENCY", "LEFT SCORE", "RIGHT SCORE", "CLIENTS");
+            println!(
+                "\nStreaming {} polls at {} ms intervals:",
+                count, interval_ms
+            );
+            println!(
+                "{:<6} {:<10} {:<12} {:<12} {:<10}",
+                "ITER", "LATENCY", "LEFT SCORE", "RIGHT SCORE", "CLIENTS"
+            );
             for i in 1..=count {
                 std::thread::sleep(Duration::from_millis(interval_ms));
                 let snap = session.poll()?;
                 latencies_us.push(snap.poll_duration_us);
-                let (left_score, right_score) = snap.manager.as_ref().map(|m| (m.left_score, m.right_score)).unwrap_or((0, 0));
-                println!("{:<6} {:>6.2} ms {:>12} {:>12} {:>10}",
+                let (left_score, right_score) = snap
+                    .manager
+                    .as_ref()
+                    .map(|m| (m.left_score, m.right_score))
+                    .unwrap_or((0, 0));
+                println!(
+                    "{:<6} {:>6.2} ms {:>12} {:>12} {:>10}",
                     i,
                     snap.poll_duration_us as f64 / 1000.0,
                     left_score,
@@ -332,8 +350,14 @@ fn execute(
                     snap.clients.len()
                 );
             }
-            let avg_us: u128 = latencies_us.iter().sum::<u128>() / latencies_us.len().max(1) as u128;
-            println!("\nAverage poll latency over {} cycles: {} µs ({:.3} ms)", count, avg_us, avg_us as f64 / 1000.0);
+            let avg_us: u128 =
+                latencies_us.iter().sum::<u128>() / latencies_us.len().max(1) as u128;
+            println!(
+                "\nAverage poll latency over {} cycles: {} µs ({:.3} ms)",
+                count,
+                avg_us,
+                avg_us as f64 / 1000.0
+            );
         }
         Command::CompareTosu { url } => {
             run_compare_tosu(&url, pointer_width)?;
@@ -502,11 +526,18 @@ fn execute(
                 }
                 ConfigAction::Validate => {
                     config.validate()?;
-                    println!("Configuration at '{}' is valid and within safe limits!", active_path);
+                    println!(
+                        "Configuration at '{}' is valid and within safe limits!",
+                        active_path
+                    );
                 }
             }
         }
-        Command::Serve { host, port, poll_rate } => {
+        Command::Serve {
+            host,
+            port,
+            poll_rate,
+        } => {
             let host = host.unwrap_or(config.server.host.clone());
             let port = port.unwrap_or(config.server.port);
             let poll_hz = poll_rate.unwrap_or(config.poll.poll_rate_hz as u64);
@@ -534,26 +565,27 @@ async fn run_serve_loop(
     });
 
     println!("===========================================================");
-    println!(" tosu Rust Native Replacement Server running on http://{}:{}", host, port);
+    println!(
+        " tosu Rust Native Replacement Server running on http://{}:{}",
+        host, port
+    );
     println!(" Live Endpoints:");
     println!("   - HTTP JSON:        http://{}:{}/json/v2", host, port);
     println!("   - WebSocket Stream: ws://{}:{}/websocket/v2", host, port);
     println!("   - Health check:     http://{}:{}/health", host, port);
-    println!(" Polling rate: {} Hz ({} ms interval)", poll_rate_hz, 1000 / poll_rate_hz.max(1));
+    println!(
+        " Polling rate: {} Hz ({} ms interval)",
+        poll_rate_hz,
+        1000 / poll_rate_hz.max(1)
+    );
     println!("===========================================================");
 
     let interval = Duration::from_millis(1000 / poll_rate_hz.max(1));
     let limit = (config.poll.scan_budget_mb * 1024 * 1024) as usize;
-    let mut tourney_session = TournamentSession::new(
-        &config.poll.default_profile,
-        pointer_width,
-        limit,
-    )?;
-    let mut solo_session = osumemoryreading::session::SoloSession::new(
-        "stable",
-        pointer_width,
-        limit,
-    )?;
+    let mut tourney_session =
+        TournamentSession::new(&config.poll.default_profile, pointer_width, limit)?;
+    let mut solo_session =
+        osumemoryreading::session::SoloSession::new("stable", pointer_width, limit)?;
 
     loop {
         tokio::time::sleep(interval).await;
@@ -567,17 +599,48 @@ async fn run_serve_loop(
             continue;
         }
 
-        let is_tournament = osu_procs.len() > 1 || osu_procs.iter().any(|p| {
-            let cmd = ProcessMemory::open(p.pid).and_then(|m| m.command_line()).unwrap_or_default();
-            cmd.contains("-spectateclient") || cmd.contains("-tournament")
-        });
+        let is_tournament = osu_procs.len() > 1
+            || osu_procs.iter().any(|p| {
+                let cmd = ProcessMemory::open(p.pid)
+                    .and_then(|m| m.command_line())
+                    .unwrap_or_default();
+                cmd.contains("-spectateclient") || is_tournament_manager_cmd(&cmd)
+            });
 
         if is_tournament {
             if let Ok(snap) = tourney_session.poll() {
-                let mut packet = osumemoryreading::v2::TosuV2Packet::default();
-                packet.client = "tournament".to_string();
-                packet.state.number = 19;
-                packet.state.name = "tourney".to_string();
+                let mut packet = osumemoryreading::v2::TosuV2Packet {
+                    client: "stable".to_string(),
+                    server: "ppy.sh".to_string(),
+                    profile: guest_profile(),
+                    state: osumemoryreading::v2::OsuStatusState {
+                        number: 22,
+                        name: "tourney".to_string(),
+                    },
+                    ..Default::default()
+                };
+
+                if let Some(profile) = snap.profile.as_ref() {
+                    packet.profile = profile_state(profile);
+                }
+                packet.folders.game = snap.game_folder.clone();
+                packet.folders.songs = snap.songs_folder.clone();
+                packet.folders.skin = snap.skin_folder.clone();
+                packet.direct_path.skin_folder = snap.skin_folder.clone();
+                packet.session.play_time = snap.game_time;
+                if let Some(beatmap) = snap.beatmap.as_ref() {
+                    packet.folders.beatmap = beatmap.folder.clone();
+                    packet.files.beatmap = beatmap.filename.clone();
+                    packet.files.background = beatmap.background_filename.clone();
+                    packet.files.audio = beatmap.audio_filename.clone();
+                    packet.direct_path.beatmap_folder = beatmap.folder.clone();
+                    packet.direct_path.beatmap_file = join_path(&beatmap.folder, &beatmap.filename);
+                    packet.direct_path.beatmap_background =
+                        join_path(&beatmap.folder, &beatmap.background_filename);
+                    packet.direct_path.beatmap_audio =
+                        join_path(&beatmap.folder, &beatmap.audio_filename);
+                    packet.beatmap = beatmap.clone();
+                }
 
                 if let Some(mgr) = snap.manager {
                     packet.tourney.ipc_state = mgr.ipc_state;
@@ -594,46 +657,39 @@ async fn run_serve_loop(
                 }
 
                 for client in snap.clients {
-                    let team = client.team;
-                    let ipc_id = client.ipc_id;
-                    let user = client.user.map(|u| osumemoryreading::v2::TourneyUser {
-                        id: u.id,
-                        name: u.name,
-                        country: u.country,
-                        accuracy: u.accuracy as f32,
-                        ranked_score: u.ranked_score,
-                        play_count: u.play_count,
-                        global_rank: u.global_rank,
-                        total_pp: u.pp,
-                    }).unwrap_or_default();
+                    let user = client
+                        .user
+                        .map(|u| osumemoryreading::v2::TourneyUser {
+                            id: u.id,
+                            name: u.name,
+                            country: u.country.to_ascii_uppercase(),
+                            accuracy: u.accuracy as f32,
+                            ranked_score: u.ranked_score,
+                            play_count: u.play_count,
+                            global_rank: u.global_rank,
+                            total_pp: u.pp,
+                        })
+                        .unwrap_or_default();
+                    let play = gameplay_to_play(client.gameplay);
+                    let beatmap = osumemoryreading::v2::TourneyClientBeatmap {
+                        stats: client.beatmap.map(|value| value.stats).unwrap_or_default(),
+                    };
 
-                    let gameplay = client.gameplay.map(|g| {
-                        let mut play = osumemoryreading::v2::PlayState::default();
-                        play.player_name = g.player_name;
-                        play.score = g.score;
-                        play.accuracy = g.accuracy;
-                        play.combo.current = g.combo as i32;
-                        play.combo.max = g.max_combo as i32;
-                        play.hits.n300 = g.hit_300 as i32;
-                        play.hits.n100 = g.hit_100 as i32;
-                        play.hits.n50 = g.hit_50 as i32;
-                        play.hits.n0 = g.hit_miss as i32;
-                        play.hits.geki = g.hit_geki as i32;
-                        play.hits.katu = g.hit_katu as i32;
-                        play.health_bar.normal = g.player_hp;
-                        play.health_bar.smooth = g.player_hp_smooth;
-                        play.rank.current = g.grade;
-                        play.mods = osumemoryreading::v2::create_mods_state(g.mods, &g.mods_str);
-                        play
-                    }).unwrap_or_default();
-
-                    packet.tourney.clients.push(osumemoryreading::v2::TourneyIpcClient {
-                        ipc_id,
-                        team,
-                        user,
-                        beatmap: osumemoryreading::beatmap::BeatmapSnapshot::default(),
-                        gameplay,
-                    });
+                    packet
+                        .tourney
+                        .clients
+                        .push(osumemoryreading::v2::TourneyIpcClient {
+                            ipc_id: client.ipc_id,
+                            team: client.team,
+                            settings: osumemoryreading::v2::TourneyClientSettings {
+                                mania: osumemoryreading::v2::TourneyManiaSettings {
+                                    scroll_speed: 12,
+                                },
+                            },
+                            user,
+                            beatmap,
+                            play,
+                        });
                 }
 
                 let _ = tx.send(packet);
@@ -647,13 +703,172 @@ async fn run_serve_loop(
     }
 }
 
+fn gameplay_to_play(gameplay: Option<GameplayState>) -> osumemoryreading::v2::PlayState {
+    let Some(g) = gameplay else {
+        return osumemoryreading::v2::PlayState::default();
+    };
+    let mut play = osumemoryreading::v2::PlayState {
+        failed: g.player_hp <= 0.0,
+        player_name: g.player_name,
+        mode: osumemoryreading::v2::OsuStatusState {
+            number: g.mode,
+            name: ruleset_name(g.mode).to_string(),
+        },
+        score: g.score,
+        accuracy: g.accuracy,
+        health_bar: osumemoryreading::v2::HealthBarState {
+            normal: g.player_hp / 2.0,
+            smooth: g.player_hp_smooth / 2.0,
+        },
+        hits: osumemoryreading::v2::HitsState {
+            n0: g.hit_miss as i32,
+            n50: g.hit_50 as i32,
+            n100: g.hit_100 as i32,
+            n300: g.hit_300 as i32,
+            geki: g.hit_geki as i32,
+            katu: g.hit_katu as i32,
+            slider_breaks: g.slider_breaks,
+            ..Default::default()
+        },
+        hit_error_array: g.hit_error_array,
+        combo: osumemoryreading::v2::ComboState {
+            current: g.combo as i32,
+            max: g.max_combo as i32,
+        },
+        mods: osumemoryreading::v2::create_mods_state(g.mods, &g.mods_str),
+        rank: osumemoryreading::v2::RankState {
+            current: g.grade.clone(),
+            max_this_play: g.grade_max,
+        },
+        unstable_rate: g.unstable_rate,
+        ..Default::default()
+    };
+    play.pp = osumemoryreading::pp::LivePpResult::default();
+    play
+}
+
+fn profile_state(profile: &LocalProfile) -> osumemoryreading::v2::ProfileState {
+    osumemoryreading::v2::ProfileState {
+        user_status: osumemoryreading::v2::OsuStatusState {
+            number: profile.raw_login_status,
+            name: login_status_name(profile.raw_login_status).to_string(),
+        },
+        bancho_status: osumemoryreading::v2::OsuStatusState {
+            number: profile.raw_bancho_status,
+            name: bancho_status_name(profile.raw_bancho_status).to_string(),
+        },
+        id: profile.id,
+        name: profile.name.clone(),
+        mode: osumemoryreading::v2::OsuStatusState {
+            number: profile.play_mode,
+            name: ruleset_name(profile.play_mode).to_string(),
+        },
+        ranked_score: profile.ranked_score,
+        level: profile.level as f64,
+        accuracy: profile.accuracy,
+        pp: profile.performance_points,
+        play_count: profile.play_count,
+        global_rank: profile.rank,
+        country_code: osumemoryreading::v2::OsuStatusState {
+            number: profile.country_code,
+            name: country_name(profile.country_code).to_ascii_uppercase(),
+        },
+        background_colour: format!("{:x}", profile.background_colour),
+        matchmaking: None,
+    }
+}
+
+fn guest_profile() -> osumemoryreading::v2::ProfileState {
+    osumemoryreading::v2::ProfileState {
+        user_status: osumemoryreading::v2::OsuStatusState {
+            number: 256,
+            name: "guest".to_string(),
+        },
+        bancho_status: osumemoryreading::v2::OsuStatusState {
+            number: 0,
+            name: "idle".to_string(),
+        },
+        id: -1,
+        name: "Guest".to_string(),
+        mode: osumemoryreading::v2::OsuStatusState {
+            number: 0,
+            name: "osu".to_string(),
+        },
+        background_colour: "ff010101".to_string(),
+        ..Default::default()
+    }
+}
+
+fn join_path(folder: &str, file: &str) -> String {
+    if folder.is_empty() {
+        file.to_string()
+    } else if file.is_empty() {
+        folder.to_string()
+    } else {
+        format!("{}\\{}", folder, file)
+    }
+}
+
+fn login_status_name(value: i32) -> &'static str {
+    match value {
+        0 => "reconnecting",
+        256 => "guest",
+        257 => "recieving_data",
+        65537 => "disconnected",
+        65793 => "connected",
+        _ => "",
+    }
+}
+
+fn bancho_status_name(value: i32) -> &'static str {
+    match value {
+        0 => "idle",
+        1 => "afk",
+        2 => "playing",
+        3 => "editing",
+        4 => "modding",
+        5 => "multiplayer",
+        6 => "watching",
+        7 => "unknown",
+        8 => "testing",
+        9 => "submitting",
+        10 => "paused",
+        11 => "lobby",
+        12 => "multiplaying",
+        13 => "osuDirect",
+        _ => "",
+    }
+}
+
+fn ruleset_name(value: i32) -> &'static str {
+    match value {
+        0 => "osu",
+        1 => "taiko",
+        2 => "fruits",
+        3 => "mania",
+        _ => "",
+    }
+}
+
+fn country_name(value: i32) -> &'static str {
+    const CODES: &str = "oc eu ad ae af ag ai al am an ao aq ar as at au aw az ba bb bd be bf bg bh bi bj bm bn bo br bs bt bv bw by bz ca cc cd cf cg ch ci ck cl cm cn co cr cu cv cw cx cy cz de dj dk dm do dz ec ee eg eh er es et fi fj fk fm fo fr fx ga gb gd ge gf gh gi gl gm gn gq gr gs gt gu gw gy hk hm hn hr ht hu id ie il in io iq ir is it jm jo jp ke kg kh ki km kn kp kr kw ky kz la lb lc li lk lr ls lt lu lv ly ma mc md mg mh mk ml mm mn mo mq mr ms mt mu mv mw mx my mz na nc ne nf ng ni nl no np nr nu nz om pa pe pf pg ph pk pl pm pn pr ps pt pw py qa re ro ru rw sa sb sc sd se sg sh si sj sk sl sm sn so sr st sv sy sz tc td tf tg th tj tk tm tn to tl tr tt tv tw tz ua ug um us uy uz va vc ve vg vi vn vu wf ws ye yt rs za zm me zw xx a2 o1 ax gg im je bl mf";
+    if value < 1 {
+        return "";
+    }
+    CODES
+        .split_whitespace()
+        .nth((value - 1) as usize)
+        .unwrap_or("")
+}
+
 fn http_get_localhost(port: u16, path: &str) -> Result<String> {
     use std::io::{Read, Write};
     use std::net::TcpStream;
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .with_context(|| format!("connecting to localhost:{port}"))?;
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-    let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes())?;
     let mut response = Vec::new();
     stream.read_to_end(&mut response)?;
@@ -672,9 +887,10 @@ fn run_compare_tosu(url: &str, pointer_width: Option<usize>) -> Result<()> {
     } else {
         bail!("Only localhost:24050 is supported for direct comparison");
     };
-    let tosu_val: serde_json::Value = serde_json::from_str(&tosu_raw)
-        .context("parsing tosu json")?;
-    let tosu_tourney = tosu_val.get("tourney")
+    let tosu_val: serde_json::Value =
+        serde_json::from_str(&tosu_raw).context("parsing tosu json")?;
+    let tosu_tourney = tosu_val
+        .get("tourney")
         .ok_or_else(|| anyhow::anyhow!("tosu json missing 'tourney' field"))?;
 
     println!("Initializing native Rust TournamentSession...");
@@ -686,30 +902,84 @@ fn run_compare_tosu(url: &str, pointer_width: Option<usize>) -> Result<()> {
     let rust_snap = session.poll()?;
 
     println!("\n=== PERFORMANCE ===");
-    println!("Native Rust Steady-State Poll: {} µs ({:.3} ms)",
+    println!(
+        "Native Rust Steady-State Poll: {} µs ({:.3} ms)",
         rust_snap.poll_duration_us,
         rust_snap.poll_duration_us as f64 / 1000.0
     );
 
     println!("\n=== TOURNAMENT MANAGER COMPARISON ===");
-    let tosu_ipc_state = tosu_tourney.get("ipcState").and_then(|v| v.as_i64()).unwrap_or(-1);
-    let tosu_best_of = tosu_tourney.get("bestOF").and_then(|v| v.as_i64()).unwrap_or(-1);
-    let tosu_stars_left = tosu_tourney.get("points").and_then(|v| v.get("left")).and_then(|v| v.as_i64()).unwrap_or(0);
-    let tosu_stars_right = tosu_tourney.get("points").and_then(|v| v.get("right")).and_then(|v| v.as_i64()).unwrap_or(0);
-    let tosu_score_left = tosu_tourney.get("totalScore").and_then(|v| v.get("left")).and_then(|v| v.as_i64()).unwrap_or(0);
-    let tosu_score_right = tosu_tourney.get("totalScore").and_then(|v| v.get("right")).and_then(|v| v.as_i64()).unwrap_or(0);
-    let tosu_team_left = tosu_tourney.get("team").and_then(|v| v.get("left")).and_then(|v| v.as_str()).unwrap_or("");
-    let tosu_team_right = tosu_tourney.get("team").and_then(|v| v.get("right")).and_then(|v| v.as_str()).unwrap_or("");
+    let tosu_ipc_state = tosu_tourney
+        .get("ipcState")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1);
+    let tosu_best_of = tosu_tourney
+        .get("bestOF")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-1);
+    let tosu_stars_left = tosu_tourney
+        .get("points")
+        .and_then(|v| v.get("left"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let tosu_stars_right = tosu_tourney
+        .get("points")
+        .and_then(|v| v.get("right"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let tosu_score_left = tosu_tourney
+        .get("totalScore")
+        .and_then(|v| v.get("left"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let tosu_score_right = tosu_tourney
+        .get("totalScore")
+        .and_then(|v| v.get("right"))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let tosu_team_left = tosu_tourney
+        .get("team")
+        .and_then(|v| v.get("left"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let tosu_team_right = tosu_tourney
+        .get("team")
+        .and_then(|v| v.get("right"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
     if let Some(ref m) = rust_snap.manager {
-        println!("{:<20} | {:<20} | {:<20} | Status", "Field", "tosu", "Rust Native");
+        println!(
+            "{:<20} | {:<20} | {:<20} | Status",
+            "Field", "tosu", "Rust Native"
+        );
         println!("{:-<20}-+-{:-<20}-+-{:-<20}-+-------", "", "", "");
-        print_cmp("ipcState", &tosu_ipc_state.to_string(), &m.ipc_state.to_string());
+        print_cmp(
+            "ipcState",
+            &tosu_ipc_state.to_string(),
+            &m.ipc_state.to_string(),
+        );
         print_cmp("bestOF", &tosu_best_of.to_string(), &m.best_of.to_string());
-        print_cmp("points.left", &tosu_stars_left.to_string(), &m.left_stars.to_string());
-        print_cmp("points.right", &tosu_stars_right.to_string(), &m.right_stars.to_string());
-        print_cmp("score.left", &tosu_score_left.to_string(), &m.left_score.to_string());
-        print_cmp("score.right", &tosu_score_right.to_string(), &m.right_score.to_string());
+        print_cmp(
+            "points.left",
+            &tosu_stars_left.to_string(),
+            &m.left_stars.to_string(),
+        );
+        print_cmp(
+            "points.right",
+            &tosu_stars_right.to_string(),
+            &m.right_stars.to_string(),
+        );
+        print_cmp(
+            "score.left",
+            &tosu_score_left.to_string(),
+            &m.left_score.to_string(),
+        );
+        print_cmp(
+            "score.right",
+            &tosu_score_right.to_string(),
+            &m.right_score.to_string(),
+        );
         print_cmp("team.left", tosu_team_left, &m.first_team_name);
         print_cmp("team.right", tosu_team_right, &m.second_team_name);
     } else {
@@ -718,39 +988,85 @@ fn run_compare_tosu(url: &str, pointer_width: Option<usize>) -> Result<()> {
 
     println!("\n=== SPECTATOR CLIENTS COMPARISON ===");
     let tosu_clients = tosu_tourney.get("clients").and_then(|v| v.as_array());
-    println!("{:<5} {:<6} {:<16} {:<12} {:<8} {:<8} {:<8}",
-        "ipcId", "TEAM", "PLAYER NAME", "SCORE", "ACCURACY", "COMBO", "MODS");
-    println!("{:-<5} {:-<6} {:-<16} {:-<12} {:-<8} {:-<8} {:-<8}", "", "", "", "", "", "", "");
+    println!(
+        "{:<5} {:<6} {:<16} {:<12} {:<8} {:<8} {:<8}",
+        "ipcId", "TEAM", "PLAYER NAME", "SCORE", "ACCURACY", "COMBO", "MODS"
+    );
+    println!(
+        "{:-<5} {:-<6} {:-<16} {:-<12} {:-<8} {:-<8} {:-<8}",
+        "", "", "", "", "", "", ""
+    );
 
     for rust_client in &rust_snap.clients {
-        let rust_name = rust_client.user.as_ref().map(|u| u.name.as_str()).unwrap_or("?");
+        let rust_name = rust_client
+            .user
+            .as_ref()
+            .map(|u| u.name.as_str())
+            .unwrap_or("?");
         let rust_score = rust_client.gameplay.as_ref().map(|g| g.score).unwrap_or(0);
-        let rust_acc = rust_client.gameplay.as_ref().map(|g| g.accuracy).unwrap_or(0.0);
+        let rust_acc = rust_client
+            .gameplay
+            .as_ref()
+            .map(|g| g.accuracy)
+            .unwrap_or(0.0);
         let rust_combo = rust_client.gameplay.as_ref().map(|g| g.combo).unwrap_or(0);
-        let rust_mods = rust_client.gameplay.as_ref().map(|g| g.mods_str.as_str()).unwrap_or("");
+        let rust_mods = rust_client
+            .gameplay
+            .as_ref()
+            .map(|g| g.mods_str.as_str())
+            .unwrap_or("");
 
         // Find corresponding tosu client
         let tosu_client = tosu_clients.and_then(|arr| {
-            arr.iter().find(|c| c.get("ipcId").and_then(|v| v.as_u64()) == Some(rust_client.ipc_id as u64))
+            arr.iter().find(|c| {
+                c.get("ipcId").and_then(|v| v.as_u64()) == Some(rust_client.ipc_id as u64)
+            })
         });
 
         let (t_team, t_name, t_score, t_acc, t_combo, t_mods) = if let Some(tc) = tosu_client {
             (
                 tc.get("team").and_then(|v| v.as_str()).unwrap_or(""),
-                tc.get("user").and_then(|v| v.get("name")).and_then(|v| v.as_str()).unwrap_or(""),
-                tc.get("play").and_then(|v| v.get("score")).and_then(|v| v.as_i64()).unwrap_or(0),
-                tc.get("play").and_then(|v| v.get("accuracy")).and_then(|v| v.as_f64()).unwrap_or(0.0),
-                tc.get("play").and_then(|v| v.get("combo")).and_then(|v| v.get("current")).and_then(|v| v.as_i64()).unwrap_or(0),
-                tc.get("play").and_then(|v| v.get("mods")).and_then(|v| v.get("name")).and_then(|v| v.as_str()).unwrap_or("")
+                tc.get("user")
+                    .and_then(|v| v.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
+                tc.get("play")
+                    .and_then(|v| v.get("score"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0),
+                tc.get("play")
+                    .and_then(|v| v.get("accuracy"))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0),
+                tc.get("play")
+                    .and_then(|v| v.get("combo"))
+                    .and_then(|v| v.get("current"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0),
+                tc.get("play")
+                    .and_then(|v| v.get("mods"))
+                    .and_then(|v| v.get("name"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(""),
             )
         } else {
             ("", "", 0, 0.0, 0, "")
         };
 
-        println!("Rust [#{}]  {:<6} {:<16} {:<12} {:<8.2}% {:<8} {:<8}",
-            rust_client.ipc_id, rust_client.team, rust_name, rust_score, rust_acc, rust_combo, rust_mods);
-        println!("tosu [#{}]  {:<6} {:<16} {:<12} {:<8.2}% {:<8} {:<8}",
-            rust_client.ipc_id, t_team, t_name, t_score, t_acc, t_combo, t_mods);
+        println!(
+            "Rust [#{}]  {:<6} {:<16} {:<12} {:<8.2}% {:<8} {:<8}",
+            rust_client.ipc_id,
+            rust_client.team,
+            rust_name,
+            rust_score,
+            rust_acc,
+            rust_combo,
+            rust_mods
+        );
+        println!(
+            "tosu [#{}]  {:<6} {:<16} {:<12} {:<8.2}% {:<8} {:<8}",
+            rust_client.ipc_id, t_team, t_name, t_score, t_acc, t_combo, t_mods
+        );
         println!("{:-<75}", "");
     }
 

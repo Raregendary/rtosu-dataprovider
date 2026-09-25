@@ -62,8 +62,8 @@ mod platform {
         IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_I386,
     };
     use windows_sys::Win32::System::Threading::{
-        IsWow64Process, IsWow64Process2, OpenProcess, QueryFullProcessImageNameW,
-        PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+        IsWow64Process, IsWow64Process2, OpenProcess, PROCESS_QUERY_INFORMATION,
+        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ, QueryFullProcessImageNameW,
     };
 
     const MAXIMUM_USER_ADDRESS_64: usize = 0x0000_7fff_ffff_ffff;
@@ -262,9 +262,8 @@ mod platform {
             if ntdll.is_null() {
                 bail!("failed to get ntdll handle");
             }
-            let nt_query_info_proc = unsafe {
-                GetProcAddress(ntdll, b"NtQueryInformationProcess\0".as_ptr())
-            };
+            let nt_query_info_proc =
+                unsafe { GetProcAddress(ntdll, b"NtQueryInformationProcess\0".as_ptr()) };
             let Some(nt_query_info_proc) = nt_query_info_proc else {
                 bail!("failed to resolve NtQueryInformationProcess");
             };
@@ -334,12 +333,8 @@ mod platform {
             unsafe {
                 let mut buffer = [0u16; 1024];
                 let mut size = buffer.len() as u32;
-                let res = QueryFullProcessImageNameW(
-                    self.handle,
-                    0,
-                    buffer.as_mut_ptr(),
-                    &mut size,
-                );
+                let res =
+                    QueryFullProcessImageNameW(self.handle, 0, buffer.as_mut_ptr(), &mut size);
                 if res != 0 && size > 0 {
                     Ok(String::from_utf16_lossy(&buffer[..size as usize]))
                 } else {

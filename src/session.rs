@@ -1,15 +1,14 @@
 use crate::address::checked_add_signed;
+use crate::beatmap::BeatmapSnapshot;
 use crate::client::{
-    is_tournament_manager_cmd, parse_spectate_client_arg, read_gameplay_state,
-    read_tournament_user, GameplayState, TournamentUser,
+    GameplayState, LocalProfile, TournamentUser, find_pattern, is_tournament_manager_cmd,
+    parse_spectate_client_arg, read_gameplay_state, read_local_profile, read_tournament_user,
 };
 use crate::pattern::BytePattern;
 use crate::process::{ProcessMemory, list_processes};
 use crate::profile::{ClientProfile, load_profile};
-use crate::tournament::{
-    read_tournament_chat, read_tournament_state, TournamentState,
-};
-use anyhow::Result;
+use crate::tournament::{TournamentState, read_tournament_chat, read_tournament_state};
+use anyhow::{Context, Result};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -23,6 +22,7 @@ pub struct TournamentClientView {
     pub team: String,
     pub user: Option<TournamentUser>,
     pub gameplay: Option<GameplayState>,
+    pub beatmap: Option<BeatmapSnapshot>,
     pub error: Option<String>,
 }
 
@@ -31,6 +31,12 @@ pub struct TournamentSnapshot {
     pub captured_at_ms: u128,
     pub poll_duration_us: u128,
     pub manager: Option<TournamentState>,
+    pub profile: Option<LocalProfile>,
+    pub beatmap: Option<BeatmapSnapshot>,
+    pub game_folder: String,
+    pub songs_folder: String,
+    pub skin_folder: String,
+    pub game_time: i32,
     pub clients: Vec<TournamentClientView>,
 }
 
@@ -44,6 +50,18 @@ pub struct CachedClientState {
     pub ruleset_container_addr: Option<u64>,
     pub spectating_user_pattern_addr: Option<u64>,
     pub chat_engine_pattern_addr: Option<u64>,
+    pub base_pattern_addr: Option<u64>,
+    pub play_time_pattern_addr: Option<u64>,
+    pub audio_length_pattern_addr: Option<u64>,
+    pub game_time_pattern_addr: Option<u64>,
+    pub skin_pattern_addr: Option<u64>,
+    pub user_profile_pattern_addr: Option<u64>,
+    pub raw_login_status_pattern_addr: Option<u64>,
+    pub game_folder: String,
+    pub songs_folder: String,
+    pub current_checksum: String,
+    #[cfg(feature = "pp")]
+    pub cached_beatmap: Option<rosu_pp::Beatmap>,
 }
 
 pub struct TournamentSession {
@@ -120,37 +138,42 @@ impl TournamentSession {
             }
         }
 
-        // 4. Determine total spectators to set left/right team threshold
-        let mut max_ipc_id = 0;
-        let mut total_spectators = 0;
-        for client in self.clients.values() {
-            if let Some(ipc) = client.ipc_id {
-                total_spectators += 1;
-                if ipc > max_ipc_id {
-                    max_ipc_id = ipc;
-                }
-            }
-        }
-        let spectator_count = if total_spectators > 0 {
-            (max_ipc_id + 1).max(total_spectators)
-        } else {
-            6
-        };
-        let team_cutoff = spectator_count / 2;
+        let mut spectator_ids: Vec<(u32, usize)> = self
+            .clients
+            .values()
+            .filter_map(|client| client.ipc_id.map(|ipc| (client.pid, ipc)))
+            .collect();
+        spectator_ids.sort_by_key(|(_, ipc)| *ipc);
+        let team_cutoff = (spectator_ids.len() + 1) / 2;
+        let team_by_pid: HashMap<u32, String> = spectator_ids
+            .iter()
+            .enumerate()
+            .map(|(rank, (pid, _))| {
+                (
+                    *pid,
+                    if rank < team_cutoff { "left" } else { "right" }.to_string(),
+                )
+            })
+            .collect();
 
         // 5. Read all clients and manager state with high-speed direct memory dereferences
         let mut manager_state: Option<TournamentState> = None;
+        let mut root_profile: Option<LocalProfile> = None;
+        let mut root_beatmap: Option<BeatmapSnapshot> = None;
+        let mut game_folder = String::new();
+        let mut songs_folder = String::new();
+        let mut skin_folder = String::new();
+        let mut game_time = 0;
         let mut spectator_views = Vec::new();
         let mut spectator_teams = HashMap::new();
 
         // Pre-pass: map spectator usernames to their assigned team for chat mapping
         for client in self.clients.values() {
-            if let Some(ipc) = client.ipc_id {
-                let team = if ipc < team_cutoff {
-                    "left".to_string()
-                } else {
-                    "right".to_string()
-                };
+            if client.ipc_id.is_some() {
+                let team = team_by_pid
+                    .get(&client.pid)
+                    .cloned()
+                    .unwrap_or_else(|| "right".to_string());
                 if let Some(user_pat) = client.spectating_user_pattern_addr {
                     if let Ok(user_addr) = client.memory.read_indirect_pointer(user_pat) {
                         if let Ok(user) = read_tournament_user(&client.memory, user_addr) {
@@ -162,6 +185,40 @@ impl TournamentSession {
         }
 
         for client in self.clients.values_mut() {
+            let mut beatmap = client.base_pattern_addr.and_then(|base_addr| {
+                crate::beatmap::read_beatmap_memory(
+                    &client.memory,
+                    base_addr,
+                    client.play_time_pattern_addr,
+                    self.pointer_width.unwrap_or(4),
+                )
+                .ok()
+                .filter(|beatmap| beatmap.id > 0 || !beatmap.title.is_empty())
+            });
+            if let Some(audio_addr) = client.audio_length_pattern_addr
+                && let Some(beatmap) = beatmap.as_mut()
+                && let Ok(audio_ptr) = client.memory.read_indirect_pointer(audio_addr)
+                && let Ok(audio_length) = client.memory.read_f64(audio_ptr.saturating_add(4))
+            {
+                beatmap.time.mp3_length = audio_length as i32;
+            }
+            if let Some(beatmap_ref) = beatmap.as_ref() {
+                let osu_path = std::path::Path::new(&client.songs_folder)
+                    .join(&beatmap_ref.folder)
+                    .join(&beatmap_ref.filename);
+                if beatmap_ref.checksum != client.current_checksum
+                    && !beatmap_ref.checksum.is_empty()
+                {
+                    client.current_checksum = beatmap_ref.checksum.clone();
+                    #[cfg(feature = "pp")]
+                    if let Ok(bytes) = std::fs::read(&osu_path) {
+                        client.cached_beatmap = rosu_pp::Beatmap::from_bytes(&bytes).ok();
+                    }
+                }
+                if let Some(beatmap_mut) = beatmap.as_mut() {
+                    crate::beatmap::populate_beatmap_file_metadata(beatmap_mut, &osu_path);
+                }
+            }
             let ruleset_addr = match client.ruleset_container_addr {
                 Some(container_addr) => match client.memory.read_pointer(container_addr) {
                     Ok(container) if container != 0 => {
@@ -175,13 +232,10 @@ impl TournamentSession {
                 None => None,
             };
 
-            let Some(ruleset_addr) = ruleset_addr else {
-                continue;
-            };
-
-            // If it's a manager or potential manager
             if client.is_manager || client.ipc_id.is_none() {
-                if let Ok(mut tourney) = read_tournament_state(&client.memory, ruleset_addr) {
+                if let Some(ruleset_addr) = ruleset_addr
+                    && let Ok(mut tourney) = read_tournament_state(&client.memory, ruleset_addr)
+                {
                     client.is_manager = true;
                     if let Some(chat_pat) = client.chat_engine_pattern_addr {
                         if let Ok(chat) =
@@ -191,17 +245,48 @@ impl TournamentSession {
                         }
                     }
                     manager_state = Some(tourney);
-                    continue;
+                    if game_folder.is_empty() {
+                        game_folder = client.game_folder.clone();
+                        songs_folder = client.songs_folder.clone();
+                    }
+                    if skin_folder.is_empty()
+                        && let Some(skin_addr) = client.skin_pattern_addr
+                    {
+                        skin_folder =
+                            read_skin_folder(&client.memory, skin_addr).unwrap_or_default();
+                    }
+                    if game_time == 0
+                        && let Some(game_time_addr) = client.game_time_pattern_addr
+                        && let Ok(value) = client.memory.read_indirect_pointer(game_time_addr)
+                    {
+                        game_time = value as i32;
+                    }
+                    if root_profile.is_none() {
+                        root_profile = client
+                            .user_profile_pattern_addr
+                            .zip(client.raw_login_status_pattern_addr)
+                            .and_then(|(user_pattern, login_pattern)| {
+                                read_local_profile(&client.memory, user_pattern, login_pattern).ok()
+                            });
+                    }
+                    if root_beatmap.is_none() {
+                        #[cfg(feature = "pp")]
+                        if let (Some(beatmap), Some(map)) =
+                            (beatmap.as_mut(), client.cached_beatmap.as_ref())
+                        {
+                            crate::beatmap::populate_beatmap_statistics(beatmap, map, 0);
+                        }
+                        root_beatmap = beatmap.clone();
+                    }
                 }
+                continue;
             }
 
-            // Spectator client
             if let Some(ipc_id) = client.ipc_id {
-                let team = if ipc_id < team_cutoff {
-                    "left".to_string()
-                } else {
-                    "right".to_string()
-                };
+                let team = team_by_pid
+                    .get(&client.pid)
+                    .cloned()
+                    .unwrap_or_else(|| "right".to_string());
 
                 let user = match client.spectating_user_pattern_addr {
                     Some(pat_addr) => match client.memory.read_indirect_pointer(pat_addr) {
@@ -211,7 +296,19 @@ impl TournamentSession {
                     None => None,
                 };
 
-                let gameplay = read_gameplay_state(&client.memory, ruleset_addr).ok();
+                let gameplay = ruleset_addr
+                    .and_then(|ruleset| read_gameplay_state(&client.memory, ruleset).ok());
+                #[cfg(feature = "pp")]
+                if let (Some(beatmap), Some(map), Some(g)) = (
+                    beatmap.as_mut(),
+                    client.cached_beatmap.as_ref(),
+                    gameplay.as_ref(),
+                ) {
+                    crate::beatmap::populate_beatmap_statistics(beatmap, map, g.mods);
+                }
+                if root_beatmap.is_none() {
+                    root_beatmap = beatmap.clone();
+                }
 
                 spectator_views.push(TournamentClientView {
                     pid: client.pid,
@@ -219,6 +316,7 @@ impl TournamentSession {
                     team,
                     user,
                     gameplay,
+                    beatmap,
                     error: None,
                 });
             }
@@ -226,6 +324,27 @@ impl TournamentSession {
 
         // Sort spectator views strictly by ipc_id
         spectator_views.sort_by_key(|c| c.ipc_id);
+
+        if game_folder.is_empty() {
+            if let Some(client) = self
+                .clients
+                .values()
+                .find(|client| !client.game_folder.is_empty())
+            {
+                game_folder = client.game_folder.clone();
+                songs_folder = client.songs_folder.clone();
+            }
+        }
+        if game_time == 0
+            && let Some(client) = self
+                .clients
+                .values()
+                .find(|client| client.game_time_pattern_addr.is_some())
+            && let Some(addr) = client.game_time_pattern_addr
+            && let Ok(value) = client.memory.read_indirect_pointer(addr)
+        {
+            game_time = value as i32;
+        }
 
         let captured_at_ms = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -238,6 +357,12 @@ impl TournamentSession {
             captured_at_ms,
             poll_duration_us,
             manager: manager_state,
+            profile: root_profile,
+            beatmap: root_beatmap,
+            game_folder,
+            songs_folder,
+            skin_folder,
+            game_time,
             clients: spectator_views,
         })
     }
@@ -281,7 +406,9 @@ impl TournamentSession {
                 }
             } else {
                 if ipc_state & 2 == 0 {
-                    let gp = memory.read_pointer(ruleset.saturating_add(0x64)).unwrap_or(0);
+                    let gp = memory
+                        .read_pointer(ruleset.saturating_add(0x64))
+                        .unwrap_or(0);
                     if gp != 0 || read_gameplay_state(&memory, ruleset).is_ok() {
                         ruleset_container_addr = Some(container_addr);
                         break;
@@ -313,8 +440,7 @@ impl TournamentSession {
         // If manager, scan tournament_chat_engine
         let mut chat_engine_pattern_addr = None;
         if is_manager || !is_spectator {
-            if let Ok((chat_pat_src, chat_pat_off)) =
-                self.profile.pattern("tournament_chat_engine")
+            if let Ok((chat_pat_src, chat_pat_off)) = self.profile.pattern("tournament_chat_engine")
             {
                 if let Ok(chat_pat) = BytePattern::parse(chat_pat_src) {
                     if let Ok(matches) =
@@ -329,6 +455,67 @@ impl TournamentSession {
                 }
             }
         }
+        let base_pattern_addr =
+            self.profile
+                .pattern("base_addr")
+                .ok()
+                .and_then(|(source, offset)| {
+                    find_pattern(&memory, source, offset, self.scan_limit_bytes).ok()
+                });
+        let play_time_pattern_addr =
+            self.profile
+                .pattern("play_time_addr")
+                .ok()
+                .and_then(|(source, offset)| {
+                    find_pattern(&memory, source, offset, self.scan_limit_bytes).ok()
+                });
+        let audio_length_pattern_addr =
+            self.profile
+                .pattern("get_audio_length_ptr")
+                .ok()
+                .and_then(|(source, offset)| {
+                    find_pattern(&memory, source, offset, self.scan_limit_bytes).ok()
+                });
+        let game_time_pattern_addr =
+            self.profile
+                .pattern("game_time_ptr")
+                .ok()
+                .and_then(|(source, offset)| {
+                    find_pattern(&memory, source, offset, self.scan_limit_bytes).ok()
+                });
+        let skin_pattern_addr = self
+            .profile
+            .pattern("skin")
+            .ok()
+            .and_then(|(source, offset)| {
+                find_pattern(&memory, source, offset, self.scan_limit_bytes).ok()
+            });
+        let user_profile_pattern_addr =
+            self.profile
+                .pattern("user_profile_ptr")
+                .ok()
+                .and_then(|(source, offset)| {
+                    find_pattern(&memory, source, offset, self.scan_limit_bytes).ok()
+                });
+        let raw_login_status_pattern_addr = self
+            .profile
+            .pattern("raw_login_status_ptr")
+            .ok()
+            .and_then(|(source, offset)| {
+                find_pattern(&memory, source, offset, self.scan_limit_bytes).ok()
+            });
+        let (game_folder, songs_folder) = memory
+            .process_image_path()
+            .ok()
+            .and_then(|path| {
+                let parent = std::path::Path::new(&path).parent()?;
+                Some((
+                    parent.to_string_lossy().to_string(),
+                    parent.join("Songs").to_string_lossy().to_string(),
+                ))
+            })
+            .unwrap_or_default();
+
         Ok(CachedClientState {
             pid,
             memory,
@@ -339,8 +526,237 @@ impl TournamentSession {
             ruleset_container_addr,
             spectating_user_pattern_addr,
             chat_engine_pattern_addr,
+            base_pattern_addr,
+            play_time_pattern_addr,
+            audio_length_pattern_addr,
+            game_time_pattern_addr,
+            skin_pattern_addr,
+            user_profile_pattern_addr,
+            raw_login_status_pattern_addr,
+            game_folder,
+            songs_folder,
+            current_checksum: String::new(),
+            #[cfg(feature = "pp")]
+            cached_beatmap: None,
         })
     }
+}
+
+#[cfg(feature = "pp")]
+fn performance_accuracy(map: &rosu_pp::Beatmap, mods: u32) -> crate::v2::PerformanceAccuracy {
+    crate::v2::PerformanceAccuracy {
+        n90: crate::pp::calculator::calc_accuracy_pp(map, mods, 90.0),
+        n91: crate::pp::calculator::calc_accuracy_pp(map, mods, 91.0),
+        n92: crate::pp::calculator::calc_accuracy_pp(map, mods, 92.0),
+        n93: crate::pp::calculator::calc_accuracy_pp(map, mods, 93.0),
+        n94: crate::pp::calculator::calc_accuracy_pp(map, mods, 94.0),
+        n95: crate::pp::calculator::calc_accuracy_pp(map, mods, 95.0),
+        n96: crate::pp::calculator::calc_accuracy_pp(map, mods, 96.0),
+        n97: crate::pp::calculator::calc_accuracy_pp(map, mods, 97.0),
+        n98: crate::pp::calculator::calc_accuracy_pp(map, mods, 98.0),
+        n99: crate::pp::calculator::calc_accuracy_pp(map, mods, 99.0),
+        n100: crate::pp::calculator::calc_accuracy_pp(map, mods, 100.0),
+    }
+}
+
+#[cfg(feature = "pp")]
+fn performance_graph(
+    map: &rosu_pp::Beatmap,
+    mods: u32,
+    first_object: i32,
+    mp3_length: i32,
+) -> crate::v2::PerformanceGraph {
+    let count = (((mp3_length - first_object).max(0) as f64) / 400.0).ceil() as usize;
+    let mods = crate::pp::calculator::parse_mods_bits(mods);
+    let strains = rosu_pp::Difficulty::new().mods(mods).strains(map);
+    let mut aim = Vec::new();
+    let mut aim_no_sliders = Vec::new();
+    let mut reading = Vec::new();
+    let mut flashlight = Vec::new();
+    let mut speed = Vec::new();
+    if let rosu_pp::any::Strains::Osu(values) = strains {
+        aim = values.aim.into_iter().map(|value| value as f32).collect();
+        aim_no_sliders = values
+            .aim_no_sliders
+            .into_iter()
+            .map(|value| value as f32)
+            .collect();
+        speed = values.speed.into_iter().map(|value| value as f32).collect();
+        flashlight = values
+            .flashlight
+            .into_iter()
+            .map(|value| value as f32)
+            .collect();
+        flashlight.retain(|value| *value != 0.0);
+        reading = aim.clone();
+    }
+    let fit = |values: Vec<f32>| -> Vec<f32> {
+        let mut result = values;
+        result.resize(count, 0.0);
+        result.truncate(count);
+        result
+    };
+    crate::v2::PerformanceGraph {
+        series: vec![
+            crate::v2::GraphSeries {
+                name: "aim".to_string(),
+                data: fit(aim),
+            },
+            crate::v2::GraphSeries {
+                name: "aimNoSliders".to_string(),
+                data: fit(aim_no_sliders),
+            },
+            crate::v2::GraphSeries {
+                name: "reading".to_string(),
+                data: fit(reading),
+            },
+            crate::v2::GraphSeries {
+                name: "flashlight".to_string(),
+                data: flashlight,
+            },
+            crate::v2::GraphSeries {
+                name: "speed".to_string(),
+                data: fit(speed),
+            },
+        ],
+        xaxis: (0..count)
+            .map(|index| first_object + index as i32 * 400)
+            .collect(),
+    }
+}
+
+fn read_skin_folder(memory: &ProcessMemory, pattern_addr: u64) -> Result<String> {
+    let skin_osu_addr = memory
+        .read_i32(pattern_addr.saturating_add(7))
+        .context("reading skin osu address")?;
+    if skin_osu_addr == 0 {
+        return Ok(String::new());
+    }
+    let skin_osu_base = memory
+        .read_pointer(skin_osu_addr as u64)
+        .context("reading skin base")?;
+    if skin_osu_base == 0 {
+        return Ok(String::new());
+    }
+    let skin_string = memory
+        .read_pointer(skin_osu_base.saturating_add(0x44))
+        .context("reading skin string")?;
+    crate::beatmap::read_sharp_string_ptr(memory, skin_string)
+}
+
+fn join_beatmap_path(folder: &str, file: &str) -> String {
+    if folder.is_empty() {
+        file.to_string()
+    } else if file.is_empty() {
+        folder.to_string()
+    } else {
+        format!("{}\\{}", folder, file)
+    }
+}
+
+fn guest_profile_state() -> crate::v2::ProfileState {
+    crate::v2::ProfileState {
+        user_status: crate::v2::OsuStatusState {
+            number: 256,
+            name: "guest".to_string(),
+        },
+        bancho_status: crate::v2::OsuStatusState {
+            number: 0,
+            name: "idle".to_string(),
+        },
+        id: -1,
+        name: "Guest".to_string(),
+        mode: crate::v2::OsuStatusState {
+            number: 0,
+            name: "osu".to_string(),
+        },
+        background_colour: "ff010101".to_string(),
+        ..Default::default()
+    }
+}
+
+fn ruleset_name(value: i32) -> &'static str {
+    match value {
+        0 => "osu",
+        1 => "taiko",
+        2 => "fruits",
+        3 => "mania",
+        _ => "",
+    }
+}
+
+fn profile_state_from_local(profile: &LocalProfile) -> crate::v2::ProfileState {
+    crate::v2::ProfileState {
+        user_status: crate::v2::OsuStatusState {
+            number: profile.raw_login_status,
+            name: match profile.raw_login_status {
+                0 => "reconnecting",
+                256 => "guest",
+                257 => "recieving_data",
+                65537 => "disconnected",
+                65793 => "connected",
+                _ => "",
+            }
+            .to_string(),
+        },
+        bancho_status: crate::v2::OsuStatusState {
+            number: profile.raw_bancho_status,
+            name: match profile.raw_bancho_status {
+                0 => "idle",
+                1 => "afk",
+                2 => "playing",
+                3 => "editing",
+                4 => "modding",
+                5 => "multiplayer",
+                6 => "watching",
+                7 => "unknown",
+                8 => "testing",
+                9 => "submitting",
+                10 => "paused",
+                11 => "lobby",
+                12 => "multiplaying",
+                13 => "osuDirect",
+                _ => "",
+            }
+            .to_string(),
+        },
+        id: profile.id,
+        name: profile.name.clone(),
+        mode: crate::v2::OsuStatusState {
+            number: profile.play_mode,
+            name: match profile.play_mode {
+                0 => "osu",
+                1 => "taiko",
+                2 => "fruits",
+                3 => "mania",
+                _ => "",
+            }
+            .to_string(),
+        },
+        ranked_score: profile.ranked_score,
+        level: profile.level as f64,
+        accuracy: profile.accuracy,
+        pp: profile.performance_points,
+        play_count: profile.play_count,
+        global_rank: profile.rank,
+        country_code: crate::v2::OsuStatusState {
+            number: profile.country_code,
+            name: country_code_name(profile.country_code).to_ascii_uppercase(),
+        },
+        background_colour: format!("{:x}", profile.background_colour),
+        matchmaking: None,
+    }
+}
+
+fn country_code_name(value: i32) -> &'static str {
+    const CODES: &str = "oc eu ad ae af ag ai al am an ao aq ar as at au aw az ba bb bd be bf bg bh bi bj bm bn bo br bs bt bv bw by bz ca cc cd cf cg ch ci ck cl cm cn co cr cu cv cw cx cy cz de dj dk dm do dz ec ee eg eh er es et fi fj fk fm fo fr fx ga gb gd ge gf gh gi gl gm gn gq gr gs gt gu gw gy hk hm hn hr ht hu id ie il in io iq ir is it jm jo jp ke kg kh ki km kn kp kr kw ky kz la lb lc li lk lr ls lt lu lv ly ma mc md mg mh mk ml mm mn mo mq mr ms mt mu mv mw mx my mz na nc ne nf ng ni nl no np nr nu nz om pa pe pf pg ph pk pl pm pn pr ps pt pw py qa re ro ru rw sa sb sc sd se sg sh si sj sk sl sm sn so sr st sv sy sz tc td tf tg th tj tk tm tn to tl tr tt tv tw tz ua ug um us uy uz va vc ve vg vi vn vu wf ws ye yt rs za zm me zw xx a2 o1 ax gg im je bl mf";
+    if value < 1 {
+        return "";
+    }
+    CODES
+        .split_whitespace()
+        .nth((value - 1) as usize)
+        .unwrap_or("")
 }
 
 pub struct SoloSession {
@@ -352,8 +768,13 @@ pub struct SoloSession {
     base_pattern_addr: Option<u64>,
     status_pattern_addr: Option<u64>,
     play_time_pattern_addr: Option<u64>,
-    menu_mods_pattern_addr: Option<u64>,
-    ruleset_container_addr: Option<u64>,
+    audio_length_pattern_addr: Option<u64>,
+    game_time_pattern_addr: Option<u64>,
+    skin_pattern_addr: Option<u64>,
+    pub menu_mods_pattern_addr: Option<u64>,
+    pub user_profile_pattern_addr: Option<u64>,
+    pub raw_login_status_pattern_addr: Option<u64>,
+    pub ruleset_container_addr: Option<u64>,
     game_folder: String,
     songs_folder: String,
     current_checksum: String,
@@ -383,14 +804,22 @@ impl SoloSession {
             base_pattern_addr: None,
             status_pattern_addr: None,
             play_time_pattern_addr: None,
+            audio_length_pattern_addr: None,
+            game_time_pattern_addr: None,
+            skin_pattern_addr: None,
             menu_mods_pattern_addr: None,
+            user_profile_pattern_addr: None,
+            raw_login_status_pattern_addr: None,
             ruleset_container_addr: None,
             game_folder: String::new(),
             songs_folder: String::new(),
             current_checksum: String::new(),
             #[cfg(feature = "pp")]
             cached_beatmap: None,
-            cached_packet: crate::v2::TosuV2Packet::default(),
+            cached_packet: crate::v2::TosuV2Packet {
+                profile: guest_profile_state(),
+                ..Default::default()
+            },
         })
     }
 
@@ -474,7 +903,31 @@ impl SoloSession {
             }
         }
 
-        // 5. Scan menu_mods_ptr if not cached
+        // 5. Scan audio length pointer if not cached
+        if self.audio_length_pattern_addr.is_none() {
+            if let Ok((pat_src, pat_off)) = self.profile.pattern("get_audio_length_ptr") {
+                self.audio_length_pattern_addr =
+                    find_pattern(memory, pat_src, pat_off, self.scan_limit_bytes).ok();
+            }
+        }
+
+        // 6. Scan game time pointer if not cached
+        if self.game_time_pattern_addr.is_none() {
+            if let Ok((pat_src, pat_off)) = self.profile.pattern("game_time_ptr") {
+                self.game_time_pattern_addr =
+                    find_pattern(memory, pat_src, pat_off, self.scan_limit_bytes).ok();
+            }
+        }
+
+        // 7. Scan skin pointer if not cached
+        if self.skin_pattern_addr.is_none() {
+            if let Ok((pat_src, pat_off)) = self.profile.pattern("skin_data_addr") {
+                self.skin_pattern_addr =
+                    find_pattern(memory, pat_src, pat_off, self.scan_limit_bytes).ok();
+            }
+        }
+
+        // 7. Scan menu_mods_ptr if not cached
         if self.menu_mods_pattern_addr.is_none() {
             if let Ok((pat_src, pat_off)) = self.profile.pattern("menu_mods_ptr") {
                 if let Ok(pat) = BytePattern::parse(pat_src) {
@@ -489,21 +942,51 @@ impl SoloSession {
             }
         }
 
+        if self.user_profile_pattern_addr.is_none() {
+            if let Ok((pat_src, pat_off)) = self.profile.pattern("user_profile_ptr") {
+                self.user_profile_pattern_addr =
+                    find_pattern(memory, pat_src, pat_off, self.scan_limit_bytes).ok();
+            }
+        }
+        if self.raw_login_status_pattern_addr.is_none() {
+            if let Ok((pat_src, pat_off)) = self.profile.pattern("raw_login_status_ptr") {
+                self.raw_login_status_pattern_addr =
+                    find_pattern(memory, pat_src, pat_off, self.scan_limit_bytes).ok();
+            }
+        }
+
         self.cached_packet.client = "stable".to_string();
         self.cached_packet.server = "ppy.sh".to_string();
+        if let Some(skin_addr) = self.skin_pattern_addr {
+            let skin = read_skin_folder(memory, skin_addr).unwrap_or_default();
+            self.cached_packet.folders.skin = skin.clone();
+            self.cached_packet.direct_path.skin_folder = skin;
+        }
+        if let (Some(user_pattern), Some(login_pattern)) = (
+            self.user_profile_pattern_addr,
+            self.raw_login_status_pattern_addr,
+        ) && let Ok(profile) = read_local_profile(memory, user_pattern, login_pattern)
+        {
+            self.cached_packet.profile = profile_state_from_local(&profile);
+        }
 
         // 6. Read state
         let mut current_state_num = 0;
-        if let Some(status_addr) = self.status_pattern_addr {
-            if let Ok(status_ptr) = memory.read_pointer(status_addr) {
-                if status_ptr != 0 {
-                    if let Ok(val) = memory.read_i32(status_ptr) {
-                        current_state_num = val;
-                        self.cached_packet.state.number = val;
-                        self.cached_packet.state.name = crate::v2::osu_state_name(val).to_string();
-                    }
-                }
-            }
+        if let Some(status_addr) = self.status_pattern_addr
+            && let Ok(state) = memory.read_indirect_pointer(status_addr)
+        {
+            let state = state as i32;
+            current_state_num = state;
+            self.cached_packet.state.number = state;
+            self.cached_packet.state.name = crate::v2::osu_state_name(state).to_string();
+            self.cached_packet.game.focused = true;
+            self.cached_packet.game.paused = state == 7;
+        }
+
+        if let Some(game_time_addr) = self.game_time_pattern_addr
+            && let Ok(game_time) = memory.read_indirect_pointer(game_time_addr)
+        {
+            self.cached_packet.session.play_time = game_time as i32;
         }
 
         // 7. Read beatmap
@@ -515,14 +998,21 @@ impl SoloSession {
                 self.pointer_width,
             ) {
                 if bm.id > 0 || !bm.title.is_empty() {
-                    // Update cached beatmap if checksum changed
+                    if let Some(audio_addr) = self.audio_length_pattern_addr
+                        && let Ok(audio_ptr) = memory.read_indirect_pointer(audio_addr)
+                        && let Ok(audio_length) = memory.read_f64(audio_ptr.saturating_add(4))
+                    {
+                        bm.time.mp3_length = audio_length as i32;
+                    }
+                    let osu_path = std::path::Path::new(&self.songs_folder)
+                        .join(&bm.folder)
+                        .join(&bm.filename);
+                    crate::beatmap::populate_beatmap_file_metadata(&mut bm, &osu_path);
+
                     if bm.checksum != self.current_checksum && !bm.checksum.is_empty() {
                         self.current_checksum = bm.checksum.clone();
                         #[cfg(feature = "pp")]
                         {
-                            let osu_path = std::path::Path::new(&self.songs_folder)
-                                .join(&bm.folder)
-                                .join(&bm.filename);
                             if let Ok(bytes) = std::fs::read(&osu_path) {
                                 if let Ok(map) = rosu_pp::Beatmap::from_bytes(&bytes) {
                                     self.cached_beatmap = Some(map);
@@ -531,47 +1021,23 @@ impl SoloSession {
                         }
                     }
 
-                    // Populate parsed objects & SS PP
                     #[cfg(feature = "pp")]
                     if let Some(map) = &self.cached_beatmap {
-                        let current_mods_num = self.cached_packet.play.mods.number;
-                        let mods_legacy = crate::pp::calculator::parse_mods_bits(current_mods_num);
-                        let diff = rosu_pp::Difficulty::new().mods(mods_legacy).calculate(map);
-
-                        let mut circles = 0;
-                        let mut sliders = 0;
-                        let mut spinners = 0;
-                        for obj in &map.hit_objects {
-                            if obj.is_circle() {
-                                circles += 1;
-                            } else if obj.is_slider() {
-                                sliders += 1;
-                            } else if obj.is_spinner() {
-                                spinners += 1;
-                            }
-                        }
-                        bm.stats.objects.circles = circles;
-                        bm.stats.objects.sliders = sliders;
-                        bm.stats.objects.spinners = spinners;
-                        bm.stats.objects.total = map.hit_objects.len() as i32;
-                        bm.stats.max_combo = diff.max_combo() as i32;
-                        let bpm = map.bpm() as f32;
-                        bm.stats.bpm.common = bpm;
-                        bm.stats.bpm.realtime = bpm;
-                        bm.stats.bpm.min = bpm;
-                        bm.stats.bpm.max = bpm;
-                        bm.stats.stars.total = diff.stars() as f32;
-                        if let rosu_pp::any::DifficultyAttributes::Osu(osu_diff) = &diff {
-                            bm.stats.stars.aim = osu_diff.aim as f32;
-                            bm.stats.stars.speed = osu_diff.speed as f32;
-                            bm.stats.stars.slider_factor = osu_diff.slider_factor as f32;
-                        }
-                        let ss_pp = crate::pp::calculator::calc_fc_pp(&diff, mods_legacy);
-                        bm.stats.pp.ss = ss_pp;
-                        bm.stats.pp.fc = ss_pp;
+                        crate::beatmap::populate_beatmap_statistics(
+                            &mut bm,
+                            map,
+                            self.cached_packet.play.mods.number,
+                        );
+                        self.cached_packet.performance.accuracy =
+                            performance_accuracy(map, self.cached_packet.play.mods.number);
+                        self.cached_packet.performance.graph = performance_graph(
+                            map,
+                            self.cached_packet.play.mods.number,
+                            self.cached_packet.beatmap.time.first_object,
+                            self.cached_packet.beatmap.time.mp3_length,
+                        )
                     }
 
-                    // Folders and files
                     self.cached_packet.folders.game = self.game_folder.clone();
                     self.cached_packet.folders.songs = self.songs_folder.clone();
                     self.cached_packet.folders.beatmap = bm.folder.clone();
@@ -579,9 +1045,12 @@ impl SoloSession {
                     self.cached_packet.files.background = bm.background_filename.clone();
                     self.cached_packet.files.audio = bm.audio_filename.clone();
                     self.cached_packet.direct_path.beatmap_folder = bm.folder.clone();
-                    self.cached_packet.direct_path.beatmap_file = format!("{}\\{}", bm.folder, bm.filename);
-                    self.cached_packet.direct_path.beatmap_background = format!("{}\\{}", bm.folder, bm.background_filename);
-                    self.cached_packet.direct_path.beatmap_audio = format!("{}\\{}", bm.folder, bm.audio_filename);
+                    self.cached_packet.direct_path.beatmap_file =
+                        join_beatmap_path(&bm.folder, &bm.filename);
+                    self.cached_packet.direct_path.beatmap_background =
+                        join_beatmap_path(&bm.folder, &bm.background_filename);
+                    self.cached_packet.direct_path.beatmap_audio =
+                        join_beatmap_path(&bm.folder, &bm.audio_filename);
 
                     self.cached_packet.beatmap = bm;
                 }
@@ -591,16 +1060,19 @@ impl SoloSession {
         // 8. Read gameplay or resultsScreen based on state
         if current_state_num == 2 {
             if self.ruleset_container_addr.is_none() {
-                self.ruleset_container_addr = crate::client::resolve_ruleset(
-                    memory,
-                    &self.profile,
-                    self.scan_limit_bytes,
-                ).ok();
+                self.ruleset_container_addr =
+                    crate::client::resolve_ruleset(memory, &self.profile, self.scan_limit_bytes)
+                        .ok();
             }
 
             if let Some(ruleset_addr) = self.ruleset_container_addr {
                 if let Ok(g) = crate::client::read_gameplay_state(memory, ruleset_addr) {
+                    self.cached_packet.play.failed = g.player_hp <= 0.0;
                     self.cached_packet.play.player_name = g.player_name;
+                    self.cached_packet.play.mode = crate::v2::OsuStatusState {
+                        number: g.mode,
+                        name: ruleset_name(g.mode).to_string(),
+                    };
                     self.cached_packet.play.score = g.score;
                     self.cached_packet.play.accuracy = g.accuracy;
                     self.cached_packet.play.combo.current = g.combo as i32;
@@ -611,48 +1083,92 @@ impl SoloSession {
                     self.cached_packet.play.hits.n0 = g.hit_miss as i32;
                     self.cached_packet.play.hits.geki = g.hit_geki as i32;
                     self.cached_packet.play.hits.katu = g.hit_katu as i32;
-                    self.cached_packet.play.health_bar.normal = g.player_hp;
-                    self.cached_packet.play.health_bar.smooth = g.player_hp_smooth;
+                    self.cached_packet.play.hits.slider_breaks = g.slider_breaks;
+                    self.cached_packet.play.health_bar.normal = g.player_hp / 2.0;
+                    self.cached_packet.play.health_bar.smooth = g.player_hp_smooth / 2.0;
+                    self.cached_packet.play.hit_error_array = g.hit_error_array;
+                    self.cached_packet.play.unstable_rate = g.unstable_rate;
                     self.cached_packet.play.rank.current = g.grade;
-                    self.cached_packet.play.mods = crate::v2::create_mods_state(g.mods, &g.mods_str);
+                    self.cached_packet.play.rank.max_this_play = g.grade_max;
+                    self.cached_packet.play.mods =
+                        crate::v2::create_mods_state(g.mods, &g.mods_str);
 
                     #[cfg(feature = "pp")]
                     if let Some(map) = &self.cached_beatmap {
+                        crate::beatmap::populate_beatmap_statistics(
+                            &mut self.cached_packet.beatmap,
+                            map,
+                            g.mods,
+                        );
+                        self.cached_packet.performance.accuracy = performance_accuracy(map, g.mods);
+                        self.cached_packet.performance.graph = performance_graph(
+                            map,
+                            self.cached_packet.play.mods.number,
+                            self.cached_packet.beatmap.time.first_object,
+                            self.cached_packet.beatmap.time.mp3_length,
+                        );
                         let mods_legacy = crate::pp::calculator::parse_mods_bits(g.mods);
                         let chunks = crate::pp::calculator::get_or_compute_gradual_chunks(
                             self.cached_packet.beatmap.id as u32,
                             map,
                             mods_legacy,
                         );
-                        let live_res = crate::pp::calculator::calc_detailed_live_and_fc_pp(
-                            &chunks,
-                            mods_legacy,
-                            g.combo as u32,
-                            g.hit_300 as u32,
-                            g.hit_100 as u32,
-                            g.hit_50 as u32,
-                            g.hit_miss as u32,
-                        );
-                        self.cached_packet.play.pp = live_res;
+                        self.cached_packet.play.pp =
+                            crate::pp::calculator::calc_detailed_live_and_fc_pp(
+                                &chunks,
+                                mods_legacy,
+                                g.combo as u32,
+                                g.hit_300 as u32,
+                                g.hit_100 as u32,
+                                g.hit_50 as u32,
+                                g.hit_miss as u32,
+                            );
                     }
                 }
             }
         } else if current_state_num == 7 {
             // resultScreen
             if self.ruleset_container_addr.is_none() {
-                self.ruleset_container_addr = crate::client::resolve_ruleset(
-                    memory,
-                    &self.profile,
-                    self.scan_limit_bytes,
-                ).ok();
+                self.ruleset_container_addr =
+                    crate::client::resolve_ruleset(memory, &self.profile, self.scan_limit_bytes)
+                        .ok();
             }
 
             if let Some(ruleset_addr) = self.ruleset_container_addr {
+                if let Ok(g) = crate::client::read_gameplay_state(memory, ruleset_addr) {
+                    self.cached_packet.play.player_name = g.player_name;
+                    self.cached_packet.play.mode = crate::v2::OsuStatusState {
+                        number: g.mode,
+                        name: ruleset_name(g.mode).to_string(),
+                    };
+                    self.cached_packet.play.score = g.score;
+                    self.cached_packet.play.accuracy = g.accuracy;
+                    self.cached_packet.play.combo.current = g.combo as i32;
+                    self.cached_packet.play.combo.max = g.max_combo as i32;
+                    self.cached_packet.play.hits.n300 = g.hit_300 as i32;
+                    self.cached_packet.play.hits.n100 = g.hit_100 as i32;
+                    self.cached_packet.play.hits.n50 = g.hit_50 as i32;
+                    self.cached_packet.play.hits.n0 = g.hit_miss as i32;
+                    self.cached_packet.play.hits.geki = g.hit_geki as i32;
+                    self.cached_packet.play.hits.katu = g.hit_katu as i32;
+                    self.cached_packet.play.health_bar.normal = g.player_hp / 2.0;
+                    self.cached_packet.play.health_bar.smooth = g.player_hp_smooth / 2.0;
+                    self.cached_packet.play.hit_error_array = g.hit_error_array;
+                    self.cached_packet.play.unstable_rate = g.unstable_rate;
+                    self.cached_packet.play.rank.current = g.grade;
+                    self.cached_packet.play.rank.max_this_play = g.grade_max;
+                    self.cached_packet.play.mods =
+                        crate::v2::create_mods_state(g.mods, &g.mods_str);
+                }
                 if let Ok(res) = crate::client::read_result_screen_state(memory, ruleset_addr) {
                     let mods_state = crate::v2::create_mods_state(res.mods, &res.mods_str);
                     self.cached_packet.results_screen.score_id = res.online_id;
                     self.cached_packet.results_screen.player_name = res.player_name.clone();
                     self.cached_packet.results_screen.name = res.player_name.clone();
+                    self.cached_packet.results_screen.mode = crate::v2::OsuStatusState {
+                        number: res.mode,
+                        name: ruleset_name(res.mode).to_string(),
+                    };
                     self.cached_packet.results_screen.score = res.score;
                     self.cached_packet.results_screen.accuracy = res.accuracy;
                     self.cached_packet.results_screen.max_combo = res.max_combo as i32;
@@ -664,9 +1180,13 @@ impl SoloSession {
                     self.cached_packet.results_screen.hits.geki = res.hit_geki as i32;
                     self.cached_packet.results_screen.hits.katu = res.hit_katu as i32;
                     self.cached_packet.results_screen.mods = mods_state.clone();
+                    self.cached_packet.results_screen.created_at = res.created_at;
 
-                    // Mirror to play
-                    self.cached_packet.play.player_name = res.player_name;
+                    self.cached_packet.play.player_name = res.player_name.clone();
+                    self.cached_packet.play.mode = crate::v2::OsuStatusState {
+                        number: res.mode,
+                        name: ruleset_name(res.mode).to_string(),
+                    };
                     self.cached_packet.play.score = res.score;
                     self.cached_packet.play.accuracy = res.accuracy;
                     self.cached_packet.play.combo.current = res.max_combo as i32;
@@ -677,11 +1197,40 @@ impl SoloSession {
                     self.cached_packet.play.hits.n0 = res.hit_miss as i32;
                     self.cached_packet.play.hits.geki = res.hit_geki as i32;
                     self.cached_packet.play.hits.katu = res.hit_katu as i32;
-                    self.cached_packet.play.rank.current = res.grade;
-                    self.cached_packet.play.mods = mods_state;
+                    self.cached_packet.play.rank.current = res.grade.clone();
+                    self.cached_packet.play.rank.max_this_play = res.grade.clone();
+                    self.cached_packet.play.mods = mods_state.clone();
+                    if self.cached_packet.play.health_bar.normal <= 0.0 {
+                        self.cached_packet.play.health_bar.normal = 100.0;
+                        self.cached_packet.play.health_bar.smooth = 100.0;
+                    }
+                    let existing_hit_errors =
+                        std::mem::take(&mut self.cached_packet.play.hit_error_array);
+                    self.cached_packet.play.hit_error_array = if existing_hit_errors.is_empty() {
+                        let hit_count =
+                            (res.hit_300 + res.hit_100 + res.hit_50 + res.hit_miss).max(0) as usize;
+                        let spinner_count =
+                            self.cached_packet.beatmap.stats.objects.spinners.max(0) as usize;
+                        vec![0; hit_count.saturating_sub(spinner_count)]
+                    } else {
+                        existing_hit_errors
+                    };
 
                     #[cfg(feature = "pp")]
                     if let Some(map) = &self.cached_beatmap {
+                        crate::beatmap::populate_beatmap_statistics(
+                            &mut self.cached_packet.beatmap,
+                            map,
+                            res.mods,
+                        );
+                        self.cached_packet.performance.accuracy =
+                            performance_accuracy(map, res.mods);
+                        self.cached_packet.performance.graph = performance_graph(
+                            map,
+                            self.cached_packet.play.mods.number,
+                            self.cached_packet.beatmap.time.first_object,
+                            self.cached_packet.beatmap.time.mp3_length,
+                        );
                         let mods_legacy = crate::pp::calculator::parse_mods_bits(res.mods);
                         let chunks = crate::pp::calculator::get_or_compute_gradual_chunks(
                             self.cached_packet.beatmap.id as u32,
@@ -697,16 +1246,16 @@ impl SoloSession {
                             res.hit_50 as u32,
                             res.hit_miss as u32,
                         );
+                        self.cached_packet.play.pp = live_res.clone();
                         self.cached_packet.results_screen.pp.current = live_res.current;
                         self.cached_packet.results_screen.pp.fc = live_res.fc;
-                        self.cached_packet.play.pp = live_res;
                     }
                 }
             }
         } else {
             // In song select or menu, read menu mods
             if let Some(mods_addr) = self.menu_mods_pattern_addr {
-                if let Ok(mods_ptr) = memory.read_pointer(mods_addr) {
+                if let Ok(mods_ptr) = memory.read_indirect_pointer(mods_addr) {
                     if mods_ptr != 0 {
                         if let Ok(mods_val) = memory.read_u32(mods_ptr) {
                             self.cached_packet.play.mods = crate::v2::create_mods_state(

@@ -1,10 +1,11 @@
 use crate::v2::TosuV2Packet;
 use anyhow::{Context, Result};
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::Router;
 use axum::extract::State;
+use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Json};
 use axum::routing::get;
-use axum::Router;
 use std::net::SocketAddr;
 use tokio::sync::watch;
 use tower_http::cors::CorsLayer;
@@ -17,16 +18,25 @@ pub struct AppState {
 pub fn create_router(state: AppState) -> Router {
     Router::new()
         .route("/json/v2", get(handle_json_v2))
+        .route("/json/v2/precise", get(handle_json_v2))
         .route("/json", get(handle_json_v2))
         .route("/health", get(handle_health))
         .route("/websocket/v2", get(handle_ws_upgrade))
+        .route("/websocket/v2/precise", get(handle_ws_upgrade))
         .layer(CorsLayer::permissive())
         .with_state(state)
 }
 
-async fn handle_json_v2(State(state): State<AppState>) -> Json<TosuV2Packet> {
+async fn handle_json_v2(State(state): State<AppState>) -> impl IntoResponse {
     let packet = state.packet_rx.borrow().clone();
-    Json(packet)
+    if packet.client == "none" {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "not_ready" })),
+        )
+            .into_response();
+    }
+    Json(packet).into_response()
 }
 
 async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {

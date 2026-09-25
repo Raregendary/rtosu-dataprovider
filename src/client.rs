@@ -23,6 +23,23 @@ pub struct TournamentUser {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct LocalProfile {
+    pub id: i32,
+    pub name: String,
+    pub accuracy: f64,
+    pub ranked_score: i64,
+    pub level: f32,
+    pub play_count: i32,
+    pub play_mode: i32,
+    pub rank: i32,
+    pub country_code: i32,
+    pub performance_points: i32,
+    pub raw_bancho_status: i32,
+    pub raw_login_status: i32,
+    pub background_colour: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct GameplayState {
     pub player_name: String,
     pub mode: i32,
@@ -38,9 +55,13 @@ pub struct GameplayState {
     pub hit_geki: i16,
     pub hit_katu: i16,
     pub hit_miss: i16,
+    pub hit_error_array: Vec<i32>,
+    pub slider_breaks: i32,
     pub mods: u32,
     pub mods_str: String,
     pub grade: String,
+    pub grade_max: String,
+    pub unstable_rate: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -60,6 +81,7 @@ pub struct ResultScreenState {
     pub mods: u32,
     pub mods_str: String,
     pub grade: String,
+    pub created_at: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -86,13 +108,19 @@ pub struct ProcessSnapshotResult {
 
 pub fn parse_spectate_client_arg(cmd: &str) -> Option<(usize, usize)> {
     let lower = cmd.to_ascii_lowercase();
-    if let Some(idx) = lower.find("-spectateclient").or_else(|| lower.find("/spectateclient")) {
+    if let Some(idx) = lower
+        .find("-spectateclient")
+        .or_else(|| lower.find("/spectateclient"))
+    {
         let after = &cmd[idx..];
         let mut tokens = after.split_whitespace();
         tokens.next(); // skip -spectateclient
         if let Some(id_str) = tokens.next() {
             if let Ok(id) = id_str.parse::<usize>() {
-                let total = tokens.next().and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
+                let total = tokens
+                    .next()
+                    .and_then(|s| s.parse::<usize>().ok())
+                    .unwrap_or(0);
                 return Some((id, total));
             }
         }
@@ -102,7 +130,10 @@ pub fn parse_spectate_client_arg(cmd: &str) -> Option<(usize, usize)> {
 
 pub fn is_tournament_manager_cmd(cmd: &str) -> bool {
     let lower = cmd.to_ascii_lowercase();
-    lower.contains("-go") || lower.contains("/go") || lower.contains("tourney") || lower.contains("tournament")
+    lower.contains("-go")
+        || lower.contains("/go")
+        || lower.contains("tourney")
+        || lower.contains("tournament")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -111,48 +142,55 @@ pub struct ModEntry {
 }
 
 pub fn format_mods(mods: u32) -> String {
-    let mut res = String::new();
-    if mods & 1 != 0 { res.push_str("NF"); }
-    if mods & 2 != 0 { res.push_str("EZ"); }
-    if mods & 4 != 0 { res.push_str("TD"); }
-    if mods & 8 != 0 { res.push_str("HD"); }
-    if mods & 16 != 0 { res.push_str("HR"); }
-    if mods & 16384 != 0 {
-        res.push_str("PF");
-    } else if mods & 32 != 0 {
-        res.push_str("SD");
-    }
-    if mods & 512 != 0 {
-        res.push_str("NC");
-    } else if mods & 64 != 0 {
-        res.push_str("DT");
-    }
-    if mods & 128 != 0 { res.push_str("RX"); }
-    if mods & 256 != 0 { res.push_str("HT"); }
-    if mods & 1024 != 0 { res.push_str("FL"); }
-    if mods & (1 << 22) != 0 {
-        res.push_str("CN");
-    } else if mods & 2048 != 0 {
-        res.push_str("AT");
-    }
-    if mods & 4096 != 0 { res.push_str("SO"); }
-    if mods & 8192 != 0 { res.push_str("AP"); }
-    if mods & (1 << 15) != 0 { res.push_str("4K"); }
-    if mods & (1 << 16) != 0 { res.push_str("5K"); }
-    if mods & (1 << 17) != 0 { res.push_str("6K"); }
-    if mods & (1 << 18) != 0 { res.push_str("7K"); }
-    if mods & (1 << 19) != 0 { res.push_str("8K"); }
-    if mods & (1 << 20) != 0 { res.push_str("FI"); }
-    if mods & (1 << 21) != 0 { res.push_str("RD"); }
-    if mods & (1 << 23) != 0 { res.push_str("TG"); }
-    if mods & (1 << 24) != 0 { res.push_str("9K"); }
-    if mods & (1 << 25) != 0 { res.push_str("10K"); }
-    if mods & (1 << 26) != 0 { res.push_str("1K"); }
-    if mods & (1 << 27) != 0 { res.push_str("3K"); }
-    if mods & (1 << 28) != 0 { res.push_str("2K"); }
-    if mods & (1 << 29) != 0 { res.push_str("V2"); }
-    if mods & (1 << 30) != 0 { res.push_str("MR"); }
-    res
+    const VALUES: [(u32, &str, u8); 31] = [
+        (1, "NF", 0),
+        (2, "EZ", 1),
+        (4, "TD", 7),
+        (8, "HD", 2),
+        (16, "HR", 4),
+        (32, "SD", 5),
+        (64, "DT", 3),
+        (128, "RX", 99),
+        (256, "HT", 3),
+        (512, "NC", 3),
+        (1024, "FL", 6),
+        (2048, "AT", 99),
+        (4096, "SO", 5),
+        (8192, "AP", 99),
+        (16384, "PF", 5),
+        (1 << 15, "4K", 99),
+        (1 << 16, "5K", 99),
+        (1 << 17, "6K", 99),
+        (1 << 18, "7K", 99),
+        (1 << 19, "8K", 99),
+        (1 << 20, "FI", 99),
+        (1 << 21, "RD", 99),
+        (1 << 22, "CN", 99),
+        (1 << 23, "TG", 99),
+        (1 << 24, "9K", 99),
+        (1 << 25, "10K", 99),
+        (1 << 26, "1K", 99),
+        (1 << 27, "3K", 99),
+        (1 << 28, "2K", 99),
+        (1 << 29, "v2", 99),
+        (1 << 30, "MR", 99),
+    ];
+    let mut parts: Vec<(u8, usize, &str)> = VALUES
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (bit, name, order))| {
+            (mods & bit != 0).then_some((*order, index, *name))
+        })
+        .collect();
+    parts.sort_by_key(|(order, index, _)| (*order, *index));
+    parts
+        .into_iter()
+        .map(|(_, _, name)| name)
+        .collect::<Vec<_>>()
+        .join("")
+        .replace("DTNC", "NC")
+        .replace("SDPF", "PF")
+        .replace("ATCN", "CN")
 }
 
 pub fn mod_acronyms(mods: u32) -> Vec<ModEntry> {
@@ -185,9 +223,17 @@ pub fn calculate_grade(
     let r300 = hit_300 as f64 / total;
     let r50 = hit_50 as f64 / total;
     if hit_300 as f64 == total {
-        if has_hd_fl { "SSH".to_string() } else { "SS".to_string() }
+        if has_hd_fl {
+            "SSH".to_string()
+        } else {
+            "SS".to_string()
+        }
     } else if r300 > 0.90 && r50 <= 0.01 && hit_miss == 0 {
-        if has_hd_fl { "SH".to_string() } else { "S".to_string() }
+        if has_hd_fl {
+            "SH".to_string()
+        } else {
+            "S".to_string()
+        }
     } else if (r300 > 0.80 && hit_miss == 0) || r300 > 0.90 {
         "A".to_string()
     } else if (r300 > 0.70 && hit_miss == 0) || r300 > 0.80 {
@@ -234,7 +280,11 @@ fn snapshot_process_once(
     let ipc_id = spectate_info.map(|(id, _)| id);
     let team = spectate_info.map(|(id, total)| {
         let cutoff = if total > 0 { total / 2 } else { 3 };
-        if id < cutoff { "left".to_string() } else { "right".to_string() }
+        if id < cutoff {
+            "left".to_string()
+        } else {
+            "right".to_string()
+        }
     });
 
     let ruleset_address = resolve_ruleset(&memory, &profile, scan_limit_bytes)?;
@@ -395,6 +445,53 @@ pub fn resolve_ruleset(
     fallback.ok_or_else(|| anyhow::anyhow!("no valid ruleset candidate was found"))
 }
 
+pub fn calculate_accuracy(
+    mode: i32,
+    hit_300: i16,
+    hit_100: i16,
+    hit_50: i16,
+    hit_miss: i16,
+) -> f64 {
+    match mode {
+        0 => {
+            let total = (hit_300 + hit_100 + hit_50 + hit_miss) as f64;
+            if total == 0.0 {
+                100.0
+            } else {
+                (hit_300 as f64 * 300.0 + hit_100 as f64 * 100.0 + hit_50 as f64 * 50.0)
+                    / (total * 300.0)
+                    * 100.0
+            }
+        }
+        1 => {
+            let total = (hit_300 + hit_100 + hit_miss) as f64;
+            if total == 0.0 {
+                100.0
+            } else {
+                (hit_300 as f64 * 1.0 + hit_100 as f64 * 0.5) / total * 100.0
+            }
+        }
+        2 => {
+            let total = (hit_300 + hit_100 + hit_50 + hit_miss) as f64;
+            if total == 0.0 {
+                100.0
+            } else {
+                (hit_300 as f64 * 300.0 + hit_100 as f64 * 100.0 + hit_50 as f64 * 50.0) / total
+                    * 100.0
+            }
+        }
+        3 => {
+            let total = (hit_300 + hit_100 + hit_50 + hit_miss) as f64;
+            if total == 0.0 {
+                100.0
+            } else {
+                (hit_300 as f64 / total) * 100.0
+            }
+        }
+        _ => 0.0,
+    }
+}
+
 pub fn read_result_screen_state(
     memory: &ProcessMemory,
     ruleset_address: u64,
@@ -454,17 +551,9 @@ pub fn read_result_screen_state(
         .read_i16(checked_add(result_screen_base, 0x92)?)
         .unwrap_or(0);
 
-    let total_hits = (hit_300 + hit_100 + hit_50 + hit_miss) as f64;
-    let accuracy = if total_hits > 0.0 {
-        ((hit_300 as f64 * 300.0 + hit_100 as f64 * 100.0 + hit_50 as f64 * 50.0)
-            / (total_hits * 300.0))
-            * 100.0
-    } else {
-        100.0
-    };
-
-    let has_hd_fl = (mods & 8 != 0) || (mods & 1024 != 0);
-    let grade = calculate_grade(hit_300, hit_100, hit_50, hit_miss, 100.0, has_hd_fl);
+    let accuracy = calculate_accuracy(mode, hit_300, hit_100, hit_50, hit_miss);
+    let created_at = net_date_to_iso(memory, result_screen_base).unwrap_or_default();
+    let grade = calculate_tosu_grade(mode, accuracy, hit_300, hit_100, hit_50, hit_miss, mods);
 
     Ok(ResultScreenState {
         online_id,
@@ -476,13 +565,243 @@ pub fn read_result_screen_state(
         hit_100,
         hit_300,
         hit_50,
-        hit_geki,
-        hit_katu,
+        hit_geki: if mode == 1 || mode == 3 { hit_geki } else { 0 },
+        hit_katu: if mode == 1 || mode == 2 || mode == 3 {
+            hit_katu
+        } else {
+            0
+        },
         hit_miss,
         mods,
         mods_str,
         grade,
+        created_at,
     })
+}
+
+pub fn read_local_profile(
+    memory: &ProcessMemory,
+    user_profile_pattern_addr: u64,
+    raw_login_status_pattern_addr: u64,
+) -> Result<LocalProfile> {
+    let profile_base = memory
+        .read_indirect_pointer(user_profile_pattern_addr)
+        .context("reading local user profile pointer")?;
+    if profile_base == 0 {
+        bail!("local user profile is null");
+    }
+    let raw_login_status = if raw_login_status_pattern_addr == 0 {
+        256
+    } else {
+        memory
+            .read_indirect_pointer(raw_login_status_pattern_addr)
+            .context("reading local login status")? as i32
+    };
+    Ok(LocalProfile {
+        id: memory
+            .read_i32(checked_add(profile_base, 0x70)?)
+            .context("reading local user id")?,
+        name: memory
+            .read_dotnet_string_from_pointer(checked_add(profile_base, 0x30)?, 256)
+            .context("reading local user name")?,
+        accuracy: memory
+            .read_f64(checked_add(profile_base, 0x04)?)
+            .context("reading local user accuracy")?,
+        ranked_score: memory
+            .read_i64(checked_add(profile_base, 0x0c)?)
+            .context("reading local ranked score")?,
+        level: memory
+            .read_f32(checked_add(profile_base, 0x74)?)
+            .context("reading local user level")?,
+        play_count: memory
+            .read_i32(checked_add(profile_base, 0x7c)?)
+            .context("reading local play count")?,
+        play_mode: memory
+            .read_i32(checked_add(profile_base, 0x80)?)
+            .context("reading local play mode")?,
+        rank: memory
+            .read_i32(checked_add(profile_base, 0x84)?)
+            .context("reading local global rank")?,
+        country_code: memory
+            .read_i32(checked_add(profile_base, 0x9c)?)
+            .context("reading local country code")?,
+        performance_points: memory
+            .read_i32(checked_add(profile_base, 0x88)?)
+            .context("reading local performance points")?,
+        raw_bancho_status: memory
+            .read_u8(checked_add(profile_base, 0x8c)?)
+            .context("reading local bancho status")? as i32,
+        raw_login_status,
+        background_colour: memory
+            .read_u32(checked_add(profile_base, 0xac)?)
+            .context("reading local background colour")?,
+    })
+}
+
+pub fn read_hit_errors(memory: &ProcessMemory, score_base: u64) -> Result<Vec<i32>> {
+    let list = memory
+        .read_pointer(checked_add(score_base, 0x38)?)
+        .context("reading hit error list")?;
+    if list == 0 {
+        return Ok(Vec::new());
+    }
+    let items = memory
+        .read_pointer(checked_add(list, 0x4)?)
+        .context("reading hit error items")?;
+    if items == 0 {
+        return Ok(Vec::new());
+    }
+    let size = memory
+        .read_i32(checked_add(list, 0xc)?)
+        .context("reading hit error count")?;
+    if !(0..=20_000).contains(&size) {
+        return Ok(Vec::new());
+    }
+    let mut result = Vec::with_capacity(size as usize);
+    for index in 0..size as u64 {
+        let address = checked_add(items, 8 + index * 4)?;
+        let value = memory.read_i32(address).unwrap_or(0);
+        if !(-10_000..=10_000).contains(&value) {
+            break;
+        }
+        result.push(value);
+    }
+    Ok(result)
+}
+
+pub fn calculate_unstable_rate(hit_errors: &[i32], mods: u32) -> f64 {
+    if hit_errors.is_empty() {
+        return 0.0;
+    }
+    let count = hit_errors.len() as f64;
+    let average = hit_errors.iter().map(|value| *value as f64).sum::<f64>() / count;
+    let variance = hit_errors
+        .iter()
+        .map(|value| {
+            let delta = *value as f64 - average;
+            delta * delta
+        })
+        .sum::<f64>()
+        / count;
+    let rate = variance.sqrt() * 10.0;
+    if mods & 64 != 0 {
+        rate / 1.5
+    } else if mods & 256 != 0 {
+        rate / 1.3333
+    } else {
+        rate
+    }
+}
+
+pub fn calculate_tosu_grade(
+    mode: i32,
+    accuracy: f64,
+    hit_300: i16,
+    hit_100: i16,
+    hit_50: i16,
+    hit_miss: i16,
+    mods: u32,
+) -> String {
+    let silver = mods & 8 != 0 || mods & 1024 != 0;
+    let perfect = if silver { "XH" } else { "X" };
+    let s_hit = if silver { "SH" } else { "S" };
+    match mode {
+        0 | 1 => {
+            let total = hit_300 as f64 + hit_100 as f64 + hit_50 as f64 + hit_miss as f64;
+            if total == 0.0 {
+                return perfect.to_string();
+            }
+            let r300 = hit_300 as f64 / total;
+            let r50 = hit_50 as f64 / total;
+            if r300 == 1.0 {
+                perfect.to_string()
+            } else if r300 > 0.9 && r50 < 0.01 && hit_miss == 0 {
+                s_hit.to_string()
+            } else if (r300 > 0.8 && hit_miss == 0) || r300 > 0.9 {
+                "A".to_string()
+            } else if (r300 > 0.7 && hit_miss == 0) || r300 > 0.8 {
+                "B".to_string()
+            } else if r300 > 0.6 {
+                "C".to_string()
+            } else {
+                "D".to_string()
+            }
+        }
+        2 => {
+            if accuracy >= 100.0 {
+                perfect.to_string()
+            } else if accuracy > 98.0 {
+                s_hit.to_string()
+            } else if accuracy > 94.0 {
+                "A".to_string()
+            } else if accuracy > 90.0 {
+                "B".to_string()
+            } else if accuracy > 85.0 {
+                "C".to_string()
+            } else {
+                "D".to_string()
+            }
+        }
+        3 => {
+            if accuracy >= 100.0 {
+                perfect.to_string()
+            } else if accuracy >= 95.0 {
+                s_hit.to_string()
+            } else if accuracy >= 90.0 {
+                "A".to_string()
+            } else if accuracy >= 80.0 {
+                "B".to_string()
+            } else if accuracy >= 70.0 {
+                "C".to_string()
+            } else {
+                "D".to_string()
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+fn net_date_to_iso(memory: &ProcessMemory, base: u64) -> Result<String> {
+    let low = memory.read_i32(checked_add(base, 0xa0)?)? as u32;
+    let high = (memory.read_i32(checked_add(base, 0xa4)?)? as u32) & 0x3fff_ffff;
+    let ticks = (high as u64) << 32 | low as u64;
+    let epoch_ticks: u64 = 621_355_968_000_000_000;
+    let milliseconds = ticks.saturating_sub(epoch_ticks) / 10_000;
+    let seconds = (milliseconds / 1000) as i64;
+    let fraction_millis = (milliseconds % 1000) as u32;
+    let datetime = chrono_like_datetime(seconds, fraction_millis)?;
+    Ok(datetime)
+}
+
+fn chrono_like_datetime(seconds: i64, fraction_millis: u32) -> Result<String> {
+    let days = seconds.div_euclid(86_400);
+    let seconds_of_day = seconds.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let hour = seconds_of_day / 3600;
+    let minute = (seconds_of_day % 3600) / 60;
+    let second = seconds_of_day % 60;
+    Ok(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{fraction_millis:03}Z"
+    ))
+}
+
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let day_of_era = z - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = (day_of_year - (153 * month_prime + 2) / 5 + 1) as u32;
+    let month = if month_prime < 10 {
+        month_prime + 3
+    } else {
+        month_prime - 9
+    } as u32;
+    let year = if month <= 2 { year + 1 } else { year };
+    (year, month, day)
 }
 
 pub fn read_tournament_user(memory: &ProcessMemory, user_address: u64) -> Result<TournamentUser> {
@@ -595,21 +914,24 @@ pub fn read_gameplay_state(memory: &ProcessMemory, ruleset_address: u64) -> Resu
     let hit_miss = memory
         .read_i16(checked_add(score_base, 0x92)?)
         .context("reading miss count")?;
-
-    let has_hd_fl = (mods & 8 != 0) || (mods & 1024 != 0);
-    let grade = calculate_grade(hit_300, hit_100, hit_50, hit_miss, player_hp, has_hd_fl);
+    let mode = memory
+        .read_i32(checked_add(score_base, 0x64)?)
+        .context("reading gameplay mode")?;
+    let accuracy = memory
+        .read_f64(checked_add(accuracy_base, 0x0c)?)
+        .context("reading gameplay accuracy")?;
+    let hit_error_array = read_hit_errors(memory, score_base).unwrap_or_default();
+    let unstable_rate = calculate_unstable_rate(&hit_error_array, mods);
+    let grade = calculate_tosu_grade(mode, accuracy, hit_300, hit_100, hit_50, hit_miss, mods);
+    let grade_max = grade.clone();
 
     Ok(GameplayState {
         player_name: memory
             .read_dotnet_string_from_pointer(checked_add(score_base, 0x28)?, 256)
             .context("reading gameplay player name")?,
-        mode: memory
-            .read_i32(checked_add(score_base, 0x64)?)
-            .context("reading gameplay mode")?,
+        mode,
         score,
-        accuracy: memory
-            .read_f64(checked_add(accuracy_base, 0x0c)?)
-            .context("reading gameplay accuracy")?,
+        accuracy,
         player_hp,
         player_hp_smooth,
         combo,
@@ -617,12 +939,20 @@ pub fn read_gameplay_state(memory: &ProcessMemory, ruleset_address: u64) -> Resu
         hit_100,
         hit_300,
         hit_50,
-        hit_geki,
-        hit_katu,
+        hit_geki: if mode == 1 || mode == 3 { hit_geki } else { 0 },
+        hit_katu: if mode == 1 || mode == 2 || mode == 3 {
+            hit_katu
+        } else {
+            0
+        },
         hit_miss,
+        hit_error_array,
+        slider_breaks: 0,
         mods,
         mods_str,
         grade,
+        grade_max,
+        unstable_rate,
     })
 }
 
@@ -643,7 +973,10 @@ pub fn find_pattern(
 
 #[cfg(test)]
 mod tests {
-    use super::{GameplayState, ProcessSnapshotResult, format_mods, calculate_grade, parse_spectate_client_arg};
+    use super::{
+        GameplayState, ProcessSnapshotResult, calculate_grade, format_mods,
+        parse_spectate_client_arg,
+    };
 
     #[test]
     fn snapshot_types_are_serializable() {
@@ -659,7 +992,7 @@ mod tests {
         assert_eq!(format_mods(24), "HDHR");
         assert_eq!(format_mods(64), "DT");
         assert_eq!(format_mods(512), "NC");
-        assert_eq!(format_mods(536870912), "V2");
+        assert_eq!(format_mods(536870912), "v2");
     }
 
     #[test]

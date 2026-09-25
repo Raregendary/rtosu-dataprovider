@@ -132,7 +132,15 @@ pub mod calculator {
         pp_attrs.pp() as f32
     }
 
-    /// Calculate live PP from precomputed gradual 10-object difficulty chunks
+    pub fn calc_accuracy_pp(map: &rosu_pp::Beatmap, mods: u32, accuracy: f64) -> f32 {
+        let mods = parse_mods_bits(mods);
+        let difficulty = rosu_pp::Difficulty::new().mods(mods).calculate(map);
+        Performance::new(difficulty)
+            .accuracy(accuracy)
+            .calculate()
+            .pp() as f32
+    }
+
     pub fn calc_live_pp_from_chunks(
         chunks: &[DifficultyAttributes],
         mods: GameModsLegacy,
@@ -278,7 +286,7 @@ pub mod calculator {
         #[test]
         fn test_gradual_chunk_progression() {
             let mut map_content = String::from(
-                "osu file format v14\n\n[General]\nMode: 0\n\n[Metadata]\nTitle:Test\nArtist:Test\nCreator:Test\nVersion:Normal\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\nSliderMultiplier:1.4\nSliderTickRate:1\n\n[TimingPoints]\n0,500,4,2,0,50,1,0\n\n[HitObjects]\n"
+                "osu file format v14\n\n[General]\nMode: 0\n\n[Metadata]\nTitle:Test\nArtist:Test\nCreator:Test\nVersion:Normal\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\nSliderMultiplier:1.4\nSliderTickRate:1\n\n[TimingPoints]\n0,500,4,2,0,50,1,0\n\n[HitObjects]\n",
             );
             for i in 0..25 {
                 let time = 1000 + i * 200;
