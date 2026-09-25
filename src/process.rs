@@ -62,7 +62,7 @@ mod platform {
         IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_I386,
     };
     use windows_sys::Win32::System::Threading::{
-        IsWow64Process, IsWow64Process2, OpenProcess, PROCESS_QUERY_INFORMATION,
+        GetExitCodeProcess, IsWow64Process, IsWow64Process2, OpenProcess, PROCESS_QUERY_INFORMATION,
         PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ, QueryFullProcessImageNameW,
     };
 
@@ -115,6 +115,12 @@ mod platform {
 
         pub fn pointer_size(&self) -> usize {
             self.pointer_size
+        }
+
+        pub fn is_alive(&self) -> bool {
+            let mut exit_code = 0u32;
+            let result = unsafe { GetExitCodeProcess(self.handle, &mut exit_code) };
+            result != 0 && exit_code == 259
         }
 
         pub fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>> {
@@ -625,6 +631,10 @@ mod platform {
 
         pub fn pointer_size(&self) -> usize {
             usize::BITS as usize / 8
+        }
+
+        pub fn is_alive(&self) -> bool {
+            false
         }
 
         pub fn read_bytes(&self, _address: u64, _length: usize) -> Result<Vec<u8>> {

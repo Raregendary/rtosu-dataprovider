@@ -141,6 +141,30 @@ pub mod calculator {
             .pp() as f32
     }
 
+    pub fn calc_accuracy_table_from_diff(
+        diff: &DifficultyAttributes,
+    ) -> crate::v2::PerformanceAccuracy {
+        let calc = |acc: f64| {
+            Performance::new(diff.clone())
+                .accuracy(acc)
+                .calculate()
+                .pp() as f32
+        };
+        crate::v2::PerformanceAccuracy {
+            n90: calc(90.0),
+            n91: calc(91.0),
+            n92: calc(92.0),
+            n93: calc(93.0),
+            n94: calc(94.0),
+            n95: calc(95.0),
+            n96: calc(96.0),
+            n97: calc(97.0),
+            n98: calc(98.0),
+            n99: calc(99.0),
+            n100: calc(100.0),
+        }
+    }
+
     pub fn calc_live_pp_from_chunks(
         chunks: &[DifficultyAttributes],
         mods: GameModsLegacy,

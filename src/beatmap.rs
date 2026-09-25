@@ -440,8 +440,19 @@ pub fn populate_beatmap_statistics(
     map: &rosu_pp::Beatmap,
     mods: u32,
 ) {
-    let mods = crate::pp::calculator::parse_mods_bits(mods);
-    let diff = rosu_pp::Difficulty::new().mods(mods).calculate(map);
+    let mods_legacy = crate::pp::calculator::parse_mods_bits(mods);
+    let diff = rosu_pp::Difficulty::new().mods(mods_legacy).calculate(map);
+    populate_beatmap_statistics_with_diff(snapshot, map, &diff, mods);
+}
+
+#[cfg(feature = "pp")]
+pub fn populate_beatmap_statistics_with_diff(
+    snapshot: &mut BeatmapSnapshot,
+    map: &rosu_pp::Beatmap,
+    diff: &rosu_pp::any::DifficultyAttributes,
+    mods: u32,
+) {
+    let mods_legacy = crate::pp::calculator::parse_mods_bits(mods);
     let mut circles = 0;
     let mut sliders = 0;
     let mut spinners = 0;
@@ -488,7 +499,7 @@ pub fn populate_beatmap_statistics(
     }
     snapshot.stats.stars.total = round_value(diff.stars() as f32, 2);
     snapshot.stats.stars.live = snapshot.stats.stars.total;
-    if let rosu_pp::any::DifficultyAttributes::Osu(osu_diff) = &diff {
+    if let rosu_pp::any::DifficultyAttributes::Osu(osu_diff) = diff {
         snapshot.stats.stars.aim = round_value(osu_diff.aim as f32, 2);
         snapshot.stats.stars.speed = round_value(osu_diff.speed as f32, 2);
         snapshot.stats.stars.slider_factor = round_value(osu_diff.slider_factor as f32, 2);
@@ -515,7 +526,7 @@ pub fn populate_beatmap_statistics(
             round_value(osu_diff.great_hit_window as f32, 2),
         );
     }
-    snapshot.stats.pp.ss = crate::pp::calculator::calc_fc_pp(&diff, mods);
+    snapshot.stats.pp.ss = crate::pp::calculator::calc_fc_pp(diff, mods_legacy);
     snapshot.stats.pp.fc = snapshot.stats.pp.ss;
 }
 

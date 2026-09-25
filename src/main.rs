@@ -12,7 +12,7 @@ use osumemoryreading::process::{ProcessMemory, list_modules, list_processes, mod
 use osumemoryreading::profile::{available_profiles, load_profile};
 use osumemoryreading::session::TournamentSession;
 use osumemoryreading::tournament::read_tournament_state;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Parser)]
 #[command(
@@ -586,26 +586,40 @@ async fn run_serve_loop(
         TournamentSession::new(&config.poll.default_profile, pointer_width, limit)?;
     let mut solo_session =
         osumemoryreading::session::SoloSession::new("stable", pointer_width, limit)?;
+    let mut cached_pids: Vec<u32> = Vec::new();
+    let mut is_tournament = false;
+    let mut last_proc_check = Instant::now() - Duration::from_secs(10);
 
     loop {
         tokio::time::sleep(interval).await;
 
-        let osu_procs = list_processes(Some("osu!.exe")).unwrap_or_default();
-        if osu_procs.is_empty() {
-            let mut packet = osumemoryreading::v2::TosuV2Packet::default();
-            packet.client = "none".to_string();
-            packet.state.name = "notRunning".to_string();
-            let _ = tx.send(packet);
-            continue;
-        }
+        let should_check_procs =
+            cached_pids.is_empty() || last_proc_check.elapsed() >= Duration::from_millis(1500);
+        if should_check_procs {
+            last_proc_check = Instant::now();
+            let osu_procs = list_processes(Some("osu!.exe")).unwrap_or_default();
+            let new_pids: Vec<u32> = osu_procs.iter().map(|p| p.pid).collect();
+            if new_pids.is_empty() {
+                cached_pids.clear();
+                let mut packet = osumemoryreading::v2::TosuV2Packet::default();
+                packet.client = "none".to_string();
+                packet.state.name = "notRunning".to_string();
+                let _ = tx.send(packet);
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
 
-        let is_tournament = osu_procs.len() > 1
-            || osu_procs.iter().any(|p| {
-                let cmd = ProcessMemory::open(p.pid)
-                    .and_then(|m| m.command_line())
-                    .unwrap_or_default();
-                cmd.contains("-spectateclient") || is_tournament_manager_cmd(&cmd)
-            });
+            if new_pids != cached_pids {
+                cached_pids = new_pids;
+                is_tournament = cached_pids.len() > 1
+                    || osu_procs.iter().any(|p| {
+                        let cmd = ProcessMemory::open(p.pid)
+                            .and_then(|m| m.command_line())
+                            .unwrap_or_default();
+                        cmd.contains("-spectateclient") || is_tournament_manager_cmd(&cmd)
+                    });
+            }
+        }
 
         if is_tournament {
             if let Ok(snap) = tourney_session.poll() {
