@@ -44,6 +44,25 @@ pub struct GameplayState {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ResultScreenState {
+    pub online_id: i64,
+    pub player_name: String,
+    pub mode: i32,
+    pub score: i32,
+    pub accuracy: f64,
+    pub max_combo: i16,
+    pub hit_100: i16,
+    pub hit_300: i16,
+    pub hit_50: i16,
+    pub hit_geki: i16,
+    pub hit_katu: i16,
+    pub hit_miss: i16,
+    pub mods: u32,
+    pub mods_str: String,
+    pub grade: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ClientSnapshot {
     pub pid: u32,
     pub ipc_id: Option<usize>,
@@ -367,12 +386,103 @@ pub fn resolve_ruleset(
         };
         if read_gameplay_state(memory, candidate).is_ok()
             || read_tournament_state(memory, candidate).is_ok()
+            || read_result_screen_state(memory, candidate).is_ok()
         {
             return Ok(candidate);
         }
         fallback.get_or_insert(candidate);
     }
     fallback.ok_or_else(|| anyhow::anyhow!("no valid ruleset candidate was found"))
+}
+
+pub fn read_result_screen_state(
+    memory: &ProcessMemory,
+    ruleset_address: u64,
+) -> Result<ResultScreenState> {
+    let result_screen_base = memory
+        .read_pointer(checked_add(ruleset_address, 0x38)?)
+        .context("reading result screen base")?;
+    if result_screen_base == 0 {
+        bail!("resultScreenBase is null");
+    }
+
+    let online_id = memory
+        .read_i64(checked_add(result_screen_base, 0x4)?)
+        .unwrap_or(0);
+    let player_name = memory
+        .read_dotnet_string_from_pointer(checked_add(result_screen_base, 0x28)?, 256)
+        .unwrap_or_default();
+
+    let mods_ptr = memory
+        .read_pointer(checked_add(result_screen_base, 0x1c)?)
+        .unwrap_or(0);
+    let mods = if mods_ptr != 0 {
+        let x = memory.read_i32(checked_add(mods_ptr, 0xc)?).unwrap_or(0);
+        let y = memory.read_i32(checked_add(mods_ptr, 0x8)?).unwrap_or(0);
+        (x ^ y) as u32
+    } else {
+        0
+    };
+    let mods_str = format_mods(mods);
+
+    let mode = memory
+        .read_i32(checked_add(result_screen_base, 0x64)?)
+        .unwrap_or(0);
+    let max_combo = memory
+        .read_i16(checked_add(result_screen_base, 0x68)?)
+        .unwrap_or(0);
+    let score = memory
+        .read_i32(checked_add(result_screen_base, 0x78)?)
+        .unwrap_or(0);
+
+    let hit_100 = memory
+        .read_i16(checked_add(result_screen_base, 0x88)?)
+        .unwrap_or(0);
+    let hit_300 = memory
+        .read_i16(checked_add(result_screen_base, 0x8a)?)
+        .unwrap_or(0);
+    let hit_50 = memory
+        .read_i16(checked_add(result_screen_base, 0x8c)?)
+        .unwrap_or(0);
+    let hit_geki = memory
+        .read_i16(checked_add(result_screen_base, 0x8e)?)
+        .unwrap_or(0);
+    let hit_katu = memory
+        .read_i16(checked_add(result_screen_base, 0x90)?)
+        .unwrap_or(0);
+    let hit_miss = memory
+        .read_i16(checked_add(result_screen_base, 0x92)?)
+        .unwrap_or(0);
+
+    let total_hits = (hit_300 + hit_100 + hit_50 + hit_miss) as f64;
+    let accuracy = if total_hits > 0.0 {
+        ((hit_300 as f64 * 300.0 + hit_100 as f64 * 100.0 + hit_50 as f64 * 50.0)
+            / (total_hits * 300.0))
+            * 100.0
+    } else {
+        100.0
+    };
+
+    let has_hd_fl = (mods & 8 != 0) || (mods & 1024 != 0);
+    let grade = calculate_grade(hit_300, hit_100, hit_50, hit_miss, 100.0, has_hd_fl);
+
+    Ok(ResultScreenState {
+        online_id,
+        player_name,
+        mode,
+        score,
+        accuracy,
+        max_combo,
+        hit_100,
+        hit_300,
+        hit_50,
+        hit_geki,
+        hit_katu,
+        hit_miss,
+        mods,
+        mods_str,
+        grade,
+    })
 }
 
 pub fn read_tournament_user(memory: &ProcessMemory, user_address: u64) -> Result<TournamentUser> {

@@ -1,4 +1,4 @@
-use crate::beatmap::{BeatmapPpStats, BeatmapSnapshot};
+use crate::beatmap::BeatmapSnapshot;
 use crate::client::{mod_acronyms, ModEntry};
 use crate::pp::LivePpResult;
 use crate::tournament::TournamentChatMessage;
@@ -94,13 +94,53 @@ pub struct PlayState {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
+pub struct ResultsScreenPp {
+    pub current: f32,
+    pub fc: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct ResultsScreenState {
+    pub score_id: i64,
+    pub player_name: String,
     pub name: String,
+    pub mode: OsuStatusState,
     pub score: i32,
+    pub accuracy: f64,
+    pub hits: HitsState,
+    pub mods: ModsState,
     pub max_combo: i32,
     pub rank: String,
-    pub pp: BeatmapPpStats,
+    pub pp: ResultsScreenPp,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FoldersState {
+    pub game: String,
+    pub skin: String,
+    pub songs: String,
+    pub beatmap: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct FilesState {
+    pub beatmap: String,
+    pub background: String,
+    pub audio: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct DirectPathState {
+    pub beatmap_file: String,
+    pub beatmap_background: String,
+    pub beatmap_audio: String,
+    pub beatmap_folder: String,
+    pub skin_folder: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -172,6 +212,9 @@ pub struct TosuV2Packet {
     pub beatmap: BeatmapSnapshot,
     pub play: PlayState,
     pub results_screen: ResultsScreenState,
+    pub folders: FoldersState,
+    pub files: FilesState,
+    pub direct_path: DirectPathState,
     pub tourney: TourneyRootState,
 }
 

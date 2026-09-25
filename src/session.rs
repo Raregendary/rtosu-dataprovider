@@ -354,6 +354,11 @@ pub struct SoloSession {
     play_time_pattern_addr: Option<u64>,
     menu_mods_pattern_addr: Option<u64>,
     ruleset_container_addr: Option<u64>,
+    game_folder: String,
+    songs_folder: String,
+    current_checksum: String,
+    #[cfg(feature = "pp")]
+    cached_beatmap: Option<rosu_pp::Beatmap>,
     pub cached_packet: crate::v2::TosuV2Packet,
 }
 
@@ -380,6 +385,11 @@ impl SoloSession {
             play_time_pattern_addr: None,
             menu_mods_pattern_addr: None,
             ruleset_container_addr: None,
+            game_folder: String::new(),
+            songs_folder: String::new(),
+            current_checksum: String::new(),
+            #[cfg(feature = "pp")]
+            cached_beatmap: None,
             cached_packet: crate::v2::TosuV2Packet::default(),
         })
     }
@@ -398,6 +408,13 @@ impl SoloSession {
         let pid = procs[0].pid;
         if self.pid != Some(pid) || self.memory.is_none() {
             let mem = ProcessMemory::open_with_pointer_size(pid, Some(self.pointer_width))?;
+            if let Ok(exe_path) = mem.process_image_path() {
+                let p = std::path::Path::new(&exe_path);
+                if let Some(parent) = p.parent() {
+                    self.game_folder = parent.to_string_lossy().to_string();
+                    self.songs_folder = parent.join("Songs").to_string_lossy().to_string();
+                }
+            }
             self.pid = Some(pid);
             self.memory = Some(mem);
             self.base_pattern_addr = None;
@@ -405,6 +422,11 @@ impl SoloSession {
             self.play_time_pattern_addr = None;
             self.menu_mods_pattern_addr = None;
             self.ruleset_container_addr = None;
+            self.current_checksum.clear();
+            #[cfg(feature = "pp")]
+            {
+                self.cached_beatmap = None;
+            }
         }
 
         let memory = self.memory.as_ref().unwrap();
@@ -486,19 +508,87 @@ impl SoloSession {
 
         // 7. Read beatmap
         if let Some(base_addr) = self.base_pattern_addr {
-            if let Ok(bm) = crate::beatmap::read_beatmap_memory(
+            if let Ok(mut bm) = crate::beatmap::read_beatmap_memory(
                 memory,
                 base_addr,
                 self.play_time_pattern_addr,
                 self.pointer_width,
             ) {
                 if bm.id > 0 || !bm.title.is_empty() {
+                    // Update cached beatmap if checksum changed
+                    if bm.checksum != self.current_checksum && !bm.checksum.is_empty() {
+                        self.current_checksum = bm.checksum.clone();
+                        #[cfg(feature = "pp")]
+                        {
+                            let osu_path = std::path::Path::new(&self.songs_folder)
+                                .join(&bm.folder)
+                                .join(&bm.filename);
+                            if let Ok(bytes) = std::fs::read(&osu_path) {
+                                if let Ok(map) = rosu_pp::Beatmap::from_bytes(&bytes) {
+                                    self.cached_beatmap = Some(map);
+                                }
+                            }
+                        }
+                    }
+
+                    // Populate parsed objects & SS PP
+                    #[cfg(feature = "pp")]
+                    if let Some(map) = &self.cached_beatmap {
+                        let current_mods_num = self.cached_packet.play.mods.number;
+                        let mods_legacy = crate::pp::calculator::parse_mods_bits(current_mods_num);
+                        let diff = rosu_pp::Difficulty::new().mods(mods_legacy).calculate(map);
+
+                        let mut circles = 0;
+                        let mut sliders = 0;
+                        let mut spinners = 0;
+                        for obj in &map.hit_objects {
+                            if obj.is_circle() {
+                                circles += 1;
+                            } else if obj.is_slider() {
+                                sliders += 1;
+                            } else if obj.is_spinner() {
+                                spinners += 1;
+                            }
+                        }
+                        bm.stats.objects.circles = circles;
+                        bm.stats.objects.sliders = sliders;
+                        bm.stats.objects.spinners = spinners;
+                        bm.stats.objects.total = map.hit_objects.len() as i32;
+                        bm.stats.max_combo = diff.max_combo() as i32;
+                        let bpm = map.bpm() as f32;
+                        bm.stats.bpm.common = bpm;
+                        bm.stats.bpm.realtime = bpm;
+                        bm.stats.bpm.min = bpm;
+                        bm.stats.bpm.max = bpm;
+                        bm.stats.stars.total = diff.stars() as f32;
+                        if let rosu_pp::any::DifficultyAttributes::Osu(osu_diff) = &diff {
+                            bm.stats.stars.aim = osu_diff.aim as f32;
+                            bm.stats.stars.speed = osu_diff.speed as f32;
+                            bm.stats.stars.slider_factor = osu_diff.slider_factor as f32;
+                        }
+                        let ss_pp = crate::pp::calculator::calc_fc_pp(&diff, mods_legacy);
+                        bm.stats.pp.ss = ss_pp;
+                        bm.stats.pp.fc = ss_pp;
+                    }
+
+                    // Folders and files
+                    self.cached_packet.folders.game = self.game_folder.clone();
+                    self.cached_packet.folders.songs = self.songs_folder.clone();
+                    self.cached_packet.folders.beatmap = bm.folder.clone();
+                    self.cached_packet.files.beatmap = bm.filename.clone();
+                    self.cached_packet.files.background = bm.background_filename.clone();
+                    self.cached_packet.files.audio = bm.audio_filename.clone();
+                    self.cached_packet.direct_path.beatmap_folder = bm.folder.clone();
+                    self.cached_packet.direct_path.beatmap_file = format!("{}\\{}", bm.folder, bm.filename);
+                    self.cached_packet.direct_path.beatmap_background = format!("{}\\{}", bm.folder, bm.background_filename);
+                    self.cached_packet.direct_path.beatmap_audio = format!("{}\\{}", bm.folder, bm.audio_filename);
+
                     self.cached_packet.beatmap = bm;
                 }
             }
         }
 
-        // 8. Read gameplay if in play state (state 2)
+        // 8. Read gameplay or resultsScreen based on state
         if current_state_num == 2 {
             if self.ruleset_container_addr.is_none() {
                 self.ruleset_container_addr = crate::client::resolve_ruleset(
@@ -525,9 +615,95 @@ impl SoloSession {
                     self.cached_packet.play.health_bar.smooth = g.player_hp_smooth;
                     self.cached_packet.play.rank.current = g.grade;
                     self.cached_packet.play.mods = crate::v2::create_mods_state(g.mods, &g.mods_str);
+
+                    #[cfg(feature = "pp")]
+                    if let Some(map) = &self.cached_beatmap {
+                        let mods_legacy = crate::pp::calculator::parse_mods_bits(g.mods);
+                        let chunks = crate::pp::calculator::get_or_compute_gradual_chunks(
+                            self.cached_packet.beatmap.id as u32,
+                            map,
+                            mods_legacy,
+                        );
+                        let live_res = crate::pp::calculator::calc_detailed_live_and_fc_pp(
+                            &chunks,
+                            mods_legacy,
+                            g.combo as u32,
+                            g.hit_300 as u32,
+                            g.hit_100 as u32,
+                            g.hit_50 as u32,
+                            g.hit_miss as u32,
+                        );
+                        self.cached_packet.play.pp = live_res;
+                    }
                 }
             }
-        } else if current_state_num != 7 {
+        } else if current_state_num == 7 {
+            // resultScreen
+            if self.ruleset_container_addr.is_none() {
+                self.ruleset_container_addr = crate::client::resolve_ruleset(
+                    memory,
+                    &self.profile,
+                    self.scan_limit_bytes,
+                ).ok();
+            }
+
+            if let Some(ruleset_addr) = self.ruleset_container_addr {
+                if let Ok(res) = crate::client::read_result_screen_state(memory, ruleset_addr) {
+                    let mods_state = crate::v2::create_mods_state(res.mods, &res.mods_str);
+                    self.cached_packet.results_screen.score_id = res.online_id;
+                    self.cached_packet.results_screen.player_name = res.player_name.clone();
+                    self.cached_packet.results_screen.name = res.player_name.clone();
+                    self.cached_packet.results_screen.score = res.score;
+                    self.cached_packet.results_screen.accuracy = res.accuracy;
+                    self.cached_packet.results_screen.max_combo = res.max_combo as i32;
+                    self.cached_packet.results_screen.rank = res.grade.clone();
+                    self.cached_packet.results_screen.hits.n300 = res.hit_300 as i32;
+                    self.cached_packet.results_screen.hits.n100 = res.hit_100 as i32;
+                    self.cached_packet.results_screen.hits.n50 = res.hit_50 as i32;
+                    self.cached_packet.results_screen.hits.n0 = res.hit_miss as i32;
+                    self.cached_packet.results_screen.hits.geki = res.hit_geki as i32;
+                    self.cached_packet.results_screen.hits.katu = res.hit_katu as i32;
+                    self.cached_packet.results_screen.mods = mods_state.clone();
+
+                    // Mirror to play
+                    self.cached_packet.play.player_name = res.player_name;
+                    self.cached_packet.play.score = res.score;
+                    self.cached_packet.play.accuracy = res.accuracy;
+                    self.cached_packet.play.combo.current = res.max_combo as i32;
+                    self.cached_packet.play.combo.max = res.max_combo as i32;
+                    self.cached_packet.play.hits.n300 = res.hit_300 as i32;
+                    self.cached_packet.play.hits.n100 = res.hit_100 as i32;
+                    self.cached_packet.play.hits.n50 = res.hit_50 as i32;
+                    self.cached_packet.play.hits.n0 = res.hit_miss as i32;
+                    self.cached_packet.play.hits.geki = res.hit_geki as i32;
+                    self.cached_packet.play.hits.katu = res.hit_katu as i32;
+                    self.cached_packet.play.rank.current = res.grade;
+                    self.cached_packet.play.mods = mods_state;
+
+                    #[cfg(feature = "pp")]
+                    if let Some(map) = &self.cached_beatmap {
+                        let mods_legacy = crate::pp::calculator::parse_mods_bits(res.mods);
+                        let chunks = crate::pp::calculator::get_or_compute_gradual_chunks(
+                            self.cached_packet.beatmap.id as u32,
+                            map,
+                            mods_legacy,
+                        );
+                        let live_res = crate::pp::calculator::calc_detailed_live_and_fc_pp(
+                            &chunks,
+                            mods_legacy,
+                            res.max_combo as u32,
+                            res.hit_300 as u32,
+                            res.hit_100 as u32,
+                            res.hit_50 as u32,
+                            res.hit_miss as u32,
+                        );
+                        self.cached_packet.results_screen.pp.current = live_res.current;
+                        self.cached_packet.results_screen.pp.fc = live_res.fc;
+                        self.cached_packet.play.pp = live_res;
+                    }
+                }
+            }
+        } else {
             // In song select or menu, read menu mods
             if let Some(mods_addr) = self.menu_mods_pattern_addr {
                 if let Ok(mods_ptr) = memory.read_pointer(mods_addr) {

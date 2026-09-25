@@ -104,6 +104,9 @@ pub struct BeatmapSnapshot {
     pub mapper: String,
     pub version: String,
     pub folder: String,
+    pub filename: String,
+    pub audio_filename: String,
+    pub background_filename: String,
     pub source: String,
     pub tags: String,
     pub stats: BeatmapStats,
@@ -168,20 +171,23 @@ pub fn read_beatmap_memory(
 
     let id = memory.read_i32(checked_add_signed(beatmap_addr, 0xC8)?).unwrap_or(0);
     let set_id = memory.read_i32(checked_add_signed(beatmap_addr, 0xCC)?).unwrap_or(0);
-    let status_num = memory.read_i32(checked_add_signed(beatmap_addr, 0xEC)?).unwrap_or(0);
+    let status_num = memory.read_i32(checked_add_signed(beatmap_addr, 0x12C)?).unwrap_or(0);
 
     let ar = memory.read_f32(checked_add_signed(beatmap_addr, 0x2C)?).unwrap_or(0.0);
     let cs = memory.read_f32(checked_add_signed(beatmap_addr, 0x30)?).unwrap_or(0.0);
     let hp = memory.read_f32(checked_add_signed(beatmap_addr, 0x34)?).unwrap_or(0.0);
     let od = memory.read_f32(checked_add_signed(beatmap_addr, 0x38)?).unwrap_or(0.0);
 
+    let artist = read_net_string(memory, beatmap_addr, 0x18, pointer_width).unwrap_or_default();
+    let artist_unicode = read_net_string(memory, beatmap_addr, 0x1C, pointer_width).unwrap_or_default();
+    let title = read_net_string(memory, beatmap_addr, 0x24, pointer_width).unwrap_or_default();
+    let title_unicode = read_net_string(memory, beatmap_addr, 0x28, pointer_width).unwrap_or_default();
+    let audio_filename = read_net_string(memory, beatmap_addr, 0x64, pointer_width).unwrap_or_default();
+    let background_filename = read_net_string(memory, beatmap_addr, 0x68, pointer_width).unwrap_or_default();
     let checksum = read_net_string(memory, beatmap_addr, 0x6C, pointer_width).unwrap_or_default();
     let folder = read_net_string(memory, beatmap_addr, 0x78, pointer_width).unwrap_or_default();
     let mapper = read_net_string(memory, beatmap_addr, 0x7C, pointer_width).unwrap_or_default();
-    let artist = read_net_string(memory, beatmap_addr, 0x80, pointer_width).unwrap_or_default();
-    let artist_unicode = read_net_string(memory, beatmap_addr, 0x84, pointer_width).unwrap_or_default();
-    let title = read_net_string(memory, beatmap_addr, 0x88, pointer_width).unwrap_or_default();
-    let title_unicode = read_net_string(memory, beatmap_addr, 0x90, pointer_width).unwrap_or_default();
+    let filename = read_net_string(memory, beatmap_addr, 0x90, pointer_width).unwrap_or_default();
     let version = read_net_string(memory, beatmap_addr, 0xAC, pointer_width).unwrap_or_default();
 
     Ok(BeatmapSnapshot {
@@ -212,6 +218,9 @@ pub fn read_beatmap_memory(
         mapper,
         version,
         folder,
+        filename,
+        audio_filename,
+        background_filename,
         source: String::new(),
         tags: String::new(),
         stats: BeatmapStats {
@@ -229,7 +238,7 @@ pub fn read_beatmap_memory(
 }
 
 /// Read a .NET UTF-16 String from memory at offset from base
-fn read_net_string(
+pub fn read_net_string(
     memory: &ProcessMemory,
     base: u64,
     offset: i64,
@@ -237,24 +246,15 @@ fn read_net_string(
 ) -> Result<String> {
     let str_ptr_addr = checked_add_signed(base, offset)?;
     let str_ptr = memory.read_pointer(str_ptr_addr)?;
+    read_sharp_string_ptr(memory, str_ptr)
+}
+
+/// Read a .NET UTF-16 String directly from a String object pointer
+pub fn read_sharp_string_ptr(memory: &ProcessMemory, str_ptr: u64) -> Result<String> {
     if str_ptr == 0 {
         return Ok(String::new());
     }
-
-    let len = memory.read_i32(checked_add_signed(str_ptr, 0x4)?)?;
-    if len <= 0 || len > 1024 {
-        return Ok(String::new());
-    }
-
-    let utf16_addr = checked_add_signed(str_ptr, 0x8)?;
-    let mut u16_chars = Vec::with_capacity(len as usize);
-    for i in 0..len {
-        let char_addr = checked_add_signed(utf16_addr, (i as i64) * 2)?;
-        let c = memory.read_u16(char_addr)?;
-        u16_chars.push(c);
-    }
-
-    Ok(String::from_utf16_lossy(&u16_chars))
+    memory.read_dotnet_string(str_ptr, 2048)
 }
 
 #[cfg(test)]
