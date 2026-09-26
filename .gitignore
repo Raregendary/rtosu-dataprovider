@@ -13,6 +13,9 @@ Cargo.lock
 Benchmarks/
 benches/
 
+# Validation harness
+validations/snapshots/
+
 # Logs & temp files
 logs/
 *.log

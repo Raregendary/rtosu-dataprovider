@@ -1,0 +1,91 @@
+left  = tosu (148067 bytes)
+right = rtosu (138839 bytes)
+
+STRUCTURAL (schema gaps / type / key order) : 1
+ARRAY LEN  (element count differences)     : 0
+VALUE      (materially different)          : 17
+VALUE      (non-volatile -> real defect)   : 10
+ROUNDING   (agrees within 0.005)              : 7
+
+--- STRUCTURAL (1) ---
+  MISSING_IN_RTOSU  <root>.settings
+      left : 'object'
+      right: None
+
+--- VALUE (non-volatile -> real defect) (10) ---
+  VALUE_MISMATCH    performance.accuracy.90
+      left : 125.68
+      right: 113.75
+  VALUE_MISMATCH    performance.accuracy.91
+      left : 128.28
+      right: 116.08
+  VALUE_MISMATCH    performance.accuracy.92
+      left : 131.72
+      right: 118.75
+  VALUE_MISMATCH    performance.accuracy.93
+      left : 135.93
+      right: 122.09
+  VALUE_MISMATCH    performance.accuracy.94
+      left : 140.65
+      right: 126.18
+  VALUE_MISMATCH    performance.accuracy.95
+      left : 147.42
+      right: 132.01
+  VALUE_MISMATCH    performance.accuracy.96
+      left : 155.97
+      right: 139.78
+  VALUE_MISMATCH    performance.accuracy.97
+      left : 167.64
+      right: 151.58
+  VALUE_MISMATCH    performance.accuracy.98
+      left : 183.03
+      right: 169.09
+  VALUE_MISMATCH    performance.accuracy.99
+      left : 205.73
+      right: 197.99
+
+--- VALUE (volatile / expected live drift) (7) ---
+  VALUE_MISMATCH    session.playTime
+      left : 1190853
+      right: 1190931
+  VALUE_MISMATCH    beatmap.time.live
+      left : 292994
+      right: 292978
+  VALUE_MISMATCH    beatmap.time.lastObject
+      left : 330654
+      right: 328808
+  VALUE_MISMATCH    performance.graph.series.[0].data[0]
+      left : 4.433959664267074
+      right: 4.433957138590933
+  VALUE_MISMATCH    performance.graph.series.[1].data[0]
+      left : 4.433959664267074
+      right: 4.433957138590933
+  VALUE_MISMATCH    performance.graph.series.[2].data[0]
+      left : 0
+      right: 0.0
+  VALUE_MISMATCH    performance.graph.series.[4].data[0]
+      left : 21.41135125701791
+      right: 21.41135125701791
+
+--- ROUNDING (7) ---
+  ROUNDING          beatmap.stats.bpm.common
+      left : 260.0003
+      right: 260.0
+  ROUNDING          tourney.clients.[0].beatmap.stats.bpm.common
+      left : 260.0003
+      right: 260.0
+  ROUNDING          tourney.clients.[1].beatmap.stats.bpm.common
+      left : 260.0003
+      right: 260.0
+  ROUNDING          tourney.clients.[2].beatmap.stats.bpm.common
+      left : 260.0003
+      right: 260.0
+  ROUNDING          tourney.clients.[3].beatmap.stats.bpm.common
+      left : 260.0003
+      right: 260.0
+  ROUNDING          tourney.clients.[4].beatmap.stats.bpm.common
+      left : 260.0003
+      right: 260.0
+  ROUNDING          tourney.clients.[5].beatmap.stats.bpm.common
+      left : 260.0003
+      right: 260.0

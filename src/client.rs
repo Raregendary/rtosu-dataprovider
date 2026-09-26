@@ -147,7 +147,7 @@ pub struct ModEntry {
 
 fn compute_format_mods(mods: u32) -> String {
     const VALUES: [(u32, &str, u8); 31] = [
-        (1, "NF", 0),
+        (1, "NF", 99), // Replicate tosu quirk: ModsOrder['nf'] is 0 which is falsy in JS, defaulting order to 99
         (2, "EZ", 1),
         (4, "TD", 7),
         (8, "HD", 2),
@@ -235,7 +235,7 @@ pub fn mod_acronyms(mods: u32) -> Vec<ModEntry> {
     let mut chars = s.chars().peekable();
     while let (Some(a), Some(b)) = (chars.next(), chars.next()) {
         entries.push(ModEntry {
-            acronym: format!("{a}{b}"),
+            acronym: format!("{a}{b}").to_uppercase(),
         });
     }
 
@@ -444,7 +444,7 @@ pub fn snapshot_processes(
     Ok(results)
 }
 
-pub fn resolve_ruleset(
+pub fn resolve_ruleset_container(
     memory: &ProcessMemory,
     profile: &ClientProfile,
     scan_limit_bytes: usize,
@@ -454,20 +454,19 @@ pub fn resolve_ruleset(
     let matches = memory.scan_pattern(&pattern, None, 16, scan_limit_bytes)?;
     let mut fallback = None;
     for match_address in matches {
-        let match_address = match_address;
         let pattern_address = match checked_add_signed(match_address, offset) {
             Ok(address) => address,
             Err(_) => continue,
         };
-        let container_address = match pattern_address.checked_sub(0xb) {
+        let container_addr = match pattern_address.checked_sub(0xb) {
             Some(address) => address,
             None => continue,
         };
-        let container_address = match memory.read_pointer(container_address) {
+        let container = match memory.read_pointer(container_addr) {
             Ok(address) if address != 0 => address,
             _ => continue,
         };
-        let ruleset_slot = match checked_add(container_address, 4) {
+        let ruleset_slot = match checked_add(container, 4) {
             Ok(address) => address,
             Err(_) => continue,
         };
@@ -479,11 +478,33 @@ pub fn resolve_ruleset(
             || read_tournament_state(memory, candidate).is_ok()
             || read_result_screen_state(memory, candidate).is_ok()
         {
-            return Ok(candidate);
+            return Ok(container_addr);
         }
-        fallback.get_or_insert(candidate);
+        fallback.get_or_insert(container_addr);
     }
-    fallback.ok_or_else(|| anyhow::anyhow!("no valid ruleset candidate was found"))
+    fallback.ok_or_else(|| anyhow::anyhow!("no valid ruleset container candidate was found"))
+}
+
+pub fn read_active_ruleset(memory: &ProcessMemory, container_addr: u64) -> Option<u64> {
+    let container = memory.read_pointer(container_addr).ok()?;
+    if container == 0 {
+        return None;
+    }
+    let ruleset = memory.read_pointer(container.saturating_add(4)).ok()?;
+    if ruleset == 0 {
+        return None;
+    }
+    Some(ruleset)
+}
+
+pub fn resolve_ruleset(
+    memory: &ProcessMemory,
+    profile: &ClientProfile,
+    scan_limit_bytes: usize,
+) -> Result<u64> {
+    let container_addr = resolve_ruleset_container(memory, profile, scan_limit_bytes)?;
+    read_active_ruleset(memory, container_addr)
+        .ok_or_else(|| anyhow::anyhow!("active ruleset is null"))
 }
 
 pub fn calculate_accuracy(

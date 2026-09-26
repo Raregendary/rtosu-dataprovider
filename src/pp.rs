@@ -198,20 +198,20 @@ pub mod calculator {
     pub fn extract_pp_breakdown(attrs: &rosu_pp::any::PerformanceAttributes) -> PpBreakdown {
         match attrs {
             rosu_pp::any::PerformanceAttributes::Osu(osu) => PpBreakdown {
-                aim: osu.pp_aim as f32,
-                speed: osu.pp_speed as f32,
-                accuracy: osu.pp_acc as f32,
+                aim: crate::beatmap::round_value(osu.pp_aim as f32, 2),
+                speed: crate::beatmap::round_value(osu.pp_speed as f32, 2),
+                accuracy: crate::beatmap::round_value(osu.pp_acc as f32, 2),
                 difficulty: 0.0,
-                flashlight: osu.pp_flashlight as f32,
-                total: osu.pp as f32,
+                flashlight: crate::beatmap::round_value(osu.pp_flashlight as f32, 2),
+                total: crate::beatmap::round_value(osu.pp as f32, 2),
             },
             rosu_pp::any::PerformanceAttributes::Taiko(taiko) => PpBreakdown {
                 aim: 0.0,
                 speed: 0.0,
-                accuracy: taiko.pp_acc as f32,
-                difficulty: taiko.pp_difficulty as f32,
+                accuracy: crate::beatmap::round_value(taiko.pp_acc as f32, 2),
+                difficulty: crate::beatmap::round_value(taiko.pp_difficulty as f32, 2),
                 flashlight: 0.0,
-                total: taiko.pp as f32,
+                total: crate::beatmap::round_value(taiko.pp as f32, 2),
             },
             rosu_pp::any::PerformanceAttributes::Catch(catch) => PpBreakdown {
                 aim: 0.0,
@@ -219,15 +219,15 @@ pub mod calculator {
                 accuracy: 0.0,
                 difficulty: 0.0,
                 flashlight: 0.0,
-                total: catch.pp as f32,
+                total: crate::beatmap::round_value(catch.pp as f32, 2),
             },
             rosu_pp::any::PerformanceAttributes::Mania(mania) => PpBreakdown {
                 aim: 0.0,
                 speed: 0.0,
                 accuracy: 0.0,
-                difficulty: mania.pp_difficulty as f32,
+                difficulty: crate::beatmap::round_value(mania.pp_difficulty as f32, 2),
                 flashlight: 0.0,
-                total: mania.pp as f32,
+                total: crate::beatmap::round_value(mania.pp as f32, 2),
             },
         }
     }
@@ -255,10 +255,13 @@ pub mod calculator {
         diff: &DifficultyAttributes,
     ) -> crate::v2::PerformanceAccuracy {
         let calc = |acc: f64| {
-            Performance::new(diff.clone())
+            let pp = Performance::new(diff.clone())
                 .accuracy(acc)
+                .hitresult_generator::<rosu_pp::any::hitresult_generator::Fast>()
+                .lazer(false)
                 .calculate()
-                .pp() as f32
+                .pp();
+            crate::beatmap::round_value(pp as f32, 2)
         };
         crate::v2::PerformanceAccuracy {
             n90: calc(90.0),
@@ -329,7 +332,7 @@ pub mod calculator {
             .misses(0)
             .calculate();
         let fc_breakdown = extract_pp_breakdown(&fc_perf);
-        let fc_total = fc_perf.pp() as f32;
+        let fc_total = crate::beatmap::round_value(fc_perf.pp() as f32, 2);
 
         let passed = n300 + n100 + n50 + n0;
         if passed == 0 {
@@ -363,7 +366,7 @@ pub mod calculator {
             .passed_objects(passed)
             .calculate();
         let live_breakdown = extract_pp_breakdown(&live_perf);
-        let live_total = live_perf.pp() as f32;
+        let live_total = crate::beatmap::round_value(live_perf.pp() as f32, 2);
 
         LivePpResult {
             current: live_total,
@@ -375,6 +378,20 @@ pub mod calculator {
                 fc: fc_breakdown,
             },
         }
+    }
+
+    /// Extract live star rating based on passed object count
+    pub fn live_stars_from_chunks(
+        chunks: &[DifficultyAttributes],
+        total_objects: usize,
+        passed_objects: u32,
+    ) -> f32 {
+        if chunks.is_empty() || total_objects == 0 || passed_objects == 0 {
+            return 0.0;
+        }
+        let passed_usize = passed_objects as usize;
+        let chunk_idx = ((passed_usize * (chunks.len() - 1)) / total_objects).min(chunks.len() - 1);
+        crate::beatmap::round_value(chunks[chunk_idx].stars() as f32, 2)
     }
 
     /// Parse legacy bitmask into GameModsLegacy

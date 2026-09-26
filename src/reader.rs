@@ -317,6 +317,8 @@ pub fn format_tourney_packet(snap: &TournamentSnapshot) -> TosuV2Packet {
     packet.folders.skin = snap.skin_folder.clone();
     packet.direct_path.skin_folder = snap.skin_folder.clone();
     packet.session.play_time = snap.game_time;
+    packet.game.focused = snap.focused;
+    packet.performance = snap.performance.clone();
     if let Some(beatmap) = snap.beatmap.as_ref() {
         packet.folders.beatmap = beatmap.folder.clone();
         packet.files.beatmap = beatmap.filename.clone();

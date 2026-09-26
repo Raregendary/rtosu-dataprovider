@@ -2,7 +2,6 @@ use crate::address::checked_add_signed;
 use crate::process::ProcessMemory;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -75,9 +74,12 @@ pub struct ObjectCounts {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
 pub struct HitWindowState {
-    #[serde(flatten)]
-    pub values: BTreeMap<String, f32>,
+    pub miss: f64,
+    pub meh: f64,
+    pub ok: f64,
+    pub great: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -314,9 +316,7 @@ pub fn read_beatmap_from_ptr(
                 holds: 0,
                 total: object_count,
             },
-            hit_window: HitWindowState {
-                values: BTreeMap::new(),
-            },
+            hit_window: HitWindowState::default(),
             max_combo: 0,
             pp: BeatmapPpStats { ss: 0.0, fc: 0.0 },
         },
@@ -474,7 +474,7 @@ pub fn populate_beatmap_file_metadata(snapshot: &mut BeatmapSnapshot, path: &Pat
 }
 
 #[cfg(feature = "pp")]
-fn round_value(value: f32, decimals: u32) -> f32 {
+pub fn round_value(value: f32, decimals: u32) -> f32 {
     let factor = 10_f32.powi(decimals as i32);
     (value * factor).round() / factor
 }
@@ -563,24 +563,36 @@ pub fn populate_beatmap_statistics_with_diff(
         1.0
     };
     let bpm = (map.bpm() as f32) * clock_rate;
-    snapshot.stats.bpm.common = round_value(bpm, 4);
+    snapshot.stats.bpm.common = round_value(bpm, 2);
     if snapshot.stats.bpm.realtime == 0.0 {
-        snapshot.stats.bpm.realtime = round_value(bpm, 4);
+        snapshot.stats.bpm.realtime = round_value(bpm, 2);
     } else {
-        snapshot.stats.bpm.realtime = round_value(snapshot.stats.bpm.realtime * clock_rate, 4);
+        snapshot.stats.bpm.realtime = round_value(snapshot.stats.bpm.realtime * clock_rate, 2);
     }
     if snapshot.stats.bpm.min == 0.0 {
-        snapshot.stats.bpm.min = round_value(bpm, 4);
+        snapshot.stats.bpm.min = round_value(bpm, 2);
     } else {
-        snapshot.stats.bpm.min = round_value(snapshot.stats.bpm.min * clock_rate, 4);
+        snapshot.stats.bpm.min = round_value(snapshot.stats.bpm.min * clock_rate, 2);
     }
     if snapshot.stats.bpm.max == 0.0 {
-        snapshot.stats.bpm.max = round_value(bpm, 4);
+        snapshot.stats.bpm.max = round_value(bpm, 2);
     } else {
-        snapshot.stats.bpm.max = round_value(snapshot.stats.bpm.max * clock_rate, 4);
+        snapshot.stats.bpm.max = round_value(snapshot.stats.bpm.max * clock_rate, 2);
     }
     snapshot.stats.stars.total = round_value(diff.stars() as f32, 2);
     snapshot.stats.stars.live = snapshot.stats.stars.total;
+    snapshot.stats.ar.original = map.ar;
+    snapshot.stats.cs.original = map.cs;
+    snapshot.stats.od.original = map.od;
+    snapshot.stats.hp.original = map.hp;
+    snapshot.stats.ar.converted =
+        round_value(calculate_converted_ar(map.ar, mods, clock_rate), 2);
+    snapshot.stats.cs.converted = round_value(calculate_converted_cs(map.cs, mods), 2);
+    snapshot.stats.od.converted = round_value(
+        calculate_converted_od(map.od, mods, clock_rate, map.mode as u8),
+        2,
+    );
+    snapshot.stats.hp.converted = round_value(calculate_converted_hp(map.hp, mods), 2);
     if let rosu_pp::any::DifficultyAttributes::Osu(osu_diff) = diff {
         snapshot.stats.stars.aim = round_value(osu_diff.aim as f32, 2);
         snapshot.stats.stars.speed = round_value(osu_diff.speed as f32, 2);
@@ -589,27 +601,80 @@ pub fn populate_beatmap_statistics_with_diff(
             (osu_diff.flashlight > 0.0).then(|| round_value(osu_diff.flashlight as f32, 2));
         snapshot.stats.stars.reading = round_value(osu_diff.reading as f32, 2);
         snapshot.stats.stars.hit_window = round_value(osu_diff.great_hit_window as f32, 2);
-        snapshot.stats.hit_window.values.clear();
-        snapshot
-            .stats
-            .hit_window
-            .values
-            .insert("miss".to_string(), 400.0);
-        snapshot.stats.hit_window.values.insert(
-            "meh".to_string(),
-            round_value(osu_diff.meh_hit_window as f32, 2),
-        );
-        snapshot.stats.hit_window.values.insert(
-            "ok".to_string(),
-            round_value(osu_diff.ok_hit_window as f32, 2),
-        );
-        snapshot.stats.hit_window.values.insert(
-            "great".to_string(),
-            round_value(osu_diff.great_hit_window as f32, 2),
-        );
+        snapshot.stats.hit_window = HitWindowState {
+            miss: 400.0 / (clock_rate as f64),
+            meh: osu_diff.meh_hit_window,
+            ok: osu_diff.ok_hit_window,
+            great: osu_diff.great_hit_window,
+        };
     }
     snapshot.stats.pp.ss = crate::pp::calculator::calc_fc_pp(diff, mods_legacy);
     snapshot.stats.pp.fc = snapshot.stats.pp.ss;
+}
+
+pub fn calculate_converted_ar(base_ar: f32, mods: u32, clock_rate: f32) -> f32 {
+    let mut ar = base_ar;
+    if (mods & 16) != 0 {
+        ar = (ar * 1.4).min(10.0);
+    } else if (mods & 2) != 0 {
+        ar *= 0.5;
+    }
+    let ms = if ar <= 5.0 {
+        1800.0 - 120.0 * ar
+    } else {
+        1200.0 - 150.0 * (ar - 5.0)
+    };
+    let scaled_ms = ms / clock_rate;
+    if scaled_ms > 1200.0 {
+        (1800.0 - scaled_ms) / 120.0
+    } else {
+        (1200.0 - scaled_ms) / 150.0 + 5.0
+    }
+}
+
+pub fn calculate_converted_od(base_od: f32, mods: u32, clock_rate: f32, mode: u8) -> f32 {
+    let mut od = base_od;
+    if (mods & 16) != 0 {
+        od = (od * 1.4).min(10.0);
+    } else if (mods & 2) != 0 {
+        od *= 0.5;
+    }
+    if (clock_rate - 1.0).abs() < 1e-5 {
+        return od;
+    }
+    match mode {
+        0 => {
+            let ms = 80.0 - 6.0 * od;
+            let scaled_ms = ms / clock_rate;
+            (80.0 - scaled_ms) / 6.0
+        }
+        1 => {
+            let ms = 50.0 - 3.0 * od;
+            let scaled_ms = ms / clock_rate;
+            (50.0 - scaled_ms) / 3.0
+        }
+        _ => od,
+    }
+}
+
+pub fn calculate_converted_cs(base_cs: f32, mods: u32) -> f32 {
+    let mut cs = base_cs;
+    if (mods & 16) != 0 {
+        cs = (cs * 1.3).min(10.0);
+    } else if (mods & 2) != 0 {
+        cs *= 0.5;
+    }
+    cs
+}
+
+pub fn calculate_converted_hp(base_hp: f32, mods: u32) -> f32 {
+    let mut hp = base_hp;
+    if (mods & 16) != 0 {
+        hp = (hp * 1.4).min(10.0);
+    } else if (mods & 2) != 0 {
+        hp *= 0.5;
+    }
+    hp
 }
 
 /// Read a .NET UTF-16 String from memory at offset from base
@@ -651,16 +716,35 @@ mod tests {
         snapshot.title = "Test Map".to_string();
         snapshot.stats.pp.ss = 512.4;
         snapshot.stats.pp.fc = 512.4;
-        snapshot
-            .stats
-            .hit_window
-            .values
-            .insert("great".to_string(), 55.5);
+        snapshot.stats.hit_window = HitWindowState {
+            miss: 400.0,
+            meh: 100.0,
+            ok: 70.0,
+            great: 55.5,
+        };
 
         let json = serde_json::to_string(&snapshot).expect("serialize beatmap");
         assert!(json.contains("\"id\":12345"));
         assert!(json.contains("\"title\":\"Test Map\""));
         assert!(json.contains("\"great\":55.5"));
         assert!(!json.contains("\"pp\""));
+    }
+
+    #[test]
+    fn test_ar_od_conversion() {
+        // HT: 0.75 clock rate
+        let ar_ht = round_value(calculate_converted_ar(10.0, 256, 0.75), 2);
+        assert_eq!(ar_ht, 9.0);
+        let od_ht = round_value(calculate_converted_od(9.0, 256, 0.75, 0), 2);
+        assert_eq!(od_ht, 7.56);
+        // DT: 1.5 clock rate
+        let ar_dt = round_value(calculate_converted_ar(9.0, 64, 1.5), 2);
+        assert_eq!(ar_dt, 10.33);
+
+        let test_map = rosu_pp::Beatmap::from_bytes(b"osu file format v14\n[TimingPoints]\n0,500,4,1,0,100,1,1\n").unwrap();
+        let kiai = test_map.effect_points.iter().rev().find(|ep| ep.time <= 10.0).map_or(false, |ep| ep.kiai);
+        assert!(kiai);
+        let is_break = test_map.breaks.iter().any(|b| 10.0 >= b.start_time && 10.0 <= b.end_time);
+        assert!(!is_break);
     }
 }

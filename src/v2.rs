@@ -79,7 +79,7 @@ pub struct ComboState {
     pub max: i32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ModsState {
     pub checksum: String,
@@ -89,6 +89,18 @@ pub struct ModsState {
     pub rate: f32,
 }
 
+impl Default for ModsState {
+    fn default() -> Self {
+        Self {
+            checksum: String::new(),
+            number: 0,
+            name: String::new(),
+            array: Vec::new(),
+            rate: 1.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct RankState {
@@ -96,7 +108,7 @@ pub struct RankState {
     pub max_this_play: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PlayState {
     pub failed: bool,
@@ -114,6 +126,29 @@ pub struct PlayState {
     pub unstable_rate: f64,
 }
 
+impl Default for PlayState {
+    fn default() -> Self {
+        Self {
+            failed: false,
+            player_name: String::new(),
+            mode: OsuStatusState {
+                number: 0,
+                name: "osu".to_string(),
+            },
+            score: 0,
+            accuracy: 100.0,
+            health_bar: HealthBarState::default(),
+            hits: HitsState::default(),
+            hit_error_array: Arc::default(),
+            combo: ComboState::default(),
+            mods: create_mods_state(0, ""),
+            rank: RankState::default(),
+            pp: LivePpResult::default(),
+            unstable_rate: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ResultsScreenPp {
@@ -121,21 +156,43 @@ pub struct ResultsScreenPp {
     pub fc: f32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ResultsScreenState {
     pub score_id: i64,
     pub player_name: String,
-    pub name: String,
     pub mode: OsuStatusState,
     pub score: i32,
     pub accuracy: f64,
+    pub name: String,
     pub hits: ResultsHitsState,
     pub mods: ModsState,
     pub max_combo: i32,
     pub rank: String,
     pub pp: ResultsScreenPp,
     pub created_at: String,
+}
+
+impl Default for ResultsScreenState {
+    fn default() -> Self {
+        Self {
+            score_id: 0,
+            player_name: String::new(),
+            mode: OsuStatusState {
+                number: 0,
+                name: "osu".to_string(),
+            },
+            score: 0,
+            accuracy: 0.0,
+            name: String::new(),
+            hits: ResultsHitsState::default(),
+            mods: ModsState::default(),
+            max_combo: 0,
+            rank: String::new(),
+            pp: ResultsScreenPp::default(),
+            created_at: String::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -225,14 +282,14 @@ pub struct PerformanceAccuracy {
 #[serde(rename_all = "camelCase")]
 pub struct GraphSeries {
     pub name: String,
-    pub data: Vec<f32>,
+    pub data: Vec<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PerformanceGraph {
     pub series: Vec<GraphSeries>,
-    pub xaxis: Vec<i32>,
+    pub xaxis: Vec<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -462,11 +519,7 @@ pub fn create_mods_state(mods_num: u32, mods_str: &str) -> ModsState {
     } else {
         1.0
     };
-    let checksum = if array.is_empty() {
-        String::new()
-    } else {
-        md5_hex(serde_json::to_string(&array).unwrap_or_default().as_bytes())
-    };
+    let checksum = md5_hex(serde_json::to_string(&array).unwrap_or_default().as_bytes());
 
     let name = crate::client::format_mods(mods_num);
     let state = ModsState {
@@ -567,6 +620,14 @@ mod tests {
             create_mods_state(16, "HR").checksum,
             "4949c7b3a26dc9119f2f7abd79f5b3f6"
         );
-        assert_eq!(create_mods_state(0, "").checksum, "");
+        assert_eq!(
+            create_mods_state(0, "").checksum,
+            "d751713988987e9331980363e24189ce"
+        );
+
+        let multi = create_mods_state(536873225, "");
+        assert_eq!(multi.checksum, "eec18211a1a9d581bafc90342c0bb4c6");
+        let acronyms: Vec<&str> = multi.array.iter().map(|e| e.acronym.as_str()).collect();
+        assert_eq!(acronyms, vec!["HD", "HT", "NF", "AT", "V2"]);
     }
 }
