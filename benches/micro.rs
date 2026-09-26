@@ -111,8 +111,7 @@ fn crate_combo(v: i32) -> rtosu_dataprovider::v2::ComboState {
 fn marathon_packet(points: usize, series: usize) -> TosuV2Packet {
     let mut packet = representative_packet(0);
     let xaxis = (0..points)
-        .map(|i| (i as i64) * 400 + 48)
-        .map(|v| v as i32)
+        .map(|i| (i as f64) * 400.0 + 48.0)
         .collect();
     let mut graph = rtosu_dataprovider::v2::PerformanceGraph {
         series: Vec::new(),
@@ -121,7 +120,7 @@ fn marathon_packet(points: usize, series: usize) -> TosuV2Packet {
     for s in 0..series {
         graph.series.push(GraphSeries {
             name: ["aim", "aimNoSliders", "reading", "flashlight", "speed"][s % 5].to_string(),
-            data: (0..points).map(|i| (i % 977) as f32 * 0.05).collect(),
+            data: (0..points).map(|i| (i % 977) as f64 * 0.05).collect(),
         });
     }
     packet.performance.graph = rtosu_dataprovider::v2::PrecomputedGraph::new(&graph);

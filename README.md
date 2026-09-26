@@ -100,6 +100,8 @@ auto_mode = true          # Auto-detect tournament vs single-player mode
 [features]
 enable_chat = true        # Attributed multiplayer tournament chat
 enable_pp = true          # Real-time gradual PP calculation
+gradual_pp_chunks = 100   # Number of gradual PP checkpoints per beatmap (1-250)
+enable_hit_errors = true  # Include full hit error array in JSON packet
 
 [logging]
 level = "info"            # "trace", "debug", "info", "warn", "error"

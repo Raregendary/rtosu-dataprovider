@@ -12,7 +12,7 @@ host = "127.0.0.1"
 # Listening port for tosu HTTP and WebSocket replacement.
 # Default: 24050
 # Range: 1024 to 65535
-port = 24051
+port = 24050
 
 # Allow Cross-Origin Resource Sharing (CORS) from any origin.
 # Necessary for browser-based stream overlays (OBS, Streamlabs, Chrome).
@@ -64,6 +64,18 @@ enable_chat = true
 # Enable real-time gradual PP calculation.
 # Default: true
 enable_pp = true
+
+# Number of gradual PP checkpoints per beatmap.
+# Range: 1 to 250
+# Default: 100
+# Set to 1 to only compute full-map difficulty (disables gradual live PP resolution for ultra-low CPU).
+gradual_pp_chunks = 100
+
+# Include the full hit error array in the JSON packet (packet.play.hitErrorArray).
+# When set to false, hitErrorArray is sent as an empty array [] to save network bandwidth
+# and JSON serialization overhead, while unstableRate is still accurately calculated and sent.
+# Default: true
+enable_hit_errors = true
 
 
 [logging]

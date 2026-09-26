@@ -9,12 +9,12 @@ Cargo.lock
 *.json
 !references/**/*.json
 !profiles/**/*.json
-# Benchmarks and benches
+# Benchmarks & local profiling runs
 Benchmarks/
-benches/
 
-# Validation harness
-validations/snapshots/
+# Validation harness & local test notes
+validations/
+validations.md
 
 # Logs & temp files
 logs/
