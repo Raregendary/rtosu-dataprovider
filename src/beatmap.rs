@@ -158,25 +158,18 @@ pub fn beatmap_mode_name(mode: i32) -> &'static str {
     }
 }
 
-/// Read active beatmap metadata from osu! process memory given the base pointer address
-pub fn read_beatmap_memory(
-    memory: &ProcessMemory,
-    base_addr: u64,
-    play_time_addr: Option<u64>,
-    pointer_width: usize,
-) -> Result<BeatmapSnapshot> {
-    // In osu! stable: base_addr - 0xc points to beatmap pointer (indirect dereference)
+/// Read the active beatmap pointer address from osu! process memory.
+/// Returns 0 if no beatmap is loaded.
+pub fn read_beatmap_ptr(memory: &ProcessMemory, base_addr: u64) -> Result<u64> {
     let beatmap_ptr_addr = checked_add_signed(base_addr, -0xc)?;
-    let beatmap_addr = memory
+    memory
         .read_indirect_pointer(beatmap_ptr_addr)
-        .context("reading beatmap pointer")?;
+        .context("reading beatmap pointer")
+}
 
-    if beatmap_addr == 0 {
-        return Ok(BeatmapSnapshot::default());
-    }
-
-    // Read audio playback time if available
-    let live_time = if let Some(pt_addr) = play_time_addr {
+/// Read the current audio playback time in milliseconds.
+pub fn read_live_time(memory: &ProcessMemory, play_time_addr: Option<u64>) -> i32 {
+    if let Some(pt_addr) = play_time_addr {
         let time_ptr_addr = checked_add_signed(pt_addr, 0x5).unwrap_or(pt_addr);
         let time_ptr = memory.read_pointer(time_ptr_addr).unwrap_or(0);
         if time_ptr != 0 {
@@ -186,7 +179,21 @@ pub fn read_beatmap_memory(
         }
     } else {
         0
-    };
+    }
+}
+
+/// Read beatmap details from an already resolved beatmap pointer address.
+pub fn read_beatmap_from_ptr(
+    memory: &ProcessMemory,
+    beatmap_addr: u64,
+    base_addr: u64,
+    live_time: i32,
+    pointer_width: usize,
+) -> Result<BeatmapSnapshot> {
+    crate::instr_scope!(BeatmapMemory);
+    if beatmap_addr == 0 {
+        return Ok(BeatmapSnapshot::default());
+    }
 
     let id = memory
         .read_i32(checked_add_signed(beatmap_addr, 0xC8)?)
@@ -262,12 +269,22 @@ pub fn read_beatmap_memory(
         version,
         folder,
         filename,
-        audio_filename,
         background_filename,
-        source: String::new(),
-        tags: String::new(),
+        audio_filename,
         stats: BeatmapStats {
-            stars: StarsBreakdown::default(),
+            stars: StarsBreakdown {
+                live: 0.0,
+                aim: 0.0,
+                speed: 0.0,
+                flashlight: None,
+                slider_factor: 0.0,
+                stamina: None,
+                rhythm: None,
+                color: None,
+                reading: 0.0,
+                hit_window: 0.0,
+                total: 0.0,
+            },
             ar: StatValue {
                 original: ar,
                 converted: ar,
@@ -284,19 +301,47 @@ pub fn read_beatmap_memory(
                 original: hp,
                 converted: hp,
             },
-            bpm: BpmStats::default(),
-            objects: ObjectCounts {
-                total: object_count,
-                ..ObjectCounts::default()
+            bpm: BpmStats {
+                realtime: 0.0,
+                common: 0.0,
+                min: 0.0,
+                max: 0.0,
             },
-            hit_window: HitWindowState::default(),
+            objects: ObjectCounts {
+                circles: 0,
+                sliders: 0,
+                spinners: 0,
+                holds: 0,
+                total: object_count,
+            },
+            hit_window: HitWindowState {
+                values: BTreeMap::new(),
+            },
             max_combo: 0,
-            pp: BeatmapPpStats::default(),
+            pp: BeatmapPpStats { ss: 0.0, fc: 0.0 },
         },
+        source: String::new(),
+        tags: String::new(),
     })
 }
 
+/// Read active beatmap metadata from osu! process memory given the base pointer address.
+pub fn read_beatmap_memory(
+    memory: &ProcessMemory,
+    base_addr: u64,
+    play_time_addr: Option<u64>,
+    pointer_width: usize,
+) -> Result<BeatmapSnapshot> {
+    let beatmap_addr = read_beatmap_ptr(memory, base_addr)?;
+    if beatmap_addr == 0 {
+        return Ok(BeatmapSnapshot::default());
+    }
+    let live_time = read_live_time(memory, play_time_addr);
+    read_beatmap_from_ptr(memory, beatmap_addr, base_addr, live_time, pointer_width)
+}
+
 pub fn populate_beatmap_file_metadata(snapshot: &mut BeatmapSnapshot, path: &Path) -> bool {
+    crate::instr_scope!(BeatmapFileMeta);
     let Ok(content) = std::fs::read_to_string(path) else {
         return false;
     };
@@ -440,6 +485,7 @@ pub fn populate_beatmap_statistics(
     map: &rosu_pp::Beatmap,
     mods: u32,
 ) {
+    crate::instr_scope!(BeatmapDifficulty);
     let mods_legacy = crate::pp::calculator::parse_mods_bits(mods);
     let diff = rosu_pp::Difficulty::new().mods(mods_legacy).calculate(map);
     populate_beatmap_statistics_with_diff(snapshot, map, &diff, mods);

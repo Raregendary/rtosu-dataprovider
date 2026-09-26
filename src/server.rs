@@ -1,18 +1,58 @@
 use crate::v2::TosuV2Packet;
 use anyhow::{Context, Result};
 use axum::Router;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::http::StatusCode;
-use axum::response::{IntoResponse, Json};
+use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::sync::watch;
 use tower_http::cors::CorsLayer;
 
+/// One poll's packet plus the JSON every consumer receives.
+///
+/// The payload is ~99 % strain graph, so encoding it once per tick and sharing
+/// the result removes a per-client `serde_json::to_string` of ~0.6-1.2 MB.
+/// `Bytes` is a refcounted buffer, so a consumer's cost is a refcount bump.
+#[derive(Clone, Debug)]
+pub struct PublishedPacket {
+    pub packet: Arc<TosuV2Packet>,
+    pub json: Bytes,
+}
+
+impl PublishedPacket {
+    /// Serialize the packet once. `None` means the packet could not be encoded,
+    /// which is logged instead of being pushed to clients as an empty message.
+    pub fn new(packet: TosuV2Packet) -> Option<Self> {
+        crate::instr_scope!(JsonEncode);
+        match serde_json::to_vec(&packet) {
+            Ok(json) => Some(Self {
+                packet: Arc::new(packet),
+                json: Bytes::from(json),
+            }),
+            Err(err) => {
+                tracing::error!("failed to serialize packet: {err:#}");
+                None
+            }
+        }
+    }
+
+    pub fn default_packet() -> Self {
+        let packet = TosuV2Packet::default();
+        let json = serde_json::to_vec(&packet).unwrap_or_else(|_| b"{}".to_vec());
+        Self {
+            packet: Arc::new(packet),
+            json: Bytes::from(json),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
-    pub packet_rx: watch::Receiver<TosuV2Packet>,
+    pub packet_rx: watch::Receiver<PublishedPacket>,
 }
 
 pub fn create_router(
@@ -44,20 +84,29 @@ pub fn create_router(
     router.with_state(state)
 }
 
-async fn handle_json_v2(State(state): State<AppState>) -> impl IntoResponse {
-    let packet = state.packet_rx.borrow().clone();
-    if packet.client == "none" {
+fn json_response(json: Bytes) -> Response {
+    (
+        [(header::CONTENT_TYPE, "application/json")],
+        Body::from(json),
+    )
+        .into_response()
+}
+
+async fn handle_json_v2(State(state): State<AppState>) -> Response {
+    let published = state.packet_rx.borrow().clone();
+    if published.packet.client == "none" {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": "not_ready" })),
         )
             .into_response();
     }
-    Json(packet).into_response()
+    json_response(published.json)
 }
 
 async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
-    let packet = state.packet_rx.borrow();
+    let published = state.packet_rx.borrow();
+    let packet = &published.packet;
     Json(serde_json::json!({
         "status": "ok",
         "client": packet.client,
@@ -74,30 +123,27 @@ async fn handle_ws_upgrade(
     ws.on_upgrade(move |socket| handle_ws_stream(socket, state.packet_rx))
 }
 
-async fn handle_ws_stream(mut socket: WebSocket, mut packet_rx: watch::Receiver<TosuV2Packet>) {
+fn ws_text(json: Bytes) -> Message {
+    Message::Text(
+        Utf8Bytes::try_from(json).expect("packet json is produced by serde_json as utf-8"),
+    )
+}
+
+async fn handle_ws_stream(mut socket: WebSocket, mut packet_rx: watch::Receiver<PublishedPacket>) {
     tracing::debug!("WebSocket client connected");
 
     // Send immediate initial state
-    let initial_json = {
-        let packet = packet_rx.borrow();
-        serde_json::to_string(&*packet).unwrap_or_default()
-    };
-
-    if !initial_json.is_empty() {
-        if socket.send(Message::Text(initial_json.into())).await.is_err() {
-            tracing::debug!("WebSocket client disconnected during initial handshake");
-            return;
-        }
+    let initial_json = packet_rx.borrow_and_update().json.clone();
+    if !initial_json.is_empty() && socket.send(ws_text(initial_json)).await.is_err() {
+        tracing::debug!("WebSocket client disconnected during initial handshake");
+        return;
     }
 
-    // Stream updates on each tick
+    // Stream updates on each tick. The payload was encoded once by the poll
+    // loop, so this is a refcount bump and a write, not a re-serialization.
     while packet_rx.changed().await.is_ok() {
-        let json_str = {
-            let packet = packet_rx.borrow();
-            serde_json::to_string(&*packet).unwrap_or_default()
-        };
-
-        if socket.send(Message::Text(json_str.into())).await.is_err() {
+        let json_str = packet_rx.borrow_and_update().json.clone();
+        if socket.send(ws_text(json_str)).await.is_err() {
             break;
         }
     }
@@ -115,7 +161,7 @@ pub async fn start_server(
     enable_http: bool,
     enable_ws: bool,
     cors_allow_all: bool,
-    packet_rx: watch::Receiver<TosuV2Packet>,
+    packet_rx: watch::Receiver<PublishedPacket>,
 ) -> Result<()> {
     if !enable_http && !enable_ws {
         tracing::info!(
@@ -145,7 +191,7 @@ pub async fn serve_with_listener(
     enable_http: bool,
     enable_ws: bool,
     cors_allow_all: bool,
-    packet_rx: watch::Receiver<TosuV2Packet>,
+    packet_rx: watch::Receiver<PublishedPacket>,
 ) -> Result<()> {
     let state = AppState { packet_rx };
     let app = create_router(state, enable_http, enable_ws, cors_allow_all);
@@ -178,7 +224,7 @@ mod tests {
         sample.client = "stable".to_string();
         sample.play.score = 55555;
 
-        let (tx, rx) = watch::channel(sample);
+        let (tx, rx) = watch::channel(PublishedPacket::new(sample).expect("serialize"));
         let rx_holder = rx.clone();
         let state = AppState { packet_rx: rx };
         let app = create_router(state, true, true, true);
@@ -205,8 +251,9 @@ mod tests {
         // Verify state update propagation to active receivers
         let mut updated = TosuV2Packet::default();
         updated.client = "tournament".to_string();
-        tx.send(updated).unwrap();
-        assert_eq!(rx_holder.borrow().client, "tournament");
+        tx.send(PublishedPacket::new(updated).expect("serialize"))
+            .unwrap();
+        assert_eq!(rx_holder.borrow().packet.client, "tournament");
     }
 
     #[tokio::test]
@@ -214,7 +261,7 @@ mod tests {
         let mut sample = TosuV2Packet::default();
         sample.client = "stable".to_string();
 
-        let (_tx, rx) = watch::channel(sample);
+        let (_tx, rx) = watch::channel(PublishedPacket::new(sample).expect("serialize"));
         let state = AppState { packet_rx: rx };
         let app = create_router(state, true, false, true);
 
@@ -249,7 +296,7 @@ mod tests {
         let mut sample = TosuV2Packet::default();
         sample.client = "stable".to_string();
 
-        let (_tx, rx) = watch::channel(sample);
+        let (_tx, rx) = watch::channel(PublishedPacket::new(sample).expect("serialize"));
         let state = AppState { packet_rx: rx };
         let app = create_router(state, false, true, true);
 
@@ -286,7 +333,7 @@ mod tests {
         sample.client = "stable".to_string();
 
         // 1. With CORS allowed
-        let (_tx, rx1) = watch::channel(sample.clone());
+        let (_tx, rx1) = watch::channel(PublishedPacket::new(sample.clone()).expect("serialize"));
         let app_cors_enabled = create_router(AppState { packet_rx: rx1 }, true, false, true);
         let res1 = app_cors_enabled
             .oneshot(
@@ -304,7 +351,7 @@ mod tests {
         );
 
         // 2. With CORS disabled
-        let (_tx, rx2) = watch::channel(sample);
+        let (_tx, rx2) = watch::channel(PublishedPacket::new(sample).expect("serialize"));
         let app_cors_disabled = create_router(AppState { packet_rx: rx2 }, true, false, false);
         let res2 = app_cors_disabled
             .oneshot(
@@ -322,7 +369,7 @@ mod tests {
     #[tokio::test]
     async fn test_start_server_zero_port_bypass() {
         let sample = TosuV2Packet::default();
-        let (_tx, rx) = watch::channel(sample);
+        let (_tx, rx) = watch::channel(PublishedPacket::new(sample).expect("serialize"));
 
         // Even with an invalid or bound port, if both are false, it should succeed immediately
         let res = start_server("127.0.0.1", 0, false, false, true, rx).await;

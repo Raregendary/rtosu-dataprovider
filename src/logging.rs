@@ -149,8 +149,8 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for DailyLogWriter {
 fn enable_ansi_support() -> bool {
     use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
     use windows_sys::Win32::System::Console::{
-        GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
-        STD_OUTPUT_HANDLE,
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle, STD_OUTPUT_HANDLE,
+        SetConsoleMode,
     };
     unsafe {
         let handle = GetStdHandle(STD_OUTPUT_HANDLE);

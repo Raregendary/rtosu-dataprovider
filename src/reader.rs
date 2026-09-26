@@ -23,6 +23,8 @@ pub struct OsuReaderBuilder {
     proc_check_interval: Duration,
     mode: OsuReaderMode,
     enable_pp: bool,
+    pub gradual_pp_chunks: usize,
+    enable_hit_errors: bool,
     enable_chat: bool,
 }
 
@@ -37,6 +39,8 @@ impl Default for OsuReaderBuilder {
             proc_check_interval: Duration::from_millis(1500),
             mode: OsuReaderMode::Auto,
             enable_pp: true,
+            gradual_pp_chunks: 100,
+            enable_hit_errors: true,
             enable_chat: true,
         }
     }
@@ -103,6 +107,16 @@ impl OsuReaderBuilder {
         self
     }
 
+    pub fn gradual_pp_chunks(mut self, chunks: usize) -> Self {
+        self.gradual_pp_chunks = chunks.clamp(1, 250);
+        self
+    }
+
+    pub fn enable_hit_errors(mut self, enable: bool) -> Self {
+        self.enable_hit_errors = enable;
+        self
+    }
+
     pub fn enable_chat(mut self, enable: bool) -> Self {
         self.enable_chat = enable;
         self
@@ -135,6 +149,8 @@ impl OsuReader {
             builder.scan_limit_bytes,
         )?;
         solo_session.enable_pp = builder.enable_pp;
+        solo_session.gradual_pp_chunks = builder.gradual_pp_chunks;
+        solo_session.enable_hit_errors = builder.enable_hit_errors;
 
         let mut tourney_session = TournamentSession::new(
             &builder.tournament_profile,
@@ -142,6 +158,9 @@ impl OsuReader {
             builder.scan_limit_bytes,
         )?;
         tourney_session.enable_chat = builder.enable_chat;
+        tourney_session.enable_pp = builder.enable_pp;
+        tourney_session.gradual_pp_chunks = builder.gradual_pp_chunks;
+        tourney_session.enable_hit_errors = builder.enable_hit_errors;
 
         let mut reader = Self {
             builder,
@@ -158,6 +177,7 @@ impl OsuReader {
     }
 
     pub fn poll(&mut self) -> Result<TosuV2Packet> {
+        crate::instr_scope!(ReaderPoll);
         let should_check = self.cached_pids.is_empty()
             || self.last_proc_check.elapsed() >= self.builder.proc_check_interval;
         if should_check {
@@ -181,10 +201,12 @@ impl OsuReader {
         if is_tourney {
             let snap = self.tourney_session.poll()?;
             let packet = format_tourney_packet(&snap);
+            crate::instr_scope!(PacketClone);
             self.last_packet = packet.clone();
             Ok(packet)
         } else {
             let packet = self.solo_session.poll()?;
+            crate::instr_scope!(PacketClone);
             self.last_packet = packet.clone();
             Ok(packet)
         }
@@ -192,7 +214,13 @@ impl OsuReader {
 
     fn check_processes(&mut self) {
         self.last_proc_check = Instant::now();
-        let osu_procs = list_processes(Some("osu!.exe")).unwrap_or_default();
+        let osu_procs = match list_processes(Some("osu!.exe")) {
+            Ok(procs) => procs,
+            Err(err) => {
+                tracing::debug!("process check snapshot failed: {err:#}");
+                return;
+            }
+        };
         let new_pids: Vec<u32> = osu_procs.iter().map(|p| p.pid).collect();
         if new_pids.is_empty() {
             self.cached_pids.clear();
@@ -562,4 +590,3 @@ mod tests {
         assert_eq!(country_name(0), "");
     }
 }
-

@@ -23,3 +23,6 @@ jobs:
 
       - name: Run unit tests
         run: cargo test --verbose
+
+      - name: Verify benchmarks compile
+        run: cargo bench --no-run --verbose

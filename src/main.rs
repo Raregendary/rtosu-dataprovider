@@ -192,7 +192,15 @@ fn main() -> Result<()> {
         port: None,
         poll_rate: None,
     });
-    execute(command, cli.pointer_width, config, cli.config.as_deref())
+    let result = execute(command, cli.pointer_width, config, cli.config.as_deref());
+    #[cfg(feature = "instr")]
+    if std::env::var("RTOSU_INSTR").is_ok() {
+        println!(
+            "\n[instr] final phase totals (cumulative, inclusive)\n{}",
+            rtosu_dataprovider::instr::format_table()
+        );
+    }
+    result
 }
 
 fn execute(
@@ -502,8 +510,11 @@ fn execute(
             address,
             length,
         } => {
-            let value =
-                rtosu_dataprovider::rosu_mem::read_bytes(&process, parse_address(&address)?, length)?;
+            let value = rtosu_dataprovider::rosu_mem::read_bytes(
+                &process,
+                parse_address(&address)?,
+                length,
+            )?;
             print_bytes(&value);
         }
         #[cfg(feature = "rosu-mem")]
@@ -554,7 +565,8 @@ async fn run_serve_loop(
     pointer_width: Option<usize>,
     config: AppConfig,
 ) -> Result<()> {
-    let (tx, rx) = tokio::sync::watch::channel(rtosu_dataprovider::v2::TosuV2Packet::default());
+    let (tx, rx) =
+        tokio::sync::watch::channel(rtosu_dataprovider::server::PublishedPacket::default_packet());
     let enable_http = config.server.enable_http;
     let enable_ws = config.server.enable_websocket;
     let cors_allow_all = config.server.cors_allow_all;
@@ -572,17 +584,26 @@ async fn run_serve_loop(
                     || err_msg.contains("address already in use")
                 {
                     eprintln!(" Port {} is already in use by another application!", port);
-                    eprintln!(" (e.g. tosu, another running instance of rtosu, or another web server)");
+                    eprintln!(
+                        " (e.g. tosu, another running instance of rtosu, or another web server)"
+                    );
                     eprintln!();
                     eprintln!(" How to fix:");
                     eprintln!("   1. Close conflicting instances (tosu / rtosu-dataprovider.exe).");
-                    eprintln!("   2. Or run on a different port: rtosu-dataprovider.exe serve --port 24051");
+                    eprintln!(
+                        "   2. Or run on a different port: rtosu-dataprovider.exe serve --port 24051"
+                    );
                     eprintln!("   3. Or change port = 24051 under [server] in config.toml");
                 } else {
                     eprintln!(" Reason: {}", err_msg);
                 }
                 eprintln!("===========================================================");
-                tracing::error!("Failed to bind server listener to {}:{}: {:#}", host, port, err);
+                tracing::error!(
+                    "Failed to bind server listener to {}:{}: {:#}",
+                    host,
+                    port,
+                    err
+                );
                 return Err(err);
             }
         }
@@ -618,15 +639,27 @@ async fn run_serve_loop(
             host, port
         );
         if host == "0.0.0.0" {
-            println!(" (Bound to 0.0.0.0:{} - accessible locally and via your LAN IP)", port);
+            println!(
+                " (Bound to 0.0.0.0:{} - accessible locally and via your LAN IP)",
+                port
+            );
         }
         println!(" Live Endpoints:");
         if enable_http {
-            println!("   - HTTP JSON:        http://{}:{}/json/v2", display_host, port);
-            println!("   - Health check:     http://{}:{}/health", display_host, port);
+            println!(
+                "   - HTTP JSON:        http://{}:{}/json/v2",
+                display_host, port
+            );
+            println!(
+                "   - Health check:     http://{}:{}/health",
+                display_host, port
+            );
         }
         if enable_ws {
-            println!("   - WebSocket Stream: ws://{}:{}/websocket/v2", display_host, port);
+            println!(
+                "   - WebSocket Stream: ws://{}:{}/websocket/v2",
+                display_host, port
+            );
         }
     } else {
         println!(" tosu Rust Native Data Provider running in headless reader mode");
@@ -640,36 +673,68 @@ async fn run_serve_loop(
 
     let mode = if config.poll.auto_mode {
         rtosu_dataprovider::OsuReaderMode::Auto
-    } else if config.poll.default_profile.eq_ignore_ascii_case("tournament") {
+    } else if config
+        .poll
+        .default_profile
+        .eq_ignore_ascii_case("tournament")
+    {
         rtosu_dataprovider::OsuReaderMode::Tournament
     } else {
         rtosu_dataprovider::OsuReaderMode::Solo
     };
 
-    println!(" Mode: {}", match mode {
-        rtosu_dataprovider::OsuReaderMode::Auto => "Auto-detection (Single-Player & Tournament)",
-        rtosu_dataprovider::OsuReaderMode::Tournament => "Locked to Tournament Mode",
-        rtosu_dataprovider::OsuReaderMode::Solo => "Locked to Single-Player Mode",
-    });
     println!(
-        " Features: pp_calc={}, chat_attribution={}",
+        " Mode: {}",
+        match mode {
+            rtosu_dataprovider::OsuReaderMode::Auto =>
+                "Auto-detection (Single-Player & Tournament)",
+            rtosu_dataprovider::OsuReaderMode::Tournament => "Locked to Tournament Mode",
+            rtosu_dataprovider::OsuReaderMode::Solo => "Locked to Single-Player Mode",
+        }
+    );
+    println!(
+        " Features: pp_calc={}, pp_chunks={}, hit_errors={}, chat_attribution={}",
         config.features.enable_pp,
+        config.features.gradual_pp_chunks,
+        config.features.enable_hit_errors,
         config.features.enable_chat
     );
     println!("===========================================================");
 
     let interval = Duration::from_millis(1000 / poll_rate_hz.max(1));
-    let limit = (config.poll.scan_budget_mb * 1024 * 1024) as usize;
+    let limit = config.poll.scan_budget_mb * 1024 * 1024;
     let mut reader = rtosu_dataprovider::OsuReader::builder()
         .tournament_profile(&config.poll.default_profile)
         .solo_profile("stable")
         .mode(mode)
         .enable_pp(config.features.enable_pp)
+        .gradual_pp_chunks(config.features.gradual_pp_chunks)
+        .enable_hit_errors(config.features.enable_hit_errors)
         .enable_chat(config.features.enable_chat)
         .opt_pointer_width(pointer_width)
         .scan_limit_bytes(limit)
         .poll_interval(interval)
         .build()?;
+
+    // Optional phase-instrumentation dump (build with --features instr and set
+    // RTOSU_INSTR=<seconds>). Off by default and absent without the feature.
+    #[cfg(feature = "instr")]
+    if let Ok(raw) = std::env::var("RTOSU_INSTR") {
+        let period = raw.parse::<u64>().unwrap_or(30).max(1);
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(period));
+                println!(
+                    "\n[instr] phase totals after {}s (cumulative, inclusive)\n{}",
+                    period,
+                    rtosu_dataprovider::instr::format_table()
+                );
+            }
+        });
+    }
+
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         tokio::select! {
@@ -678,9 +743,13 @@ async fn run_serve_loop(
                 println!("\nShutdown signal received. Exiting rtosu-dataprovider... Goodbye!");
                 break;
             }
-            _ = tokio::time::sleep(interval) => {
+            _ = ticker.tick() => {
                 if let Ok(packet) = reader.poll() {
-                    let _ = tx.send(packet);
+                    // Encode once per tick and share the result with every HTTP
+                    // and WebSocket consumer.
+                    if let Some(published) = rtosu_dataprovider::server::PublishedPacket::new(packet) {
+                        let _ = tx.send(published);
+                    }
                 }
             }
         }

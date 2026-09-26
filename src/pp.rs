@@ -32,44 +32,83 @@ pub mod calculator {
     use rosu_mods::GameModsLegacy;
     use rosu_pp::any::DifficultyAttributes;
     use rosu_pp::{Beatmap, Difficulty, Performance};
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, Mutex, OnceLock};
 
-    /// In-memory cache for gradual difficulty chunks (10-object stepping)
-    /// Key: (map_id, mods_bits)
-    static CHUNKS_CACHE: Mutex<Option<HashMap<(u32, u32), Arc<Vec<DifficultyAttributes>>>>> =
-        Mutex::new(None);
+    /// In-memory cache for gradual difficulty chunks.
+    /// Key: (map_id_or_hash, mods_bits)
+    static CHUNKS_CACHE: OnceLock<Mutex<HashMap<(u64, u32), Arc<Vec<DifficultyAttributes>>>>> =
+        OnceLock::new();
 
-    /// Precompute and cache gradual difficulty attributes every 10 objects
-    pub fn get_or_compute_gradual_chunks(
-        map_id: u32,
+    static IN_PROGRESS: OnceLock<Mutex<HashSet<(u64, u32)>>> = OnceLock::new();
+
+    fn chunks_cache() -> &'static Mutex<HashMap<(u64, u32), Arc<Vec<DifficultyAttributes>>>> {
+        CHUNKS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn in_progress() -> &'static Mutex<HashSet<(u64, u32)>> {
+        IN_PROGRESS.get_or_init(|| Mutex::new(HashSet::new()))
+    }
+
+    fn insert_chunks(key: (u64, u32), chunks: Arc<Vec<DifficultyAttributes>>) {
+        let mut cache = chunks_cache().lock().unwrap();
+        if cache.len() >= 100 && !cache.contains_key(&key) {
+            if let Some(old_key) = cache.keys().next().copied() {
+                cache.remove(&old_key);
+            }
+        }
+        cache.insert(key, chunks);
+    }
+
+    fn beatmap_cache_key(map_id: u32, map: &Beatmap) -> u64 {
+        if map_id > 0 {
+            map_id as u64
+        } else {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            map.hit_objects.len().hash(&mut hasher);
+            (map.mode as u8).hash(&mut hasher);
+            if let Some(first) = map.hit_objects.first() {
+                (first.start_time as i64).hash(&mut hasher);
+            }
+            if let Some(last) = map.hit_objects.last() {
+                (last.start_time as i64).hash(&mut hasher);
+            }
+            hasher.finish() | 0x8000_0000_0000_0000
+        }
+    }
+
+    /// Synchronously compute difficulty chunks for a given beatmap and mods.
+    pub fn compute_chunks(
         rosu_map: &Beatmap,
         mods: GameModsLegacy,
+        chunk_count: usize,
     ) -> Arc<Vec<DifficultyAttributes>> {
-        let key = (map_id, mods.bits());
-        let mut lock = CHUNKS_CACHE.lock().unwrap();
-        let cache = lock.get_or_insert_with(HashMap::new);
+        let chunk_count = chunk_count.clamp(1, 250);
+        let total_objects = rosu_map.hit_objects.len();
 
-        if let Some(chunks) = cache.get(&key) {
-            return chunks.clone();
+        if chunk_count <= 1 || total_objects == 0 {
+            let full = Difficulty::new().mods(mods).calculate(rosu_map);
+            return Arc::new(vec![full]);
         }
 
+        let step = (total_objects / chunk_count).max(1);
         let diff = Difficulty::new().mods(mods);
         let mut iter = rosu_pp::GradualDifficulty::new(diff, rosu_map);
-        let mut chunks = Vec::new();
+        let mut chunks = Vec::with_capacity(chunk_count + 1);
         let mut last_attrs = None;
         let mut obj_count = 0;
 
         while let Some(attrs) = iter.next() {
             obj_count += 1;
-            if obj_count % 10 == 0 {
+            if obj_count % step == 0 {
                 chunks.push(attrs.clone());
             }
             last_attrs = Some(attrs);
         }
 
-        if obj_count % 10 != 0 {
-            if let Some(attrs) = last_attrs {
+        if let Some(attrs) = last_attrs {
+            if chunks.is_empty() || obj_count % step != 0 {
                 chunks.push(attrs);
             }
         }
@@ -79,9 +118,80 @@ pub mod calculator {
             chunks.push(full);
         }
 
-        let arc_chunks = Arc::new(chunks);
-        cache.insert(key, arc_chunks.clone());
-        arc_chunks
+        Arc::new(chunks)
+    }
+
+    /// Precompute and cache gradual difficulty attributes based on chunk_count (1..=250)
+    pub fn get_or_compute_gradual_chunks(
+        map_id: u32,
+        rosu_map: &Beatmap,
+        mods: GameModsLegacy,
+        chunk_count: usize,
+    ) -> Arc<Vec<DifficultyAttributes>> {
+        let map_key = beatmap_cache_key(map_id, rosu_map);
+        let key = (map_key, mods.bits());
+        let chunk_count = chunk_count.clamp(1, 250);
+
+        // 1. Check if already computed
+        {
+            let cache = chunks_cache().lock().unwrap();
+            if let Some(chunks) = cache.get(&key) {
+                if chunk_count <= 1 || chunks.len() > 1 {
+                    crate::instr_scope!(PpChunksCached);
+                    return chunks.clone();
+                }
+            }
+        }
+
+        // 2. If chunk_count == 1, calculate full map directly in ~5ms without gradual loop
+        if chunk_count <= 1 {
+            let full = Difficulty::new().mods(mods).calculate(rosu_map);
+            let chunks = Arc::new(vec![full]);
+            insert_chunks(key, chunks.clone());
+            return chunks;
+        }
+
+        // 3. For small maps (< 1000 objects), computing is very fast (~20-50ms)
+        let total_objects = rosu_map.hit_objects.len();
+        if total_objects < 1000 {
+            crate::instr_scope!(PpChunksCompute);
+            let chunks = compute_chunks(rosu_map, mods, chunk_count);
+            insert_chunks(key, chunks.clone());
+            return chunks;
+        }
+
+        // 4. For larger maps (marathons, long songs):
+        // Avoid blocking the poll loop! Spawn background task to compute full gradual chunks.
+        let already_in_progress = {
+            let mut in_prog = in_progress().lock().unwrap();
+            !in_prog.insert(key)
+        };
+
+        if !already_in_progress {
+            let map_clone = rosu_map.clone();
+            std::thread::Builder::new()
+                .name(format!("pp-chunk-{map_id}"))
+                .spawn(move || {
+                    let chunks = compute_chunks(&map_clone, mods, chunk_count);
+                    insert_chunks(key, chunks);
+                    in_progress().lock().unwrap().remove(&key);
+                })
+                .ok();
+        }
+
+        // Check if cache already has a fallback entry
+        {
+            let cache = chunks_cache().lock().unwrap();
+            if let Some(chunks) = cache.get(&key) {
+                return chunks.clone();
+            }
+        }
+
+        // Temporary fallback while background thread is computing: instant full-map calculation
+        let full = Difficulty::new().mods(mods).calculate(rosu_map);
+        let fallback = Arc::new(vec![full]);
+        insert_chunks(key, fallback.clone());
+        fallback
     }
 
     /// Extract aim, speed, accuracy, flashlight, and total PP into PpBreakdown
@@ -199,6 +309,7 @@ pub mod calculator {
     /// Calculate full live PP result including FC PP and detailed attribute breakdowns
     pub fn calc_detailed_live_and_fc_pp(
         chunks: &[DifficultyAttributes],
+        total_objects: usize,
         mods: GameModsLegacy,
         combo: u32,
         n300: u32,
@@ -206,6 +317,7 @@ pub mod calculator {
         n50: u32,
         n0: u32,
     ) -> LivePpResult {
+        crate::instr_scope!(PpLive);
         if chunks.is_empty() {
             return LivePpResult::default();
         }
@@ -233,7 +345,12 @@ pub mod calculator {
             };
         }
 
-        let chunk_idx = ((passed.saturating_sub(1) / 10) as usize).min(chunks.len() - 1);
+        let chunk_idx = if chunks.len() <= 1 || total_objects == 0 {
+            0
+        } else {
+            let passed_usize = passed as usize;
+            ((passed_usize * (chunks.len() - 1)) / total_objects).min(chunks.len() - 1)
+        };
         let live_attrs = &chunks[chunk_idx];
 
         let live_perf = Performance::new(live_attrs.clone())
@@ -319,18 +436,45 @@ pub mod calculator {
 
             let beatmap = Beatmap::from_bytes(map_content.as_bytes()).expect("parse map");
             let mods = GameModsLegacy::default();
-            let chunks = get_or_compute_gradual_chunks(12345, &beatmap, mods);
 
-            assert_eq!(chunks.len(), 3);
+            // 1. Test chunk_count = 1 (single chunk / no gradual)
+            let chunks_single = get_or_compute_gradual_chunks(99999, &beatmap, mods, 1);
+            assert_eq!(chunks_single.len(), 1);
 
-            let detailed_0 = calc_detailed_live_and_fc_pp(&chunks, mods, 0, 0, 0, 0, 0);
+            // 2. Test gradual chunk calculation
+            let chunks = get_or_compute_gradual_chunks(12345, &beatmap, mods, 5);
+            assert!(chunks.len() >= 4);
+
+            let detailed_0 = calc_detailed_live_and_fc_pp(&chunks, 25, mods, 0, 0, 0, 0, 0);
             assert_eq!(detailed_0.current, 0.0);
             assert!(detailed_0.fc > 0.0);
             assert!(detailed_0.detailed.fc.aim > 0.0 || detailed_0.detailed.fc.accuracy > 0.0);
 
-            let detailed_25 = calc_detailed_live_and_fc_pp(&chunks, mods, 25, 25, 0, 0, 0);
+            let detailed_25 = calc_detailed_live_and_fc_pp(&chunks, 25, mods, 25, 25, 0, 0, 0);
             assert!(detailed_25.current > 0.0);
             assert_eq!(detailed_25.current, detailed_25.fc);
+        }
+
+        #[test]
+        fn test_unsubmitted_map_cache_key_differentiation() {
+            let map1_content = "osu file format v14\n\n[General]\nMode: 0\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\n\n[TimingPoints]\n0,500,4,2,0,50,1,0\n\n[HitObjects]\n256,192,1000,1,0,0:0:0:0:\n";
+            let map2_content = "osu file format v14\n\n[General]\nMode: 0\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\n\n[TimingPoints]\n0,500,4,2,0,50,1,0\n\n[HitObjects]\n256,192,1000,1,0,0:0:0:0:\n256,192,2000,1,0,0:0:0:0:\n";
+
+            let b1 = Beatmap::from_bytes(map1_content.as_bytes()).expect("parse map1");
+            let b2 = Beatmap::from_bytes(map2_content.as_bytes()).expect("parse map2");
+
+            let key1 = beatmap_cache_key(0, &b1);
+            let key2 = beatmap_cache_key(0, &b2);
+
+            // Both have top bit set
+            assert_ne!(key1 & 0x8000_0000_0000_0000, 0);
+            assert_ne!(key2 & 0x8000_0000_0000_0000, 0);
+
+            // Different unsubmitted maps produce distinct keys
+            assert_ne!(key1, key2);
+
+            // Submitted maps use their ID directly
+            assert_eq!(beatmap_cache_key(12345, &b1), 12345);
         }
     }
 }

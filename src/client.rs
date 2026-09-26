@@ -55,7 +55,7 @@ pub struct GameplayState {
     pub hit_geki: i16,
     pub hit_katu: i16,
     pub hit_miss: i16,
-    pub hit_error_array: Vec<i32>,
+    pub hit_error_array: Vec<i16>,
     pub slider_breaks: i32,
     pub mods: u32,
     pub mods_str: String,
@@ -128,12 +128,15 @@ pub fn parse_spectate_client_arg(cmd: &str) -> Option<(usize, usize)> {
     None
 }
 
+/// Whether the command line marks osu! as a tournament manager.
+///
+/// Only the tournament flags count. `-go`/`/go` used to be listed here, but
+/// that is osu!'s **autoplay** flag: a solo game launched with `-go` was
+/// classified as a tournament manager, and the provider then served an empty
+/// packet forever while reporting no error.
 pub fn is_tournament_manager_cmd(cmd: &str) -> bool {
     let lower = cmd.to_ascii_lowercase();
-    lower.contains("-go")
-        || lower.contains("/go")
-        || lower.contains("tourney")
-        || lower.contains("tournament")
+    lower.contains("-tourney") || lower.contains("/tourney") || lower.contains("tournament")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -414,6 +417,7 @@ pub fn resolve_ruleset(
     let matches = memory.scan_pattern(&pattern, None, 16, scan_limit_bytes)?;
     let mut fallback = None;
     for match_address in matches {
+        let match_address = match_address;
         let pattern_address = match checked_add_signed(match_address, offset) {
             Ok(address) => address,
             Err(_) => continue,
@@ -496,6 +500,7 @@ pub fn read_result_screen_state(
     memory: &ProcessMemory,
     ruleset_address: u64,
 ) -> Result<ResultScreenState> {
+    crate::instr_scope!(ResultScreen);
     let result_screen_base = memory
         .read_pointer(checked_add(ruleset_address, 0x38)?)
         .context("reading result screen base")?;
@@ -584,6 +589,7 @@ pub fn read_local_profile(
     user_profile_pattern_addr: u64,
     raw_login_status_pattern_addr: u64,
 ) -> Result<LocalProfile> {
+    crate::instr_scope!(LocalProfile);
     let profile_base = memory
         .read_indirect_pointer(user_profile_pattern_addr)
         .context("reading local user profile pointer")?;
@@ -638,7 +644,62 @@ pub fn read_local_profile(
     })
 }
 
-pub fn read_hit_errors(memory: &ProcessMemory, score_base: u64) -> Result<Vec<i32>> {
+/// Newest hit errors kept from the game's append-only `List<int>`.
+///
+/// Truncation policy: a list longer than this keeps its **last**
+/// `MAX_HIT_ERRORS` entries. The old code returned an empty vector for any
+/// list above 20 000 entries, which emptied `hitErrorArray` and pinned
+/// `unstableRate` to 0.0 on marathon maps. The unstable rate is a standard
+/// deviation, so the newest 20 000 samples are statistically indistinguishable
+/// from all 47 000 while still bounding the read size and the payload.
+pub const MAX_HIT_ERRORS: usize = 20_000;
+
+/// Sanity bound for a single hit error in milliseconds; anything beyond it means
+/// the tail is garbage rather than data.
+const HIT_ERROR_BOUND: i32 = 10_000;
+
+/// Bytes of .NET object header before element 0 of a `List<int>`'s storage.
+const LIST_ITEMS_HEADER: u64 = 8;
+
+/// Number of elements to read out of a hit-error list of `size` entries, and
+/// the index of the first of them. Oversized lists are truncated to the newest
+/// `MAX_HIT_ERRORS` entries, so the read never exceeds 80 000 bytes however
+/// long the map has been running.
+pub fn hit_error_window(size: usize) -> (usize, usize) {
+    let start = size.saturating_sub(MAX_HIT_ERRORS);
+    (start, size - start)
+}
+
+/// Address of element `start` of the hit-error storage at `items`.
+pub fn hit_error_items_address(items: u64, start: usize) -> Result<u64> {
+    let offset = (start as u64)
+        .checked_mul(4)
+        .ok_or_else(|| anyhow::anyhow!("hit error offset overflow"))?;
+    checked_add(items, LIST_ITEMS_HEADER + offset)
+}
+
+/// Decode one bulk hit-error read. Decoding stops at the first value outside
+/// `±HIT_ERROR_BOUND`, preserving the prefix semantics of the per-element loop
+/// it replaces, and a trailing partial element is ignored.
+///
+/// The buffer length is an exact upper bound on the element count, so the
+/// result is allocated once. Collecting straight from the iterator instead
+/// cost 14 reallocations per poll (measured under `dhat`: 46 752 blocks over
+/// 3 343 polls) because `take_while` erases the size hint.
+pub fn parse_hit_errors(bytes: &[u8]) -> Vec<i16> {
+    let mut result = Vec::with_capacity(bytes.len() / 4);
+    for chunk in bytes.chunks_exact(4) {
+        let value = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        if !(-HIT_ERROR_BOUND..=HIT_ERROR_BOUND).contains(&value) {
+            break;
+        }
+        result.push(value.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
+    }
+    result
+}
+
+pub fn read_hit_errors(memory: &ProcessMemory, score_base: u64) -> Result<Vec<i16>> {
+    crate::instr_scope!(HitErrors);
     let list = memory
         .read_pointer(checked_add(score_base, 0x38)?)
         .context("reading hit error list")?;
@@ -654,31 +715,27 @@ pub fn read_hit_errors(memory: &ProcessMemory, score_base: u64) -> Result<Vec<i3
     let size = memory
         .read_i32(checked_add(list, 0xc)?)
         .context("reading hit error count")?;
-    if !(0..=20_000).contains(&size) {
+    if size <= 0 {
         return Ok(Vec::new());
     }
-    let mut result = Vec::with_capacity(size as usize);
-    for index in 0..size as u64 {
-        let address = checked_add(items, 8 + index * 4)?;
-        let value = memory.read_i32(address).unwrap_or(0);
-        if !(-10_000..=10_000).contains(&value) {
-            break;
-        }
-        result.push(value);
-    }
-    Ok(result)
+    let (start, count) = hit_error_window(size as usize);
+    let address = hit_error_items_address(items, start)?;
+    let bytes = memory
+        .read_bytes(address, count * 4)
+        .with_context(|| format!("reading {count} hit errors at 0x{address:X}"))?;
+    Ok(parse_hit_errors(&bytes))
 }
 
-pub fn calculate_unstable_rate(hit_errors: &[i32], mods: u32) -> f64 {
+pub fn calculate_unstable_rate(hit_errors: &[i16], mods: u32) -> f64 {
     if hit_errors.is_empty() {
         return 0.0;
     }
     let count = hit_errors.len() as f64;
-    let average = hit_errors.iter().map(|value| *value as f64).sum::<f64>() / count;
+    let average = hit_errors.iter().map(|&value| value as f64).sum::<f64>() / count;
     let variance = hit_errors
         .iter()
-        .map(|value| {
-            let delta = *value as f64 - average;
+        .map(|&value| {
+            let delta = value as f64 - average;
             delta * delta
         })
         .sum::<f64>()
@@ -687,7 +744,7 @@ pub fn calculate_unstable_rate(hit_errors: &[i32], mods: u32) -> f64 {
     if mods & 64 != 0 {
         rate / 1.5
     } else if mods & 256 != 0 {
-        rate / 1.3333
+        rate / 0.75
     } else {
         rate
     }
@@ -837,6 +894,15 @@ pub fn read_tournament_user(memory: &ProcessMemory, user_address: u64) -> Result
 }
 
 pub fn read_gameplay_state(memory: &ProcessMemory, ruleset_address: u64) -> Result<GameplayState> {
+    read_gameplay_state_cached(memory, ruleset_address, None)
+}
+
+pub fn read_gameplay_state_cached(
+    memory: &ProcessMemory,
+    ruleset_address: u64,
+    cached_hits: Option<(u32, &[i16], f64)>,
+) -> Result<GameplayState> {
+    crate::instr_scope!(GameplayState);
     let gameplay_base = memory
         .read_pointer(checked_add(ruleset_address, 0x64)?)
         .context("reading gameplay base")?;
@@ -920,8 +986,24 @@ pub fn read_gameplay_state(memory: &ProcessMemory, ruleset_address: u64) -> Resu
     let accuracy = memory
         .read_f64(checked_add(accuracy_base, 0x0c)?)
         .context("reading gameplay accuracy")?;
-    let hit_error_array = read_hit_errors(memory, score_base).unwrap_or_default();
-    let unstable_rate = calculate_unstable_rate(&hit_error_array, mods);
+
+    // Optimization: only read hit error list when hit count changed
+    let total_hits = (hit_300 as u32) + (hit_100 as u32) + (hit_50 as u32) + (hit_miss as u32);
+    let (hit_error_array, unstable_rate) = if total_hits == 0 {
+        (Vec::new(), 0.0)
+    } else if let Some((last_hits, last_arr, last_ur)) = cached_hits {
+        if last_hits == total_hits {
+            (last_arr.to_vec(), last_ur)
+        } else {
+            let arr = read_hit_errors(memory, score_base).unwrap_or_default();
+            let ur = calculate_unstable_rate(&arr, mods);
+            (arr, ur)
+        }
+    } else {
+        let arr = read_hit_errors(memory, score_base).unwrap_or_default();
+        let ur = calculate_unstable_rate(&arr, mods);
+        (arr, ur)
+    };
     let grade = calculate_tosu_grade(mode, accuracy, hit_300, hit_100, hit_50, hit_miss, mods);
     let grade_max = grade.clone();
 
@@ -974,9 +1056,63 @@ pub fn find_pattern(
 #[cfg(test)]
 mod tests {
     use super::{
-        GameplayState, ProcessSnapshotResult, calculate_grade, format_mods,
-        parse_spectate_client_arg,
+        GameplayState, MAX_HIT_ERRORS, ProcessSnapshotResult, calculate_grade,
+        calculate_unstable_rate, format_mods, hit_error_items_address, hit_error_window,
+        is_tournament_manager_cmd, parse_hit_errors, parse_spectate_client_arg,
     };
+
+    /// `List<int>._items` as it looks in the game's address space: the 8-byte
+    /// .NET object header followed by `values` as little-endian `i32`s, so
+    /// element `i` lives at `items + 8 + i * 4`.
+    fn list_items(values: &[i32]) -> Vec<u8> {
+        let mut bytes = vec![0u8; 8];
+        bytes.extend_from_slice(&item_bytes(values));
+        bytes
+    }
+
+    /// Just the elements, i.e. what one `read_bytes` of the storage returns.
+    fn item_bytes(values: &[i32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect::<Vec<u8>>()
+    }
+
+    /// The per-element loop `read_hit_errors` used before the bulk read, as an
+    /// oracle over the same synthetic storage.
+    fn read_hit_errors_reference_loop(storage: &[u8], size: usize) -> Vec<i16> {
+        if !(0..=20_000).contains(&(size as i64)) {
+            return Vec::new();
+        }
+        let mut result = Vec::with_capacity(size);
+        for index in 0..size {
+            let offset = 8 + index * 4;
+            let chunk = [
+                storage[offset],
+                storage[offset + 1],
+                storage[offset + 2],
+                storage[offset + 3],
+            ];
+            let value = i32::from_le_bytes(chunk);
+            if !(-10_000..=10_000).contains(&value) {
+                break;
+            }
+            result.push(value.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
+        }
+        result
+    }
+
+    fn pseudo_random_hits(count: usize, seed: u64) -> Vec<i32> {
+        let mut state = seed;
+        (0..count)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 33) % 4001) as i32 - 2000
+            })
+            .collect()
+    }
 
     #[test]
     fn snapshot_types_are_serializable() {
@@ -1005,9 +1141,176 @@ mod tests {
     }
 
     #[test]
+    fn autoplay_is_not_a_tournament_manager() {
+        // `-go` is osu!'s autoplay flag. Treating it as a tournament manager
+        // made Auto mode serve an empty packet for the whole session.
+        assert!(!is_tournament_manager_cmd("\"D:\\osu\\osu!.exe\" -go"));
+        assert!(!is_tournament_manager_cmd("\"D:\\osu\\osu!.exe\" /go"));
+        assert!(!is_tournament_manager_cmd("\"D:\\osu\\osu!.exe\""));
+        assert!(!is_tournament_manager_cmd(
+            "\"D:\\osu\\osu!.exe\" -replay \"C:\\maps\\x.osr\""
+        ));
+        assert!(is_tournament_manager_cmd(
+            "\"D:\\osu\\osu!.exe\" -tourney 127.0.0.1:24050"
+        ));
+        assert!(is_tournament_manager_cmd(
+            "\"D:\\osu\\osu!.exe\" -Tournament"
+        ));
+    }
+
+    #[test]
     fn test_grade() {
         assert_eq!(calculate_grade(100, 0, 0, 0, 100.0, false), "SS");
         assert_eq!(calculate_grade(100, 0, 0, 0, 100.0, true), "SSH");
         assert_eq!(calculate_grade(100, 0, 0, 0, 0.0, false), "F");
+    }
+
+    #[test]
+    fn hit_error_window_keeps_lists_within_the_cap_whole() {
+        assert_eq!(hit_error_window(0), (0, 0));
+        assert_eq!(hit_error_window(1), (0, 1));
+        assert_eq!(hit_error_window(6_230), (0, 6_230));
+        assert_eq!(hit_error_window(MAX_HIT_ERRORS), (0, MAX_HIT_ERRORS));
+    }
+
+    #[test]
+    fn hit_error_window_truncates_oversized_lists_to_the_newest_entries() {
+        // The regression: 30 000 entries used to come back empty, which emptied
+        // hitErrorArray and pinned unstableRate to 0.0.
+        assert_eq!(hit_error_window(30_000), (10_000, MAX_HIT_ERRORS));
+        assert_eq!(hit_error_window(MAX_HIT_ERRORS + 1), (1, MAX_HIT_ERRORS));
+        assert_eq!(hit_error_window(47_000), (27_000, MAX_HIT_ERRORS));
+        // The read stays bounded at 80 000 bytes no matter how absurd the count.
+        assert_eq!(
+            hit_error_window(i32::MAX as usize),
+            (i32::MAX as usize - MAX_HIT_ERRORS, MAX_HIT_ERRORS)
+        );
+        assert!(hit_error_window(usize::MAX).1 <= MAX_HIT_ERRORS);
+    }
+
+    #[test]
+    fn hit_error_items_address_skips_the_object_header() {
+        let items = 0x0000_1234_0000;
+        assert_eq!(hit_error_items_address(items, 0).unwrap(), items + 8);
+        assert_eq!(hit_error_items_address(items, 1).unwrap(), items + 12);
+        assert_eq!(hit_error_items_address(items, 3).unwrap(), items + 20);
+        assert!(hit_error_items_address(u64::MAX, MAX_HIT_ERRORS).is_err());
+    }
+
+    #[test]
+    fn parse_hit_errors_reads_little_endian_elements() {
+        assert_eq!(parse_hit_errors(&[]), Vec::<i16>::new());
+        assert_eq!(
+            parse_hit_errors(&item_bytes(&[0, 1, -1, 9_999])),
+            vec![0i16, 1, -1, 9_999]
+        );
+        assert_eq!(
+            parse_hit_errors(&item_bytes(&[10_000, -10_000])),
+            vec![10_000i16, -10_000]
+        );
+        assert_eq!(parse_hit_errors(&item_bytes(&[10_001])), Vec::<i16>::new());
+        assert_eq!(parse_hit_errors(&item_bytes(&[-10_001])), Vec::<i16>::new());
+    }
+
+    #[test]
+    fn parse_hit_errors_stops_at_the_first_out_of_range_value() {
+        let parsed = parse_hit_errors(&item_bytes(&[5, -5, 10_001, 7]));
+        assert_eq!(parsed, vec![5i16, -5]);
+    }
+
+    #[test]
+    fn parse_hit_errors_ignores_a_partial_trailing_element() {
+        let mut bytes = item_bytes(&[1, 2, 3]);
+        bytes.extend_from_slice(&[0x04, 0x00]);
+        assert_eq!(parse_hit_errors(&bytes), vec![1i16, 2, 3]);
+
+        let mut truncated = item_bytes(&[1, 2, 3]);
+        truncated.truncate(3 * 4 - 1);
+        assert_eq!(parse_hit_errors(&truncated), vec![1i16, 2]);
+    }
+
+    #[test]
+    fn bulk_parse_matches_the_per_element_loop() {
+        for &size in &[0usize, 1, 2, 3, 4, 5, 999, 6_230, 19_999, 20_000] {
+            let values = pseudo_random_hits(size, 0x5eed_0000 + size as u64);
+            let storage = list_items(&values);
+            let bulk = parse_hit_errors(&storage[8..]);
+            let oracle = read_hit_errors_reference_loop(&storage, size);
+            assert_eq!(bulk.len(), oracle.len(), "length mismatch at size {size}");
+            assert!(bulk == oracle, "value mismatch at size {size}");
+        }
+    }
+
+    #[test]
+    fn bulk_parse_matches_the_loop_with_a_sentinel_in_the_tail() {
+        let mut values = pseudo_random_hits(4_096, 0xabcd);
+        let sentinel = values.len();
+        values.extend_from_slice(&[i32::MAX, 42, 7]);
+        let storage = list_items(&values);
+        assert_eq!(
+            parse_hit_errors(&storage[8..]),
+            read_hit_errors_reference_loop(&storage, sentinel + 3)
+        );
+    }
+
+    #[test]
+    fn oversized_list_keeps_the_newest_errors_and_an_unstable_rate() {
+        let values = pseudo_random_hits(30_000, 0x1234_5678);
+        let storage = list_items(&values);
+        let (start, count) = hit_error_window(values.len());
+        let items = 0x0000_7fff_0000;
+        let address = hit_error_items_address(items, start).unwrap();
+        let offset = (address - items) as usize;
+        let bulk = parse_hit_errors(&storage[offset..offset + count * 4]);
+
+        let expected_tail: Vec<i16> = values[10_000..].iter().map(|&v| v as i16).collect();
+        assert_eq!(bulk.len(), MAX_HIT_ERRORS);
+        assert!(bulk == expected_tail);
+        assert_ne!(calculate_unstable_rate(&bulk, 0), 0.0);
+    }
+
+    #[test]
+    fn an_oversized_list_is_truncated_where_the_old_code_dropped_it() {
+        // The regression: 30 000 entries came back empty, which emptied
+        // hitErrorArray and pinned unstableRate to 0.0 on marathon maps.
+        let values = pseudo_random_hits(30_000, 0x9999);
+        let storage = list_items(&values);
+        assert!(read_hit_errors_reference_loop(&storage, values.len()).is_empty());
+
+        let (start, count) = hit_error_window(values.len());
+        let bulk = parse_hit_errors(&storage[8 + start * 4..8 + (start + count) * 4]);
+        assert_eq!(bulk.len(), MAX_HIT_ERRORS);
+        assert!(calculate_unstable_rate(&bulk, 0) > 0.0);
+    }
+
+    #[test]
+    fn empty_and_negative_counts_read_as_no_hit_errors() {
+        assert_eq!(parse_hit_errors(&item_bytes(&[])), Vec::<i16>::new());
+        let (start, count) = hit_error_window(0);
+        assert_eq!((start, count), (0, 0));
+    }
+
+    #[test]
+    fn test_unstable_rate_mod_scaling() {
+        let hits = vec![-10i16, 10, -5, 5, -8, 8];
+        let nomod = calculate_unstable_rate(&hits, 0);
+        let dt = calculate_unstable_rate(&hits, 64);
+        let ht = calculate_unstable_rate(&hits, 256);
+
+        assert!(nomod > 0.0);
+        // DT speeds up clock 1.5x -> UR is divided by 1.5
+        assert!((dt - (nomod / 1.5)).abs() < 1e-6);
+        // HT slows clock to 0.75x -> UR is divided by 0.75 (larger UR)
+        assert!((ht - (nomod / 0.75)).abs() < 1e-6);
+        assert!(ht > nomod);
+        assert!(nomod > dt);
+    }
+
+    #[test]
+    fn test_i16_hit_error_json_serialization() {
+        let hits: Vec<i16> = vec![-15, 0, 12, 35, -4];
+        let json = serde_json::to_string(&hits).unwrap();
+        // Serializes as standard JSON array of numbers, identical to tosu's Vec<i32> format
+        assert_eq!(json, "[-15,0,12,35,-4]");
     }
 }

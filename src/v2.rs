@@ -5,6 +5,7 @@ use crate::tournament::TournamentChatMessage;
 use md5::Digest;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -105,7 +106,7 @@ pub struct PlayState {
     pub accuracy: f64,
     pub health_bar: HealthBarState,
     pub hits: HitsState,
-    pub hit_error_array: Vec<i32>,
+    pub hit_error_array: Vec<i16>,
     pub combo: ComboState,
     pub mods: ModsState,
     pub rank: RankState,
@@ -238,7 +239,7 @@ pub struct PerformanceGraph {
 #[serde(rename_all = "camelCase")]
 pub struct PerformanceState {
     pub accuracy: PerformanceAccuracy,
-    pub graph: PerformanceGraph,
+    pub graph: Arc<PerformanceGraph>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -371,6 +372,7 @@ pub struct TosuV2Packet {
 }
 
 pub fn create_mods_state(mods_num: u32, mods_str: &str) -> ModsState {
+    crate::instr_scope!(ModsState);
     let array = mod_acronyms(mods_num);
     let rate = if (mods_num & 64) != 0 || (mods_num & 512) != 0 {
         1.5

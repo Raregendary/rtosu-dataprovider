@@ -9,6 +9,9 @@ Cargo.lock
 *.json
 !references/**/*.json
 !profiles/**/*.json
+# Benchmarks and benches
+Benchmarks/
+benches/
 
 # Logs & temp files
 logs/
@@ -16,3 +19,4 @@ logs/
 .DS_Store
 Thumbs.db
 *.tmp
+

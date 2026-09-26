@@ -15,11 +15,17 @@ default = ["pp"]
 pp = ["dep:rosu-pp", "dep:rosu-mods"]
 rosu-mem = ["dep:rosu-mem"]
 rosu-memory = ["rosu-mem"]
+# Enables the dhat allocation profiler inside the `live_harness` bench target.
+# Empty feature: `dhat` is a dev-dependency, so it is only linked into benches.
+dhat-heap = []
+# Enables per-phase timing counters (src/instr.rs). Off by default: with the
+# feature disabled the `instr_scope!`/`instr_bytes!` macros expand to nothing.
+instr = []
 
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.5", features = ["derive"] }
-serde = { version = "1.0", features = ["derive"] }
+serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 md-5 = "0.11"
 toml = "1.1"
@@ -35,6 +41,16 @@ rosu-mods = { version = "0.4.1", optional = true }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support", "html_reports"] }
+dhat = "0.3"
+
+[[bench]]
+name = "micro"
+harness = false
+
+[[bench]]
+name = "live_harness"
+harness = false
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
@@ -42,6 +58,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Console",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_JobObjects",
     "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_SystemInformation",
@@ -55,4 +72,12 @@ lto = "thin"
 codegen-units = 1
 panic = "abort"
 strip = true
+
+# Benchmark profiles: `cargo bench` uses the `bench` profile (inherits release),
+# but keep it explicit so `cargo bench` and the release binary stay comparable.
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
 

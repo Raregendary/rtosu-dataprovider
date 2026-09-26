@@ -161,6 +161,7 @@ pub fn read_tournament_chat(
     chat_engine_pattern_addr: u64,
     spectator_teams: &HashMap<String, String>,
 ) -> Result<Vec<TournamentChatMessage>> {
+    crate::instr_scope!(TournamentChat);
     if chat_engine_pattern_addr == 0 {
         return Ok(Vec::new());
     }

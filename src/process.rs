@@ -62,10 +62,13 @@ mod platform {
         IMAGE_FILE_MACHINE_AMD64, IMAGE_FILE_MACHINE_ARM64, IMAGE_FILE_MACHINE_I386,
     };
     use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, IsWow64Process, IsWow64Process2, OpenProcess, PROCESS_QUERY_INFORMATION,
-        PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ, QueryFullProcessImageNameW,
+        GetExitCodeProcess, IsWow64Process, IsWow64Process2, OpenProcess,
+        PROCESS_QUERY_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ,
+        QueryFullProcessImageNameW,
     };
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId,
+    };
 
     const MAXIMUM_USER_ADDRESS_64: usize = 0x0000_7fff_ffff_ffff;
     const SCAN_CHUNK_SIZE: usize = 1024 * 1024;
@@ -82,6 +85,7 @@ mod platform {
         }
 
         pub fn open_with_pointer_size(pid: u32, pointer_size: Option<usize>) -> Result<Self> {
+            crate::instr_scope!(ProcessOpen);
             if pid == 0 {
                 bail!("process id must be greater than zero");
             }
@@ -140,8 +144,12 @@ mod platform {
             if length == 0 {
                 return Ok(Vec::new());
             }
+            crate::instr_scope!(ReadBytes);
+            crate::instr_bytes!(length);
             let mut bytes = vec![0u8; length];
             let mut bytes_read = 0usize;
+            #[cfg_attr(not(feature = "instr"), allow(unused_variables))]
+            let started = std::time::Instant::now();
             let result = unsafe {
                 ReadProcessMemory(
                     self.handle,
@@ -151,6 +159,14 @@ mod platform {
                     &mut bytes_read,
                 )
             };
+            #[cfg(feature = "instr")]
+            if started.elapsed().as_millis() > 50 {
+                eprintln!(
+                    "[instr-trace] slow read {length}B @ 0x{address:X} took {:?} ok={}",
+                    started.elapsed(),
+                    result != 0
+                );
+            }
             if result == 0 {
                 return Err(std::io::Error::last_os_error())
                     .with_context(|| format!("reading {length} bytes at 0x{address:X}"));
@@ -398,6 +414,7 @@ mod platform {
         }
 
         pub fn query_regions(&self) -> Result<Vec<MemoryRegion>> {
+            crate::instr_scope!(ScanRegions);
             let mut regions = Vec::new();
             let mut address = 0usize;
             let max_address = if usize::BITS == 64 {
@@ -451,6 +468,7 @@ mod platform {
             max_matches: usize,
             max_bytes: usize,
         ) -> Result<Vec<u64>> {
+            crate::instr_scope!(ScanPattern);
             let mut regions = if let Some((base, size)) = range {
                 let end = base
                     .checked_add(size)
@@ -551,26 +569,57 @@ mod platform {
         }
     }
 
+    #[inline]
+    fn u16_ascii_lower(c: u16) -> u16 {
+        if (b'A' as u16..=b'Z' as u16).contains(&c) {
+            c + 32
+        } else {
+            c
+        }
+    }
+
     pub fn list_processes(name_filter: Option<&str>) -> Result<Vec<ProcessInfo>> {
+        crate::instr_scope!(ProcessDiscovery);
         let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
         if snapshot.is_null() || snapshot == INVALID_HANDLE_VALUE {
             return Err(std::io::Error::last_os_error()).context("creating process snapshot");
         }
+
+        let filter_u16: Option<Vec<u16>> =
+            name_filter.map(|f| f.encode_utf16().map(u16_ascii_lower).collect());
 
         let mut entry: PROCESSENTRY32W = unsafe { zeroed() };
         entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
         let mut processes = Vec::new();
         let mut has_entry = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
         while has_entry {
-            let name = utf16_to_string(&entry.szExeFile);
-            let matches = name_filter.is_none_or(|filter| {
-                name.to_ascii_lowercase()
-                    .contains(&filter.to_ascii_lowercase())
-            });
+            let matches = match &filter_u16 {
+                None => true,
+                Some(needle) => {
+                    let len = entry
+                        .szExeFile
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(entry.szExeFile.len());
+                    let exe_slice = &entry.szExeFile[..len];
+                    if needle.is_empty() {
+                        true
+                    } else if needle.len() > exe_slice.len() {
+                        false
+                    } else {
+                        exe_slice.windows(needle.len()).any(|window| {
+                            window
+                                .iter()
+                                .zip(needle.iter())
+                                .all(|(&a, &b)| u16_ascii_lower(a) == b)
+                        })
+                    }
+                }
+            };
             if matches {
                 processes.push(ProcessInfo {
                     pid: entry.th32ProcessID,
-                    name,
+                    name: utf16_to_string(&entry.szExeFile),
                 });
             }
             has_entry = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
