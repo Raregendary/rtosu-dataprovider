@@ -1,91 +1,277 @@
-left  = tosu (148067 bytes)
-right = rtosu (138839 bytes)
+left  = tosu (171740 bytes)
+right = rtosu (160877 bytes)
 
 STRUCTURAL (schema gaps / type / key order) : 1
-ARRAY LEN  (element count differences)     : 0
-VALUE      (materially different)          : 17
-VALUE      (non-volatile -> real defect)   : 10
-ROUNDING   (agrees within 0.005)              : 7
+ARRAY LEN  (element count differences)     : 5
+VALUE      (materially different)          : 137
+VALUE      (non-volatile -> real defect)   : 12
+ROUNDING   (agrees within 0.005)              : 8
 
 --- STRUCTURAL (1) ---
   MISSING_IN_RTOSU  <root>.settings
       left : 'object'
       right: None
 
---- VALUE (non-volatile -> real defect) (10) ---
+--- ARRAY LEN (5) ---
+  ARRAY_LEN         tourney.clients.[0].play.hitErrorArray
+      left : 358
+      right: 357
+  ARRAY_LEN         tourney.clients.[1].play.hitErrorArray
+      left : 360
+      right: 359
+  ARRAY_LEN         tourney.clients.[2].play.hitErrorArray
+      left : 369
+      right: 368
+  ARRAY_LEN         tourney.clients.[4].play.hitErrorArray
+      left : 356
+      right: 355
+  ARRAY_LEN         tourney.clients.[5].play.hitErrorArray
+      left : 369
+      right: 368
+
+--- VALUE (non-volatile -> real defect) (12) ---
+  VALUE_MISMATCH    beatmap.stats.stars.reading
+      left : 0.87
+      right: 2.43
+  VALUE_MISMATCH    beatmap.stats.stars.total
+      left : 6.43
+      right: 6.8
   VALUE_MISMATCH    performance.accuracy.90
-      left : 125.68
-      right: 113.75
+      left : 223.37
+      right: 178.3
   VALUE_MISMATCH    performance.accuracy.91
-      left : 128.28
-      right: 116.08
+      left : 231.05
+      right: 183.89
   VALUE_MISMATCH    performance.accuracy.92
-      left : 131.72
-      right: 118.75
+      left : 239.08
+      right: 190.82
   VALUE_MISMATCH    performance.accuracy.93
-      left : 135.93
-      right: 122.09
+      left : 249.97
+      right: 199.53
   VALUE_MISMATCH    performance.accuracy.94
-      left : 140.65
-      right: 126.18
+      left : 260.67
+      right: 210.82
   VALUE_MISMATCH    performance.accuracy.95
-      left : 147.42
-      right: 132.01
+      left : 273.21
+      right: 225.92
   VALUE_MISMATCH    performance.accuracy.96
-      left : 155.97
-      right: 139.78
+      left : 289.84
+      right: 244.99
   VALUE_MISMATCH    performance.accuracy.97
-      left : 167.64
-      right: 151.58
+      left : 307.5
+      right: 270.62
   VALUE_MISMATCH    performance.accuracy.98
-      left : 183.03
-      right: 169.09
+      left : 332.96
+      right: 305.64
   VALUE_MISMATCH    performance.accuracy.99
-      left : 205.73
-      right: 197.99
+      left : 363.32
+      right: 353.0
 
---- VALUE (volatile / expected live drift) (7) ---
+--- VALUE (volatile / expected live drift) (125) ---
   VALUE_MISMATCH    session.playTime
-      left : 1190853
-      right: 1190931
+      left : 5099349
+      right: 5099383
   VALUE_MISMATCH    beatmap.time.live
-      left : 292994
-      right: 292978
-  VALUE_MISMATCH    beatmap.time.lastObject
-      left : 330654
-      right: 328808
+      left : 51173
+      right: 51234
   VALUE_MISMATCH    performance.graph.series.[0].data[0]
-      left : 4.433959664267074
-      right: 4.433957138590933
+      left : -100
+      right: -100.0
   VALUE_MISMATCH    performance.graph.series.[1].data[0]
-      left : 4.433959664267074
-      right: 4.433957138590933
+      left : -100
+      right: -100.0
   VALUE_MISMATCH    performance.graph.series.[2].data[0]
-      left : 0
-      right: 0.0
+      left : -100
+      right: -100.0
   VALUE_MISMATCH    performance.graph.series.[4].data[0]
-      left : 21.41135125701791
-      right: 21.41135125701791
+      left : -100
+      right: -100.0
+  VALUE_MISMATCH    tourney.totalScore.left
+      left : 6798088
+      right: 6798118
+  VALUE_MISMATCH    tourney.totalScore.right
+      left : 10140767
+      right: 10140827
+  VALUE_MISMATCH    tourney.clients.[0].user.globalRank
+      left : 0
+      right: 127005
+  VALUE_MISMATCH    tourney.clients.[0].beatmap.stats.stars.live
+      left : 5.7
+      right: 5.71
+  VALUE_MISMATCH    tourney.clients.[0].play.score
+      left : 1277743
+      right: 1277773
+  VALUE_MISMATCH    tourney.clients.[0].play.healthBar.normal
+      left : 99.39024539029629
+      right: 99.99265355891923
+  VALUE_MISMATCH    tourney.clients.[0].play.healthBar.smooth
+      left : 99.67908406032987
+      right: 99.69072366357874
+  VALUE_MISMATCH    tourney.clients.[0].play.hits.sliderBreaks
+      left : 1
+      right: 0
+  VALUE_MISMATCH    tourney.clients.[0].play.combo.current
+      left : 184
+      right: 185
+  VALUE_MISMATCH    tourney.clients.[0].play.combo.max
+      left : 184
+      right: 185
+  VALUE_MISMATCH    tourney.clients.[0].play.rank.maxThisPlay
+      left : 'A'
+      right: 'B'
+  VALUE_MISMATCH    tourney.clients.[0].play.pp.current
+      left : 68.85
+      right: 79.66
+  VALUE_MISMATCH    tourney.clients.[0].play.pp.fc
+      left : 368.09
+      right: 455.59
+  VALUE_MISMATCH    tourney.clients.[0].play.pp.maxAchieved
+      left : 108.13
+      right: 79.66
+  VALUE_MISMATCH    tourney.clients.[0].play.pp.maxAchievable
+      left : 240.67
+      right: 455.59
+  VALUE_MISMATCH    tourney.clients.[0].play.pp.detailed.current.aim
+      left : 27.31
+      right: 31.43
+  VALUE_MISMATCH    tourney.clients.[0].play.pp.detailed.current.speed
+      left : 30.01
+      right: 33.75
+  VALUE_MISMATCH    tourney.clients.[0].play.pp.detailed.current.accuracy
+      left : 0.63
+      right: 1.99
+  VALUE_MISMATCH    tourney.clients.[0].play.pp.detailed.current.total
+      left : 68.85
+      right: 79.66
+  VALUE_MISMATCH    tourney.clients.[0].play.pp.detailed.fc.aim
+      left : 140.26
+      right: 143.36
+  VALUE_MISMATCH    tourney.clients.[0].play.pp.detailed.fc.speed
+      left : 120.18
+      right: 136.29
+  VALUE_MISMATCH    tourney.clients.[0].play.pp.detailed.fc.accuracy
+      left : 55.41
+      right: 122.15
+  VALUE_MISMATCH    tourney.clients.[0].play.pp.detailed.fc.total
+      left : 368.09
+      right: 455.59
+  VALUE_MISMATCH    tourney.clients.[0].play.unstableRate
+      left : 219.09056861778458
+      right: 219.2401741300199
+  VALUE_MISMATCH    tourney.clients.[1].user.playCount
+      left : 57907
+      right: 57906
+  VALUE_MISMATCH    tourney.clients.[1].user.globalRank
+      left : 0
+      right: 107809
+  VALUE_MISMATCH    tourney.clients.[1].beatmap.stats.stars.live
+      left : 5.7
+      right: 5.71
+  VALUE_MISMATCH    tourney.clients.[1].play.healthBar.normal
+      left : 99.5004420065078
+      right: 99.03761621841944
+  VALUE_MISMATCH    tourney.clients.[1].play.healthBar.smooth
+      left : 99.73924077546066
+      right: 99.49929899951364
+  VALUE_MISMATCH    tourney.clients.[1].play.hits.sliderBreaks
+      left : 2
+      right: 0
+  VALUE_MISMATCH    tourney.clients.[1].play.rank.maxThisPlay
+      left : 'A'
+      right: 'C'
+  VALUE_MISMATCH    tourney.clients.[1].play.pp.current
+      left : 70.84
+      right: 79.91
+  VALUE_MISMATCH    tourney.clients.[1].play.pp.fc
+      left : 340.22
+      right: 455.59
+  VALUE_MISMATCH    tourney.clients.[1].play.pp.maxAchieved
+      left : 85.96
+      right: 79.91
+  VALUE_MISMATCH    tourney.clients.[1].play.pp.maxAchievable
+      left : 247.84
+      right: 455.59
+  VALUE_MISMATCH    tourney.clients.[1].play.pp.detailed.current.aim
+      left : 31.04
+      right: 35.11
+  VALUE_MISMATCH    tourney.clients.[1].play.pp.detailed.current.speed
+      left : 28.28
+      right: 30.97
+  VALUE_MISMATCH    tourney.clients.[1].play.pp.detailed.current.accuracy
+      left : 0.13
+      right: 0.68
+  VALUE_MISMATCH    tourney.clients.[1].play.pp.detailed.current.total
+      left : 70.84
+      right: 79.91
+  VALUE_MISMATCH    tourney.clients.[1].play.pp.detailed.fc.aim
+      left : 138.8
+      right: 143.36
+  VALUE_MISMATCH    tourney.clients.[1].play.pp.detailed.fc.speed
+      left : 111.09
+      right: 136.29
+  VALUE_MISMATCH    tourney.clients.[1].play.pp.detailed.fc.accuracy
+      left : 38.55
+      right: 122.15
+  VALUE_MISMATCH    tourney.clients.[1].play.pp.detailed.fc.total
+      left : 340.22
+      right: 455.59
+  VALUE_MISMATCH    tourney.clients.[1].play.unstableRate
+      left : 264.8705119813905
+      right: 264.36105398196327
+  VALUE_MISMATCH    tourney.clients.[2].user.playCount
+      left : 118629
+      right: 118628
+  VALUE_MISMATCH    tourney.clients.[2].user.globalRank
+      left : 0
+      right: 14025
+  VALUE_MISMATCH    tourney.clients.[2].play.score
+      left : 4566572
+      right: 4566602
+  VALUE_MISMATCH    tourney.clients.[2].play.healthBar.normal
+      left : 99.75756744433467
+      right: 99.87511050162695
+  VALUE_MISMATCH    tourney.clients.[2].play.healthBar.smooth
+      left : 99.78003685320023
+      right: 99.76428480291585
+  VALUE_MISMATCH    tourney.clients.[2].play.combo.current
+      left : 532
+      right: 533
+  VALUE_MISMATCH    tourney.clients.[2].play.combo.max
+      left : 532
+      right: 533
+  VALUE_MISMATCH    tourney.clients.[2].play.pp.current
+      left : 171.74
+      right: 173.33
+  VALUE_MISMATCH    tourney.clients.[2].play.pp.fc
+      left : 375.83
+      right: 408.98
+  VALUE_MISMATCH    tourney.clients.[2].play.pp.maxAchieved
+      left : 175.53
+      right: 173.33
+  ... 65 more
 
---- ROUNDING (7) ---
+--- ROUNDING (8) ---
   ROUNDING          beatmap.stats.bpm.common
-      left : 260.0003
-      right: 260.0
+      left : 200.4001
+      right: 200.4
   ROUNDING          tourney.clients.[0].beatmap.stats.bpm.common
-      left : 260.0003
-      right: 260.0
+      left : 200.4001
+      right: 200.4
   ROUNDING          tourney.clients.[1].beatmap.stats.bpm.common
-      left : 260.0003
-      right: 260.0
+      left : 200.4001
+      right: 200.4
   ROUNDING          tourney.clients.[2].beatmap.stats.bpm.common
-      left : 260.0003
-      right: 260.0
+      left : 200.4001
+      right: 200.4
   ROUNDING          tourney.clients.[3].beatmap.stats.bpm.common
-      left : 260.0003
-      right: 260.0
+      left : 200.4001
+      right: 200.4
+  ROUNDING          tourney.clients.[3].play.accuracy
+      left : 95.82615816357317
+      right: 95.83
   ROUNDING          tourney.clients.[4].beatmap.stats.bpm.common
-      left : 260.0003
-      right: 260.0
+      left : 200.4001
+      right: 200.4
   ROUNDING          tourney.clients.[5].beatmap.stats.bpm.common
-      left : 260.0003
-      right: 260.0
+      left : 200.4001
+      right: 200.4

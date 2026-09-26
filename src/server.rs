@@ -4,7 +4,7 @@ use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
-use axum::http::{StatusCode, header};
+use axum::http::header;
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::get;
 use std::net::SocketAddr;
@@ -94,13 +94,6 @@ fn json_response(json: Bytes) -> Response {
 
 async fn handle_json_v2(State(state): State<AppState>) -> Response {
     let published = state.packet_rx.borrow().clone();
-    if published.packet.client == "none" {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "not_ready" })),
-        )
-            .into_response();
-    }
     json_response(published.json)
 }
 

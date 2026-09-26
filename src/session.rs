@@ -1512,17 +1512,14 @@ impl SoloSession {
             self.cached_hit_errors_total_hits = 0;
             self.cached_hit_errors = Arc::default();
             self.cached_unstable_rate = 0.0;
-            if let Some(mods_addr) = self.menu_mods_pattern_addr {
-                if let Ok(mods_ptr) = memory.read_indirect_pointer(mods_addr) {
-                    if mods_ptr != 0 {
-                        if let Ok(mods_val) = memory.read_u32(mods_ptr) {
-                            self.cached_packet.play.mods = crate::v2::create_mods_state(
-                                mods_val,
-                                &crate::client::format_mods(mods_val),
-                            );
-                        }
-                    }
-                }
+            if let Some(mods_addr) = self.menu_mods_pattern_addr
+                && let Ok(mods_val) = memory.read_indirect_pointer(mods_addr)
+            {
+                let mods_val = mods_val as u32;
+                self.cached_packet.play.mods = crate::v2::create_mods_state(
+                    mods_val,
+                    &crate::client::format_mods(mods_val),
+                );
             }
         }
 

@@ -201,7 +201,7 @@ impl OsuReader {
 
         if is_tourney {
             let snap = self.tourney_session.poll()?;
-            let packet = format_tourney_packet(&snap);
+            let packet = format_tourney_packet(&snap, self.tourney_session.enable_hit_errors);
             crate::instr_scope!(PacketClone);
             self.last_packet = packet.clone();
             Ok(packet)
@@ -297,7 +297,10 @@ impl OsuReaderStream {
     }
 }
 
-pub fn format_tourney_packet(snap: &TournamentSnapshot) -> TosuV2Packet {
+pub fn format_tourney_packet(
+    snap: &TournamentSnapshot,
+    enable_hit_errors: bool,
+) -> TosuV2Packet {
     let mut packet = TosuV2Packet {
         client: "stable".to_string(),
         server: "ppy.sh".to_string(),
@@ -362,7 +365,9 @@ pub fn format_tourney_packet(snap: &TournamentSnapshot) -> TosuV2Packet {
             })
             .unwrap_or_default();
         let mut play = gameplay_to_play(client.gameplay.as_ref());
-        play.hit_error_array = std::sync::Arc::default();
+        if !enable_hit_errors {
+            play.hit_error_array = std::sync::Arc::default();
+        }
         if play.rank.current.is_empty() {
             play.rank.current = "XH".to_string();
             play.rank.max_this_play = "XH".to_string();
