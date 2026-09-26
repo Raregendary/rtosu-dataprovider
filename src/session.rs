@@ -23,6 +23,7 @@ pub struct TournamentClientView {
     pub user: Option<TournamentUser>,
     pub gameplay: Option<GameplayState>,
     pub beatmap: Option<BeatmapSnapshot>,
+    pub pp: Option<crate::pp::LivePpResult>,
     pub error: Option<String>,
 }
 
@@ -534,6 +535,53 @@ impl TournamentSession {
                         }
                     }
                 }
+                #[cfg(feature = "pp")]
+                let live_pp = if self.enable_pp {
+                    if let Some(map) = self.cached_beatmap.as_ref() {
+                        let mods_legacy = gameplay
+                            .as_ref()
+                            .map(|g| crate::pp::calculator::parse_mods_bits(g.mods))
+                            .unwrap_or_else(|| rosu_mods::GameModsLegacy::default());
+                        let total_objects = map.hit_objects.len();
+                        let chunks = crate::pp::calculator::get_or_compute_gradual_chunks(
+                            beatmap.as_ref().map_or(0, |b| b.id as u32),
+                            map,
+                            mods_legacy,
+                            self.gradual_pp_chunks,
+                        );
+                        let (combo, n300, n100, n50, n0) = gameplay
+                            .as_ref()
+                            .map(|g| (g.combo as u32, g.hit_300 as u32, g.hit_100 as u32, g.hit_50 as u32, g.hit_miss as u32))
+                            .unwrap_or((0, 0, 0, 0, 0));
+                        let pp = crate::pp::calculator::calc_detailed_live_and_fc_pp(
+                            &chunks,
+                            total_objects,
+                            mods_legacy,
+                            combo,
+                            n300,
+                            n100,
+                            n50,
+                            n0,
+                        );
+                        let total_hits = n300 + n100 + n50 + n0;
+                        let live_stars = crate::pp::calculator::live_stars_from_chunks(
+                            &chunks,
+                            total_objects,
+                            total_hits,
+                        );
+                        if let Some(b) = beatmap.as_mut() {
+                            b.stats.stars.live = live_stars;
+                        }
+                        Some(pp)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                #[cfg(not(feature = "pp"))]
+                let live_pp: Option<crate::pp::LivePpResult> = None;
+
                 let is_playing = gameplay.as_ref().map_or(false, |g| g.combo > 0 || (g.hit_300 + g.hit_100 + g.hit_50 + g.hit_miss) > 0);
                 if !is_playing {
                     if let Some(b) = beatmap.as_mut() {
@@ -551,6 +599,7 @@ impl TournamentSession {
                     user,
                     gameplay,
                     beatmap,
+                    pp: live_pp,
                     error: None,
                 });
             }
@@ -561,6 +610,43 @@ impl TournamentSession {
 
         if root_beatmap.is_none() {
             root_beatmap = spectator_views.first().and_then(|v| v.beatmap.clone());
+        }
+
+        // Propagate ranked status from manager beatmap (valid status range: 1..=7)
+        let manager_status = self.clients
+            .values()
+            .find(|c| c.is_manager || c.ipc_id.is_none())
+            .and_then(|c| c.cached_beatmap_snapshot.as_ref())
+            .map(|b| b.status.clone())
+            .filter(|s| (1..=7).contains(&s.number));
+
+        let resolved_status = manager_status.or_else(|| {
+            root_beatmap
+                .as_ref()
+                .map(|b| b.status.clone())
+                .filter(|s| (1..=7).contains(&s.number))
+                .or_else(|| {
+                    self.clients
+                        .values()
+                        .filter_map(|c| c.cached_beatmap_snapshot.as_ref())
+                        .map(|b| b.status.clone())
+                        .find(|s| (1..=7).contains(&s.number))
+                })
+        });
+
+        if let Some(status) = resolved_status {
+            if let Some(b) = root_beatmap.as_mut() {
+                if b.status.number == 0 {
+                    b.status = status.clone();
+                }
+            }
+            for view in &mut spectator_views {
+                if let Some(b) = view.beatmap.as_mut() {
+                    if b.status.number == 0 {
+                        b.status = status.clone();
+                    }
+                }
+            }
         }
         if let Some(b) = root_beatmap.as_mut() {
             if b.time.live == 0 {

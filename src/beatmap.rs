@@ -203,9 +203,14 @@ pub fn read_beatmap_from_ptr(
     let set_id = memory
         .read_i32(checked_add_signed(beatmap_addr, 0xCC)?)
         .unwrap_or(0);
-    let status_num = memory
-        .read_i32(checked_add_signed(beatmap_addr, 0x12C)?)
-        .unwrap_or(0);
+    let status_raw = memory
+        .read_i16(checked_add_signed(beatmap_addr, 0x12C)?)
+        .unwrap_or(0) as i32;
+    let status_num = if (1..=7).contains(&status_raw) {
+        status_raw
+    } else {
+        0
+    };
     let mode = memory
         .read_indirect_pointer(checked_add_signed(base_addr, -0x33)?)
         .unwrap_or(0) as i32;

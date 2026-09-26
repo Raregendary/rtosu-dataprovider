@@ -12,7 +12,7 @@ host = "127.0.0.1"
 # Listening port for tosu HTTP and WebSocket replacement.
 # Default: 24050
 # Range: 1024 to 65535
-port = 24050
+port = 24051
 
 # Allow Cross-Origin Resource Sharing (CORS) from any origin.
 # Necessary for browser-based stream overlays (OBS, Streamlabs, Chrome).
@@ -83,4 +83,3 @@ log_to_file = true
 # Default: 7
 # Range: 1 to 365
 max_log_files = 7
-

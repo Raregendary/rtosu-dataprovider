@@ -353,7 +353,7 @@ pub fn format_tourney_packet(snap: &TournamentSnapshot) -> TosuV2Packet {
             .map(|u| TourneyUser {
                 id: u.id,
                 name: u.name.clone(),
-                country: u.country.to_ascii_uppercase(),
+                country: u.country.clone(),
                 accuracy: u.accuracy as f32,
                 ranked_score: u.ranked_score,
                 play_count: u.play_count,
@@ -363,6 +363,13 @@ pub fn format_tourney_packet(snap: &TournamentSnapshot) -> TosuV2Packet {
             .unwrap_or_default();
         let mut play = gameplay_to_play(client.gameplay.as_ref());
         play.hit_error_array = std::sync::Arc::default();
+        if play.rank.current.is_empty() {
+            play.rank.current = "XH".to_string();
+            play.rank.max_this_play = "XH".to_string();
+        }
+        if let Some(ref pp) = client.pp {
+            play.pp = pp.clone();
+        }
         let beatmap = TourneyClientBeatmap {
             stats: client
                 .beatmap
