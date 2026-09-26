@@ -69,6 +69,13 @@ pub struct CachedClientState {
     pub cached_hit_errors: Arc<[i16]>,
     pub cached_unstable_rate: f64,
     pub cached_gameplay: Option<GameplayState>,
+    pub cached_beatmap_ptr: u64,
+    pub cached_beatmap_snapshot: Option<BeatmapSnapshot>,
+    pub cached_user_ptr: u64,
+    pub cached_user: Option<TournamentUser>,
+    pub cached_chat_size: usize,
+    pub cached_chat: Vec<crate::tournament::TournamentChatMessage>,
+    pub last_pattern_retry: Instant,
 }
 
 pub struct TournamentSession {
@@ -86,6 +93,7 @@ pub struct TournamentSession {
     pub cached_beatmap: Option<rosu_pp::Beatmap>,
     pub cached_metadata: Option<crate::beatmap::BeatmapSnapshot>,
     pub cached_stats: crate::beatmap::BeatmapStats,
+    pub cached_stats_by_mods: HashMap<u32, crate::beatmap::BeatmapStats>,
     pub cached_accuracy: crate::v2::PerformanceAccuracy,
     pub cached_graph: crate::v2::PrecomputedGraph,
 }
@@ -113,6 +121,7 @@ impl TournamentSession {
             cached_beatmap: None,
             cached_metadata: None,
             cached_stats: crate::beatmap::BeatmapStats::default(),
+            cached_stats_by_mods: HashMap::new(),
             cached_accuracy: crate::v2::PerformanceAccuracy::default(),
             cached_graph: crate::v2::PrecomputedGraph::default(),
         })
@@ -122,14 +131,12 @@ impl TournamentSession {
         crate::instr_scope!(TourneyPoll);
         let start = Instant::now();
 
-        // 1. Remove dead processes from cache using fast is_alive check
-        self.clients.retain(|_, client| client.memory.is_alive());
-
-        // 2. Enumerate current osu processes only if empty or periodically (every 1.5s)
+        // 1. Enumerate current osu processes and clean up dead ones periodically (every 1.5s) or if empty
         if self.clients.is_empty()
             || self.last_proc_scan.elapsed() >= std::time::Duration::from_millis(1500)
         {
             self.last_proc_scan = Instant::now();
+            self.clients.retain(|_, client| client.memory.is_alive());
             let running_processes = list_processes(Some("osu!.exe")).unwrap_or_default();
             let running_pids: HashMap<u32, String> = running_processes
                 .into_iter()
@@ -206,7 +213,7 @@ impl TournamentSession {
         let mut spectator_teams = HashMap::new();
 
         // Pre-pass: map spectator usernames to their assigned team for chat mapping
-        for client in self.clients.values() {
+        for client in self.clients.values_mut() {
             if client.ipc_id.is_some() {
                 let team = team_by_pid
                     .get(&client.pid)
@@ -214,8 +221,18 @@ impl TournamentSession {
                     .unwrap_or_else(|| "right".to_string());
                 if let Some(user_pat) = client.spectating_user_pattern_addr {
                     if let Ok(user_addr) = client.memory.read_indirect_pointer(user_pat) {
-                        if let Ok(user) = read_tournament_user(&client.memory, user_addr) {
-                            spectator_teams.insert(user.name, team);
+                        if user_addr != 0 {
+                            if user_addr == client.cached_user_ptr && client.cached_user.is_some() {
+                                if let Some(ref u) = client.cached_user {
+                                    spectator_teams.insert(u.name.clone(), team);
+                                }
+                            } else {
+                                client.cached_user_ptr = user_addr;
+                                if let Ok(user) = read_tournament_user(&client.memory, user_addr) {
+                                    spectator_teams.insert(user.name.clone(), team);
+                                    client.cached_user = Some(user);
+                                }
+                            }
                         }
                     }
                 }
@@ -223,16 +240,44 @@ impl TournamentSession {
         }
 
         for client in self.clients.values_mut() {
-            let mut beatmap = client.base_pattern_addr.and_then(|base_addr| {
-                crate::beatmap::read_beatmap_memory(
-                    &client.memory,
-                    base_addr,
-                    client.play_time_pattern_addr,
-                    self.pointer_width.unwrap_or(4),
-                )
-                .ok()
-                .filter(|beatmap| beatmap.id > 0 || !beatmap.title.is_empty())
-            });
+            let mut beatmap = if let Some(base_addr) = client.base_pattern_addr {
+                if let Ok(beatmap_addr) = crate::beatmap::read_beatmap_ptr(&client.memory, base_addr) {
+                    if beatmap_addr == 0 {
+                        client.cached_beatmap_ptr = 0;
+                        client.cached_beatmap_snapshot = None;
+                        None
+                    } else {
+                        let live_time = crate::beatmap::read_live_time(&client.memory, client.play_time_pattern_addr);
+                        if beatmap_addr == client.cached_beatmap_ptr && client.cached_beatmap_snapshot.is_some() {
+                            let mut bm = client.cached_beatmap_snapshot.clone().unwrap();
+                            bm.time.live = live_time;
+                            Some(bm)
+                        } else {
+                            client.cached_beatmap_ptr = beatmap_addr;
+                            if let Ok(bm) = crate::beatmap::read_beatmap_from_ptr(
+                                &client.memory,
+                                beatmap_addr,
+                                base_addr,
+                                live_time,
+                                self.pointer_width.unwrap_or(4),
+                            ) {
+                                if bm.id > 0 || !bm.title.is_empty() {
+                                    client.cached_beatmap_snapshot = Some(bm.clone());
+                                    Some(bm)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             if let Some(audio_addr) = client.audio_length_pattern_addr
                 && let Some(beatmap) = beatmap.as_mut()
                 && let Ok(audio_ptr) = client.memory.read_indirect_pointer(audio_addr)
@@ -255,6 +300,7 @@ impl TournamentSession {
                     && !beatmap_ref.checksum.is_empty()
                 {
                     self.current_checksum = beatmap_ref.checksum.clone();
+                    self.cached_stats_by_mods.clear();
                     if let Some(beatmap_mut) = beatmap.as_mut() {
                         crate::beatmap::populate_beatmap_file_metadata(beatmap_mut, &osu_path);
                         self.cached_metadata = Some(beatmap_mut.clone());
@@ -319,21 +365,28 @@ impl TournamentSession {
                         .any(|b| live >= b.start_time && live <= b.end_time);
                 }
             }
-            if client.ruleset_container_addr.is_none() {
-                client.ruleset_container_addr = crate::client::resolve_ruleset_container(
-                    &client.memory,
-                    &self.profile,
-                    self.scan_limit_bytes,
-                )
-                .ok();
-            }
-            if client.ipc_id.is_some() && client.spectating_user_pattern_addr.is_none() {
-                if let Ok((user_pat_src, user_pat_off)) = self.profile.pattern("spectating_user_ptr") {
-                    if let Ok(user_pat) = BytePattern::parse(user_pat_src) {
-                        if let Ok(matches) = client.memory.scan_pattern(&user_pat, None, 1, self.scan_limit_bytes) {
-                            if let Some(&first) = matches.first() {
-                                if let Ok(addr) = checked_add_signed(first, user_pat_off) {
-                                    client.spectating_user_pattern_addr = Some(addr);
+            let need_ruleset = client.ruleset_container_addr.is_none();
+            let need_user = client.ipc_id.is_some() && client.spectating_user_pattern_addr.is_none();
+            if (need_ruleset || need_user)
+                && client.last_pattern_retry.elapsed() >= std::time::Duration::from_millis(2000)
+            {
+                client.last_pattern_retry = Instant::now();
+                if need_ruleset {
+                    client.ruleset_container_addr = crate::client::resolve_ruleset_container(
+                        &client.memory,
+                        &self.profile,
+                        self.scan_limit_bytes,
+                    )
+                    .ok();
+                }
+                if need_user {
+                    if let Ok((user_pat_src, user_pat_off)) = self.profile.pattern("spectating_user_ptr") {
+                        if let Ok(user_pat) = BytePattern::parse(user_pat_src) {
+                            if let Ok(matches) = client.memory.scan_pattern(&user_pat, None, 1, self.scan_limit_bytes) {
+                                if let Some(&first) = matches.first() {
+                                    if let Ok(addr) = checked_add_signed(first, user_pat_off) {
+                                        client.spectating_user_pattern_addr = Some(addr);
+                                    }
                                 }
                             }
                         }
@@ -361,9 +414,16 @@ impl TournamentSession {
                     client.is_manager = true;
                     if self.enable_chat {
                         if let Some(chat_pat) = client.chat_engine_pattern_addr {
+                            let cached = if client.cached_chat_size > 0 {
+                                Some((client.cached_chat_size, client.cached_chat.as_slice()))
+                            } else {
+                                None
+                            };
                             if let Ok(chat) =
-                                read_tournament_chat(&client.memory, chat_pat, &spectator_teams)
+                                read_tournament_chat(&client.memory, chat_pat, &spectator_teams, cached)
                             {
+                                client.cached_chat_size = chat.len();
+                                client.cached_chat = chat.clone();
                                 tourney.chat = chat;
                             }
                         }
@@ -406,12 +466,25 @@ impl TournamentSession {
                     .cloned()
                     .unwrap_or_else(|| "right".to_string());
 
-                let user = match client.spectating_user_pattern_addr {
-                    Some(pat_addr) => match client.memory.read_indirect_pointer(pat_addr) {
-                        Ok(user_addr) => read_tournament_user(&client.memory, user_addr).ok(),
-                        Err(_) => None,
-                    },
-                    None => None,
+                let user = if let Some(user_pat) = client.spectating_user_pattern_addr {
+                    if let Ok(user_addr) = client.memory.read_indirect_pointer(user_pat) {
+                        if user_addr != 0 && user_addr == client.cached_user_ptr && client.cached_user.is_some() {
+                            client.cached_user.clone()
+                        } else if user_addr != 0 {
+                            client.cached_user_ptr = user_addr;
+                            let u = read_tournament_user(&client.memory, user_addr).ok();
+                            client.cached_user = u.clone();
+                            u
+                        } else {
+                            client.cached_user_ptr = 0;
+                            client.cached_user = None;
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
                 };
 
                 let mut gameplay = ruleset_addr.and_then(|ruleset| {
@@ -447,8 +520,17 @@ impl TournamentSession {
                         self.cached_beatmap.as_ref(),
                         gameplay.as_ref(),
                     ) {
-                        if g.mods != 0 {
-                            crate::beatmap::populate_beatmap_statistics(beatmap, map, g.mods);
+                        let diff_mods = g.mods & !(1 << 29); // Strip ScoreV2
+                        if diff_mods == 0 {
+                            beatmap.stats = self.cached_stats.clone();
+                        } else if let Some(stats) = self.cached_stats_by_mods.get(&diff_mods) {
+                            beatmap.stats = stats.clone();
+                        } else {
+                            let mut temp = self.cached_metadata.clone().unwrap_or_else(|| beatmap.clone());
+                            crate::beatmap::populate_beatmap_statistics(&mut temp, map, diff_mods);
+                            let stats = temp.stats;
+                            self.cached_stats_by_mods.insert(diff_mods, stats.clone());
+                            beatmap.stats = stats;
                         }
                     }
                 }
@@ -506,7 +588,24 @@ impl TournamentSession {
             b.stats.stars.live = 0.0;
         }
 
-        let focused = self.clients.values().any(|c| c.memory.is_foreground());
+        let focused = {
+            #[cfg(target_os = "windows")]
+            unsafe {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{
+                    GetForegroundWindow, GetWindowThreadProcessId,
+                };
+                let hwnd = GetForegroundWindow();
+                if !hwnd.is_null() {
+                    let mut fg_pid = 0u32;
+                    GetWindowThreadProcessId(hwnd, &mut fg_pid);
+                    self.clients.contains_key(&fg_pid)
+                } else {
+                    false
+                }
+            }
+            #[cfg(not(target_os = "windows"))]
+            self.clients.values().any(|c| c.memory.is_foreground())
+        };
 
         if game_folder.is_empty() {
             if let Some(client) = self
@@ -696,6 +795,13 @@ impl TournamentSession {
             cached_hit_errors: Arc::default(),
             cached_unstable_rate: 0.0,
             cached_gameplay: None,
+            cached_beatmap_ptr: 0,
+            cached_beatmap_snapshot: None,
+            cached_user_ptr: 0,
+            cached_user: None,
+            cached_chat_size: 0,
+            cached_chat: Vec::new(),
+            last_pattern_retry: Instant::now(),
         })
     }
 }

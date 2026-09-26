@@ -361,7 +361,8 @@ pub fn format_tourney_packet(snap: &TournamentSnapshot) -> TosuV2Packet {
                 total_pp: u.pp,
             })
             .unwrap_or_default();
-        let play = gameplay_to_play(client.gameplay.as_ref());
+        let mut play = gameplay_to_play(client.gameplay.as_ref());
+        play.hit_error_array = std::sync::Arc::default();
         let beatmap = TourneyClientBeatmap {
             stats: client
                 .beatmap

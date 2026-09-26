@@ -160,6 +160,7 @@ pub fn read_tournament_chat(
     memory: &ProcessMemory,
     chat_engine_pattern_addr: u64,
     spectator_teams: &HashMap<String, String>,
+    cached_chat: Option<(usize, &[TournamentChatMessage])>,
 ) -> Result<Vec<TournamentChatMessage>> {
     crate::instr_scope!(TournamentChat);
     if chat_engine_pattern_addr == 0 {
@@ -213,6 +214,12 @@ pub fn read_tournament_chat(
             Ok(size) if size >= 0 => size.min(500) as usize,
             _ => continue,
         };
+
+        if let Some((cached_size, cached_msgs)) = cached_chat {
+            if messages_size == cached_size && !cached_msgs.is_empty() {
+                return Ok(cached_msgs.to_vec());
+            }
+        }
 
         for m in 0..messages_size {
             let msg_slot = match checked_add(messages_items, (8 + 4 * m) as u64) {
