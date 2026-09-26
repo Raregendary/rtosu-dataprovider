@@ -106,7 +106,7 @@ pub struct PlayState {
     pub accuracy: f64,
     pub health_bar: HealthBarState,
     pub hits: HitsState,
-    pub hit_error_array: Vec<i16>,
+    pub hit_error_array: Arc<[i16]>,
     pub combo: ComboState,
     pub mods: ModsState,
     pub rank: RankState,
@@ -235,11 +235,79 @@ pub struct PerformanceGraph {
     pub xaxis: Vec<i32>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PrecomputedGraph {
+    pub raw: Arc<serde_json::value::RawValue>,
+}
+
+impl PrecomputedGraph {
+    pub fn new(graph: &PerformanceGraph) -> Self {
+        let json_str = serde_json::to_string(graph)
+            .unwrap_or_else(|_| "{\"series\":[],\"xaxis\":[]}".to_string());
+        let raw = serde_json::value::RawValue::from_string(json_str).unwrap_or_else(|_| {
+            serde_json::value::RawValue::from_string("{\"series\":[],\"xaxis\":[]}".to_string())
+                .unwrap()
+        });
+        Self {
+            raw: Arc::from(raw),
+        }
+    }
+
+    pub fn from_raw_json(json: String) -> Result<Self, serde_json::Error> {
+        let raw = serde_json::value::RawValue::from_string(json)?;
+        Ok(Self {
+            raw: Arc::from(raw),
+        })
+    }
+}
+
+impl Default for PrecomputedGraph {
+    fn default() -> Self {
+        static EMPTY: std::sync::OnceLock<Arc<serde_json::value::RawValue>> =
+            std::sync::OnceLock::new();
+        let raw = EMPTY.get_or_init(|| {
+            serde_json::value::RawValue::from_string("{\"series\":[],\"xaxis\":[]}".to_string())
+                .expect("valid json")
+                .into()
+        });
+        Self {
+            raw: Arc::clone(raw),
+        }
+    }
+}
+
+impl PartialEq for PrecomputedGraph {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.raw, &other.raw) || self.raw.get() == other.raw.get()
+    }
+}
+
+impl Serialize for PrecomputedGraph {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        self.raw.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for PrecomputedGraph {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw_box = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+        Ok(PrecomputedGraph {
+            raw: Arc::from(raw_box),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PerformanceState {
     pub accuracy: PerformanceAccuracy,
-    pub graph: Arc<PerformanceGraph>,
+    pub graph: PrecomputedGraph,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]

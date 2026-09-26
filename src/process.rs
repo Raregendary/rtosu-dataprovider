@@ -140,13 +140,12 @@ mod platform {
             }
         }
 
-        pub fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>> {
-            if length == 0 {
-                return Ok(Vec::new());
+        pub fn read_into(&self, address: u64, buffer: &mut [u8]) -> Result<()> {
+            if buffer.is_empty() {
+                return Ok(());
             }
             crate::instr_scope!(ReadBytes);
-            crate::instr_bytes!(length);
-            let mut bytes = vec![0u8; length];
+            crate::instr_bytes!(buffer.len());
             let mut bytes_read = 0usize;
             #[cfg_attr(not(feature = "instr"), allow(unused_variables))]
             let started = std::time::Instant::now();
@@ -154,41 +153,59 @@ mod platform {
                 ReadProcessMemory(
                     self.handle,
                     address as *const c_void,
-                    bytes.as_mut_ptr() as *mut c_void,
-                    length,
+                    buffer.as_mut_ptr() as *mut c_void,
+                    buffer.len(),
                     &mut bytes_read,
                 )
             };
             #[cfg(feature = "instr")]
             if started.elapsed().as_millis() > 50 {
                 eprintln!(
-                    "[instr-trace] slow read {length}B @ 0x{address:X} took {:?} ok={}",
+                    "[instr-trace] slow read {}B @ 0x{address:X} took {:?} ok={}",
+                    buffer.len(),
                     started.elapsed(),
                     result != 0
                 );
             }
             if result == 0 {
                 return Err(std::io::Error::last_os_error())
-                    .with_context(|| format!("reading {length} bytes at 0x{address:X}"));
+                    .with_context(|| format!("reading {} bytes at 0x{address:X}", buffer.len()));
             }
-            if bytes_read != length {
-                bail!("read {} of {length} bytes at 0x{address:X}", bytes_read);
+            if bytes_read != buffer.len() {
+                bail!(
+                    "read {} of {} bytes at 0x{address:X}",
+                    bytes_read,
+                    buffer.len()
+                );
             }
+            Ok(())
+        }
+
+        pub fn read_bytes(&self, address: u64, length: usize) -> Result<Vec<u8>> {
+            if length == 0 {
+                return Ok(Vec::new());
+            }
+            let mut bytes = vec![0u8; length];
+            self.read_into(address, &mut bytes)?;
             Ok(bytes)
         }
 
         pub fn read_u8(&self, address: u64) -> Result<u8> {
-            Ok(self.read_bytes(address, 1)?[0])
+            let mut buf = [0u8; 1];
+            self.read_into(address, &mut buf)?;
+            Ok(buf[0])
         }
 
         pub fn read_u32(&self, address: u64) -> Result<u32> {
-            let bytes = self.read_bytes(address, size_of::<u32>())?;
-            Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            let mut buf = [0u8; 4];
+            self.read_into(address, &mut buf)?;
+            Ok(u32::from_le_bytes(buf))
         }
 
         pub fn read_u16(&self, address: u64) -> Result<u16> {
-            let bytes = self.read_bytes(address, size_of::<u16>())?;
-            Ok(u16::from_le_bytes([bytes[0], bytes[1]]))
+            let mut buf = [0u8; 2];
+            self.read_into(address, &mut buf)?;
+            Ok(u16::from_le_bytes(buf))
         }
 
         pub fn read_i16(&self, address: u64) -> Result<i16> {
@@ -204,10 +221,9 @@ mod platform {
         }
 
         pub fn read_u64(&self, address: u64) -> Result<u64> {
-            let bytes = self.read_bytes(address, size_of::<u64>())?;
-            Ok(u64::from_le_bytes([
-                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
-            ]))
+            let mut buf = [0u8; 8];
+            self.read_into(address, &mut buf)?;
+            Ok(u64::from_le_bytes(buf))
         }
 
         pub fn read_pointer(&self, address: u64) -> Result<u64> {
@@ -701,6 +717,10 @@ mod platform {
 
         pub fn is_foreground(&self) -> bool {
             false
+        }
+
+        pub fn read_into(&self, _address: u64, _buffer: &mut [u8]) -> Result<()> {
+            bail!("process memory access is only implemented on Windows")
         }
 
         pub fn read_bytes(&self, _address: u64, _length: usize) -> Result<Vec<u8>> {

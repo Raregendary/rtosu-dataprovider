@@ -64,7 +64,7 @@ pub struct CachedClientState {
     pub cached_beatmap: Option<rosu_pp::Beatmap>,
     pub cached_metadata: Option<crate::beatmap::BeatmapSnapshot>,
     pub cached_total_hits: u32,
-    pub cached_hit_errors: Vec<i16>,
+    pub cached_hit_errors: Arc<[i16]>,
     pub cached_unstable_rate: f64,
 }
 
@@ -335,7 +335,7 @@ impl TournamentSession {
                 let mut gameplay = ruleset_addr.and_then(|ruleset| {
                     let cached = Some((
                         client.cached_total_hits,
-                        client.cached_hit_errors.as_slice(),
+                        &client.cached_hit_errors,
                         client.cached_unstable_rate,
                     ));
                     crate::client::read_gameplay_state_cached(&client.memory, ruleset, cached).ok()
@@ -345,14 +345,14 @@ impl TournamentSession {
                     client.cached_total_hits = total_hits;
                     client.cached_unstable_rate = g.unstable_rate;
                     if self.enable_hit_errors {
-                        client.cached_hit_errors = g.hit_error_array.clone();
+                        client.cached_hit_errors = Arc::clone(&g.hit_error_array);
                     } else {
-                        client.cached_hit_errors.clear();
-                        g.hit_error_array.clear();
+                        client.cached_hit_errors = Arc::default();
+                        g.hit_error_array = Arc::default();
                     }
                 } else {
                     client.cached_total_hits = 0;
-                    client.cached_hit_errors.clear();
+                    client.cached_hit_errors = Arc::default();
                     client.cached_unstable_rate = 0.0;
                 }
                 #[cfg(feature = "pp")]
@@ -599,7 +599,7 @@ impl TournamentSession {
             cached_beatmap: None,
             cached_metadata: None,
             cached_total_hits: 0,
-            cached_hit_errors: Vec::new(),
+            cached_hit_errors: Arc::default(),
             cached_unstable_rate: 0.0,
         })
     }
@@ -619,7 +619,7 @@ fn performance_graph(
     mods: u32,
     first_object: i32,
     mp3_length: i32,
-) -> Arc<crate::v2::PerformanceGraph> {
+) -> crate::v2::PrecomputedGraph {
     let count = (((mp3_length - first_object).max(0) as f64) / 400.0).ceil() as usize;
     let mods = crate::pp::calculator::parse_mods_bits(mods);
     let strains = rosu_pp::Difficulty::new().mods(mods).strains(map);
@@ -650,7 +650,7 @@ fn performance_graph(
         result.truncate(count);
         result
     };
-    Arc::new(crate::v2::PerformanceGraph {
+    let graph = crate::v2::PerformanceGraph {
         series: vec![
             crate::v2::GraphSeries {
                 name: "aim".to_string(),
@@ -676,7 +676,8 @@ fn performance_graph(
         xaxis: (0..count)
             .map(|index| first_object + index as i32 * 400)
             .collect(),
-    })
+    };
+    crate::v2::PrecomputedGraph::new(&graph)
 }
 
 fn read_skin_folder(memory: &ProcessMemory, pattern_addr: u64) -> Result<String> {
@@ -841,7 +842,7 @@ pub struct SoloSession {
     #[cfg(feature = "pp")]
     cached_accuracy: crate::v2::PerformanceAccuracy,
     #[cfg(feature = "pp")]
-    cached_graph: Arc<crate::v2::PerformanceGraph>,
+    cached_graph: crate::v2::PrecomputedGraph,
     #[cfg(feature = "pp")]
     cached_gameplay_hits: (u32, u32, u32, u32, u32, u32),
     #[cfg(feature = "pp")]
@@ -862,7 +863,7 @@ pub struct SoloSession {
     pub gradual_pp_chunks: usize,
     pub enable_hit_errors: bool,
     cached_hit_errors_total_hits: u32,
-    cached_hit_errors: Vec<i16>,
+    cached_hit_errors: Arc<[i16]>,
     cached_unstable_rate: f64,
 }
 
@@ -906,7 +907,7 @@ impl SoloSession {
             #[cfg(feature = "pp")]
             cached_accuracy: crate::v2::PerformanceAccuracy::default(),
             #[cfg(feature = "pp")]
-            cached_graph: Arc::new(crate::v2::PerformanceGraph::default()),
+            cached_graph: crate::v2::PrecomputedGraph::default(),
             #[cfg(feature = "pp")]
             cached_gameplay_hits: (0, 0, 0, 0, 0, 0),
             #[cfg(feature = "pp")]
@@ -930,7 +931,7 @@ impl SoloSession {
             gradual_pp_chunks: 100,
             enable_hit_errors: true,
             cached_hit_errors_total_hits: 0,
-            cached_hit_errors: Vec::new(),
+            cached_hit_errors: Arc::default(),
             cached_unstable_rate: 0.0,
         })
     }
@@ -1179,7 +1180,7 @@ impl SoloSession {
         // Read menu mods if in song select or menu
         if current_state_num != 2 && current_state_num != 7 {
             self.cached_hit_errors_total_hits = 0;
-            self.cached_hit_errors.clear();
+            self.cached_hit_errors = Arc::default();
             self.cached_unstable_rate = 0.0;
             if let Some(mods_addr) = self.menu_mods_pattern_addr {
                 if let Ok(mods_ptr) = memory.read_indirect_pointer(mods_addr) {
@@ -1385,7 +1386,7 @@ impl SoloSession {
             if let Some(ruleset_addr) = self.ruleset_container_addr {
                 let cached = Some((
                     self.cached_hit_errors_total_hits,
-                    self.cached_hit_errors.as_slice(),
+                    &self.cached_hit_errors,
                     self.cached_unstable_rate,
                 ));
                 if let Ok(mut g) =
@@ -1395,10 +1396,10 @@ impl SoloSession {
                     self.cached_hit_errors_total_hits = total_hits;
                     self.cached_unstable_rate = g.unstable_rate;
                     if self.enable_hit_errors {
-                        self.cached_hit_errors = g.hit_error_array.clone();
+                        self.cached_hit_errors = Arc::clone(&g.hit_error_array);
                     } else {
-                        self.cached_hit_errors.clear();
-                        g.hit_error_array.clear();
+                        self.cached_hit_errors = Arc::default();
+                        g.hit_error_array = Arc::default();
                     }
                     self.cached_packet.play.failed = g.player_hp <= 0.0;
                     self.cached_packet.play.player_name = g.player_name;
@@ -1551,13 +1552,13 @@ impl SoloSession {
                     let existing_hit_errors =
                         std::mem::take(&mut self.cached_packet.play.hit_error_array);
                     self.cached_packet.play.hit_error_array = if !self.enable_hit_errors {
-                        Vec::new()
+                        Arc::default()
                     } else if existing_hit_errors.is_empty() {
                         let hit_count =
                             (res.hit_300 + res.hit_100 + res.hit_50 + res.hit_miss).max(0) as usize;
                         let spinner_count =
                             self.cached_packet.beatmap.stats.objects.spinners.max(0) as usize;
-                        vec![0; hit_count.saturating_sub(spinner_count)]
+                        vec![0i16; hit_count.saturating_sub(spinner_count)].into()
                     } else {
                         existing_hit_errors
                     };

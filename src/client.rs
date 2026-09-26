@@ -6,6 +6,7 @@ use crate::tournament::{TournamentState, read_tournament_state};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -55,7 +56,7 @@ pub struct GameplayState {
     pub hit_geki: i16,
     pub hit_katu: i16,
     pub hit_miss: i16,
-    pub hit_error_array: Vec<i16>,
+    pub hit_error_array: Arc<[i16]>,
     pub slider_breaks: i32,
     pub mods: u32,
     pub mods_str: String,
@@ -900,7 +901,7 @@ pub fn read_gameplay_state(memory: &ProcessMemory, ruleset_address: u64) -> Resu
 pub fn read_gameplay_state_cached(
     memory: &ProcessMemory,
     ruleset_address: u64,
-    cached_hits: Option<(u32, &[i16], f64)>,
+    cached_hits: Option<(u32, &Arc<[i16]>, f64)>,
 ) -> Result<GameplayState> {
     crate::instr_scope!(GameplayState);
     let gameplay_base = memory
@@ -990,17 +991,21 @@ pub fn read_gameplay_state_cached(
     // Optimization: only read hit error list when hit count changed
     let total_hits = (hit_300 as u32) + (hit_100 as u32) + (hit_50 as u32) + (hit_miss as u32);
     let (hit_error_array, unstable_rate) = if total_hits == 0 {
-        (Vec::new(), 0.0)
+        (Arc::default(), 0.0)
     } else if let Some((last_hits, last_arr, last_ur)) = cached_hits {
         if last_hits == total_hits {
-            (last_arr.to_vec(), last_ur)
+            (Arc::clone(last_arr), last_ur)
         } else {
-            let arr = read_hit_errors(memory, score_base).unwrap_or_default();
+            let arr: Arc<[i16]> = read_hit_errors(memory, score_base)
+                .unwrap_or_default()
+                .into();
             let ur = calculate_unstable_rate(&arr, mods);
             (arr, ur)
         }
     } else {
-        let arr = read_hit_errors(memory, score_base).unwrap_or_default();
+        let arr: Arc<[i16]> = read_hit_errors(memory, score_base)
+            .unwrap_or_default()
+            .into();
         let ur = calculate_unstable_rate(&arr, mods);
         (arr, ur)
     };

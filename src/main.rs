@@ -733,8 +733,7 @@ async fn run_serve_loop(
         });
     }
 
-    let mut ticker = tokio::time::interval(interval);
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_published: Option<rtosu_dataprovider::server::PublishedPacket> = None;
 
     loop {
         tokio::select! {
@@ -743,12 +742,16 @@ async fn run_serve_loop(
                 println!("\nShutdown signal received. Exiting rtosu-dataprovider... Goodbye!");
                 break;
             }
-            _ = ticker.tick() => {
+            _ = tokio::time::sleep(interval) => {
                 if let Ok(packet) = reader.poll() {
-                    // Encode once per tick and share the result with every HTTP
-                    // and WebSocket consumer.
+                    if let Some(last) = &last_published {
+                        if *last.packet == packet {
+                            continue;
+                        }
+                    }
                     if let Some(published) = rtosu_dataprovider::server::PublishedPacket::new(packet) {
-                        let _ = tx.send(published);
+                        let _ = tx.send(published.clone());
+                        last_published = Some(published);
                     }
                 }
             }

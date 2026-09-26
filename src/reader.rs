@@ -178,8 +178,9 @@ impl OsuReader {
 
     pub fn poll(&mut self) -> Result<TosuV2Packet> {
         crate::instr_scope!(ReaderPoll);
+        let is_solo = matches!(self.builder.mode, OsuReaderMode::Solo);
         let should_check = self.cached_pids.is_empty()
-            || self.last_proc_check.elapsed() >= self.builder.proc_check_interval;
+            || (!is_solo && self.last_proc_check.elapsed() >= self.builder.proc_check_interval);
         if should_check {
             self.check_processes();
         }
@@ -206,6 +207,9 @@ impl OsuReader {
             Ok(packet)
         } else {
             let packet = self.solo_session.poll()?;
+            if packet.client == "none" {
+                self.cached_pids.clear();
+            }
             crate::instr_scope!(PacketClone);
             self.last_packet = packet.clone();
             Ok(packet)
@@ -406,7 +410,7 @@ pub fn gameplay_to_play(gameplay: Option<&GameplayState>) -> PlayState {
             slider_breaks: g.slider_breaks,
             ..Default::default()
         },
-        hit_error_array: g.hit_error_array.clone(),
+        hit_error_array: std::sync::Arc::clone(&g.hit_error_array),
         combo: ComboState {
             current: g.combo as i32,
             max: g.max_combo as i32,
