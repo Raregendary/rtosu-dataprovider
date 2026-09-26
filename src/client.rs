@@ -145,7 +145,7 @@ pub struct ModEntry {
     pub acronym: String,
 }
 
-pub fn format_mods(mods: u32) -> String {
+fn compute_format_mods(mods: u32) -> String {
     const VALUES: [(u32, &str, u8); 31] = [
         (1, "NF", 0),
         (2, "EZ", 1),
@@ -197,7 +197,39 @@ pub fn format_mods(mods: u32) -> String {
         .replace("ATCN", "CN")
 }
 
+pub fn format_mods(mods: u32) -> String {
+    static CACHE: std::sync::LazyLock<std::sync::RwLock<std::collections::HashMap<u32, String>>> =
+        std::sync::LazyLock::new(|| {
+            std::sync::RwLock::new(std::collections::HashMap::with_capacity(32))
+        });
+
+    if let Ok(guard) = CACHE.read() {
+        if let Some(s) = guard.get(&mods) {
+            return s.clone();
+        }
+    }
+
+    let result = compute_format_mods(mods);
+
+    if let Ok(mut guard) = CACHE.write() {
+        guard.insert(mods, result.clone());
+    }
+    result
+}
+
 pub fn mod_acronyms(mods: u32) -> Vec<ModEntry> {
+    static CACHE: std::sync::LazyLock<
+        std::sync::RwLock<std::collections::HashMap<u32, Vec<ModEntry>>>,
+    > = std::sync::LazyLock::new(|| {
+        std::sync::RwLock::new(std::collections::HashMap::with_capacity(32))
+    });
+
+    if let Ok(guard) = CACHE.read() {
+        if let Some(entries) = guard.get(&mods) {
+            return entries.clone();
+        }
+    }
+
     let s = format_mods(mods);
     let mut entries = Vec::new();
     let mut chars = s.chars().peekable();
@@ -205,6 +237,10 @@ pub fn mod_acronyms(mods: u32) -> Vec<ModEntry> {
         entries.push(ModEntry {
             acronym: format!("{a}{b}"),
         });
+    }
+
+    if let Ok(mut guard) = CACHE.write() {
+        guard.insert(mods, entries.clone());
     }
     entries
 }
@@ -699,32 +735,60 @@ pub fn parse_hit_errors(bytes: &[u8]) -> Vec<i16> {
     result
 }
 
-pub fn read_hit_errors(memory: &ProcessMemory, score_base: u64) -> Result<Vec<i16>> {
+thread_local! {
+    static HIT_ERROR_BYTE_BUFFER: std::cell::RefCell<Vec<u8>> =
+        std::cell::RefCell::new(Vec::with_capacity(80_000));
+    static HIT_ERROR_I16_BUFFER: std::cell::RefCell<Vec<i16>> =
+        std::cell::RefCell::new(Vec::with_capacity(20_000));
+}
+
+pub fn read_hit_errors_arc(memory: &ProcessMemory, score_base: u64) -> Result<Arc<[i16]>> {
     crate::instr_scope!(HitErrors);
     let list = memory
         .read_pointer(checked_add(score_base, 0x38)?)
         .context("reading hit error list")?;
     if list == 0 {
-        return Ok(Vec::new());
+        return Ok(Arc::default());
     }
     let items = memory
         .read_pointer(checked_add(list, 0x4)?)
         .context("reading hit error items")?;
     if items == 0 {
-        return Ok(Vec::new());
+        return Ok(Arc::default());
     }
     let size = memory
         .read_i32(checked_add(list, 0xc)?)
         .context("reading hit error count")?;
     if size <= 0 {
-        return Ok(Vec::new());
+        return Ok(Arc::default());
     }
     let (start, count) = hit_error_window(size as usize);
     let address = hit_error_items_address(items, start)?;
-    let bytes = memory
-        .read_bytes(address, count * 4)
-        .with_context(|| format!("reading {count} hit errors at 0x{address:X}"))?;
-    Ok(parse_hit_errors(&bytes))
+
+    HIT_ERROR_BYTE_BUFFER.with(|byte_cell| {
+        HIT_ERROR_I16_BUFFER.with(|i16_cell| {
+            let mut byte_buf = byte_cell.borrow_mut();
+            byte_buf.resize(count * 4, 0);
+            memory
+                .read_into(address, &mut byte_buf)
+                .with_context(|| format!("reading {count} hit errors at 0x{address:X}"))?;
+
+            let mut i16_buf = i16_cell.borrow_mut();
+            i16_buf.clear();
+            for chunk in byte_buf.chunks_exact(4) {
+                let value = i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                if !(-HIT_ERROR_BOUND..=HIT_ERROR_BOUND).contains(&value) {
+                    break;
+                }
+                i16_buf.push(value.clamp(i16::MIN as i32, i16::MAX as i32) as i16);
+            }
+            Ok(Arc::from(i16_buf.as_slice()))
+        })
+    })
+}
+
+pub fn read_hit_errors(memory: &ProcessMemory, score_base: u64) -> Result<Vec<i16>> {
+    read_hit_errors_arc(memory, score_base).map(|arc| arc.to_vec())
 }
 
 pub fn calculate_unstable_rate(hit_errors: &[i16], mods: u32) -> f64 {
@@ -996,16 +1060,12 @@ pub fn read_gameplay_state_cached(
         if last_hits == total_hits {
             (Arc::clone(last_arr), last_ur)
         } else {
-            let arr: Arc<[i16]> = read_hit_errors(memory, score_base)
-                .unwrap_or_default()
-                .into();
+            let arr = read_hit_errors_arc(memory, score_base).unwrap_or_default();
             let ur = calculate_unstable_rate(&arr, mods);
             (arr, ur)
         }
     } else {
-        let arr: Arc<[i16]> = read_hit_errors(memory, score_base)
-            .unwrap_or_default()
-            .into();
+        let arr = read_hit_errors_arc(memory, score_base).unwrap_or_default();
         let ur = calculate_unstable_rate(&arr, mods);
         (arr, ur)
     };

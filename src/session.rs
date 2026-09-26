@@ -1424,8 +1424,10 @@ impl SoloSession {
                     self.cached_packet.play.unstable_rate = g.unstable_rate;
                     self.cached_packet.play.rank.current = g.grade;
                     self.cached_packet.play.rank.max_this_play = g.grade_max;
-                    self.cached_packet.play.mods =
-                        crate::v2::create_mods_state(g.mods, &g.mods_str);
+                    if self.cached_packet.play.mods.number != g.mods {
+                        self.cached_packet.play.mods =
+                            crate::v2::create_mods_state(g.mods, &g.mods_str);
+                    }
 
                     #[cfg(feature = "pp")]
                     if self.enable_pp {
@@ -1502,8 +1504,10 @@ impl SoloSession {
                     self.cached_packet.play.unstable_rate = g.unstable_rate;
                     self.cached_packet.play.rank.current = g.grade;
                     self.cached_packet.play.rank.max_this_play = g.grade_max;
-                    self.cached_packet.play.mods =
-                        crate::v2::create_mods_state(g.mods, &g.mods_str);
+                    if self.cached_packet.play.mods.number != g.mods {
+                        self.cached_packet.play.mods =
+                            crate::v2::create_mods_state(g.mods, &g.mods_str);
+                    }
                 }
                 if let Ok(res) = crate::client::read_result_screen_state(memory, ruleset_addr) {
                     let mods_state = crate::v2::create_mods_state(res.mods, &res.mods_str);

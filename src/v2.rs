@@ -441,6 +441,19 @@ pub struct TosuV2Packet {
 
 pub fn create_mods_state(mods_num: u32, mods_str: &str) -> ModsState {
     crate::instr_scope!(ModsState);
+    static CACHE: std::sync::LazyLock<
+        std::sync::RwLock<std::collections::HashMap<(u32, String), ModsState>>,
+    > = std::sync::LazyLock::new(|| {
+        std::sync::RwLock::new(std::collections::HashMap::with_capacity(32))
+    });
+
+    let key = (mods_num, mods_str.to_string());
+    if let Ok(guard) = CACHE.read() {
+        if let Some(state) = guard.get(&key) {
+            return state.clone();
+        }
+    }
+
     let array = mod_acronyms(mods_num);
     let rate = if (mods_num & 64) != 0 || (mods_num & 512) != 0 {
         1.5
@@ -456,7 +469,7 @@ pub fn create_mods_state(mods_num: u32, mods_str: &str) -> ModsState {
     };
 
     let name = crate::client::format_mods(mods_num);
-    ModsState {
+    let state = ModsState {
         checksum,
         number: mods_num,
         name: if name.is_empty() && !mods_str.is_empty() {
@@ -466,7 +479,12 @@ pub fn create_mods_state(mods_num: u32, mods_str: &str) -> ModsState {
         },
         array,
         rate,
+    };
+
+    if let Ok(mut guard) = CACHE.write() {
+        guard.insert(key, state.clone());
     }
+    state
 }
 
 pub fn osu_state_name(state_num: i32) -> &'static str {

@@ -292,6 +292,15 @@ mod platform {
             let byte_length = length
                 .checked_mul(2)
                 .ok_or_else(|| anyhow!("UTF-16 length overflow"))?;
+            if length <= 256 {
+                let mut bytes = [0u8; 512];
+                self.read_into(address, &mut bytes[..byte_length])?;
+                let mut units = [0u16; 256];
+                for (i, chunk) in bytes[..byte_length].chunks_exact(2).enumerate() {
+                    units[i] = u16::from_le_bytes([chunk[0], chunk[1]]);
+                }
+                return Ok(String::from_utf16_lossy(&units[..length]));
+            }
             let bytes = self.read_bytes(address, byte_length)?;
             let units = bytes
                 .chunks_exact(2)
