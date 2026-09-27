@@ -499,14 +499,16 @@ pub fn snapshot_processes(
                     };
                     results
                         .lock()
-                        .expect("snapshot result lock poisoned")
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .push(result);
                 }
             });
         }
     });
 
-    let mut results = results.into_inner().expect("snapshot result lock poisoned");
+    let mut results = results
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // Sort by ipc_id if present, else by pid
     results.sort_by(|a, b| {
         let a_ipc = a.snapshot.as_ref().and_then(|s| s.ipc_id);

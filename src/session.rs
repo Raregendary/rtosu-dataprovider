@@ -281,8 +281,7 @@ impl TournamentSession {
                                 live_id,
                                 client.cached_beatmap_id,
                             );
-                        if reuse {
-                            let mut bm = client.cached_beatmap_snapshot.clone().unwrap();
+                        if reuse && let Some(mut bm) = client.cached_beatmap_snapshot.clone() {
                             bm.time.live = live_time;
                             Some(bm)
                         } else {
@@ -1361,6 +1360,13 @@ impl SoloSession {
         })
     }
 
+    /// Report that there is nothing to read, so a poll without a live process
+    /// does not keep serving the last known state.
+    fn mark_not_running(&mut self) {
+        self.cached_packet.client = "none".to_string();
+        self.cached_packet.state.name = "notRunning".to_string();
+    }
+
     pub fn poll(&mut self) -> Result<crate::v2::TosuV2Packet> {
         crate::instr_scope!(SoloPoll);
         // 1. Ensure we have a valid open process
@@ -1391,8 +1397,7 @@ impl SoloSession {
                     self.cached_idle_pp_key = None;
                     self.cached_mods = u32::MAX;
                 }
-                self.cached_packet.client = "none".to_string();
-                self.cached_packet.state.name = "notRunning".to_string();
+                self.mark_not_running();
                 return Ok(self.cached_packet.clone());
             }
         }
@@ -1402,8 +1407,7 @@ impl SoloSession {
             if procs.is_empty() {
                 self.pid = None;
                 self.memory = None;
-                self.cached_packet.client = "none".to_string();
-                self.cached_packet.state.name = "notRunning".to_string();
+                self.mark_not_running();
                 return Ok(self.cached_packet.clone());
             }
 
@@ -1439,7 +1443,14 @@ impl SoloSession {
             }
         }
 
-        let memory = self.memory.as_ref().unwrap();
+        // Every path above either returns or leaves `memory` populated, so this
+        // cannot be `None`. It is a let-else rather than an `unwrap` anyway: the
+        // release profile aborts on panic, and a silent `notRunning` packet is a
+        // far better failure than the process vanishing mid-match.
+        let Some(memory) = self.memory.as_ref() else {
+            self.mark_not_running();
+            return Ok(self.cached_packet.clone());
+        };
         let can_scan = self.last_scan_attempt.elapsed() >= std::time::Duration::from_millis(1000);
         let mut attempted_scan = false;
 

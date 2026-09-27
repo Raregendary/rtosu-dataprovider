@@ -593,10 +593,20 @@ async fn handle_ws_upgrade(
     ws.on_upgrade(move |socket| handle_ws_stream(socket, state.packet_rx))
 }
 
-fn ws_text(json: Bytes) -> Message {
-    Message::Text(
-        Utf8Bytes::try_from(json).expect("packet json is produced by serde_json as utf-8"),
-    )
+/// Wrap a serialized packet as a text frame, or `None` if it is not valid UTF-8.
+///
+/// This is on the WebSocket broadcast path, so a bad frame must cost one dropped
+/// packet rather than the process. The release profile sets `panic = "abort"`,
+/// so an `expect` here would take the server down with no unwinding and no
+/// backtrace, mid-match, for every connected client at once.
+fn ws_text(json: Bytes) -> Option<Message> {
+    match Utf8Bytes::try_from(json) {
+        Ok(text) => Some(Message::Text(text)),
+        Err(error) => {
+            tracing::error!("dropping websocket frame: serialized packet is not utf-8: {error}");
+            None
+        }
+    }
 }
 
 async fn handle_ws_stream(mut socket: WebSocket, mut packet_rx: watch::Receiver<PublishedPacket>) {
@@ -604,16 +614,26 @@ async fn handle_ws_stream(mut socket: WebSocket, mut packet_rx: watch::Receiver<
 
     // Send immediate initial state
     let initial_json = packet_rx.borrow_and_update().json.clone();
-    if !initial_json.is_empty() && socket.send(ws_text(initial_json)).await.is_err() {
-        tracing::debug!("WebSocket client disconnected during initial handshake");
-        return;
+    if !initial_json.is_empty() {
+        match ws_text(initial_json) {
+            Some(frame) => {
+                if socket.send(frame).await.is_err() {
+                    tracing::debug!("WebSocket client disconnected during initial handshake");
+                    return;
+                }
+            }
+            None => tracing::warn!("WebSocket client received no initial packet"),
+        }
     }
 
     // Stream updates on each tick. The payload was encoded once by the poll
     // loop, so this is a refcount bump and a write, not a re-serialization.
     while packet_rx.changed().await.is_ok() {
         let json_str = packet_rx.borrow_and_update().json.clone();
-        if socket.send(ws_text(json_str)).await.is_err() {
+        let Some(frame) = ws_text(json_str) else {
+            continue;
+        };
+        if socket.send(frame).await.is_err() {
             break;
         }
     }
@@ -702,6 +722,15 @@ mod tests {
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
     use tower::ServiceExt;
+
+    /// A frame that is not valid UTF-8 must cost one dropped packet, not the
+    /// process. `panic = "abort"` means an `expect` here would kill the server
+    /// mid-match for every connected client at once, with no unwinding.
+    #[test]
+    fn a_frame_that_is_not_utf8_is_dropped_instead_of_panicking() {
+        assert!(ws_text(Bytes::from_static(b"{\"a\":1}")).is_some());
+        assert!(ws_text(Bytes::from_static(&[0xff, 0xfe, 0x00])).is_none());
+    }
 
     #[tokio::test]
     async fn test_http_json_v2_endpoint() {

@@ -368,11 +368,9 @@ pub mod calculator {
         n0: u32,
     ) -> LivePpResult {
         crate::instr_scope!(PpLive);
-        if chunks.is_empty() {
+        let Some(last_attrs) = chunks.last() else {
             return LivePpResult::default();
-        }
-
-        let last_attrs = chunks.last().unwrap();
+        };
         let fc_perf = Performance::new(last_attrs.clone())
             .mods(mods)
             .accuracy(100.0)

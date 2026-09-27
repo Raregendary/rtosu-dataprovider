@@ -292,21 +292,31 @@ pub struct PerformanceGraph {
     pub xaxis: Vec<f64>,
 }
 
+/// The serialized form of an empty `PerformanceGraph`, used whenever a graph
+/// cannot be encoded. `RawValue` parses it, so this is also the fallback of last
+/// resort and must stay valid JSON.
+const EMPTY_GRAPH_JSON: &str = "{\"series\":[],\"xaxis\":[]}";
+
+/// A `PerformanceGraph` that is already serialized, so the hot path does not
+/// re-encode it on every poll.
 #[derive(Debug, Clone)]
 pub struct PrecomputedGraph {
     pub raw: Arc<serde_json::value::RawValue>,
 }
 
 impl PrecomputedGraph {
+    /// Both steps are fallible in principle and neither may panic. The graph is
+    /// rebuilt every poll, and under `panic = "abort"` a failure here would take
+    /// the whole process down mid-match rather than dropping one frame.
     pub fn new(graph: &PerformanceGraph) -> Self {
-        let json_str = serde_json::to_string(graph)
-            .unwrap_or_else(|_| "{\"series\":[],\"xaxis\":[]}".to_string());
-        let raw = serde_json::value::RawValue::from_string(json_str).unwrap_or_else(|_| {
-            serde_json::value::RawValue::from_string("{\"series\":[],\"xaxis\":[]}".to_string())
-                .unwrap()
-        });
-        Self {
-            raw: Arc::from(raw),
+        match serde_json::to_string(graph)
+            .ok()
+            .and_then(|json| serde_json::value::RawValue::from_string(json).ok())
+        {
+            Some(raw) => Self {
+                raw: Arc::from(raw),
+            },
+            None => Self::default(),
         }
     }
 
@@ -323,9 +333,10 @@ impl Default for PrecomputedGraph {
         static EMPTY: std::sync::OnceLock<Arc<serde_json::value::RawValue>> =
             std::sync::OnceLock::new();
         let raw = EMPTY.get_or_init(|| {
-            serde_json::value::RawValue::from_string("{\"series\":[],\"xaxis\":[]}".to_string())
-                .expect("valid json")
-                .into()
+            Arc::from(
+                serde_json::value::RawValue::from_string(EMPTY_GRAPH_JSON.to_string())
+                    .unwrap_or_default(),
+            )
         });
         Self {
             raw: Arc::clone(raw),
@@ -583,6 +594,34 @@ fn md5_hex(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The empty graph is the fallback of last resort, so it has to be valid
+    /// JSON on its own terms -- not merely valid because the thing it replaced
+    /// happened to parse.
+    #[test]
+    fn the_default_graph_is_valid_json() {
+        let raw = PrecomputedGraph::default().raw.get().to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("default graph parses");
+        assert_eq!(parsed["series"].as_array().map(Vec::len), Some(0));
+        assert_eq!(parsed["xaxis"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// A real graph still round-trips, so the fallback did not become the
+    /// normal path.
+    #[test]
+    fn a_real_graph_is_encoded_rather_than_replaced_by_the_fallback() {
+        let graph = PerformanceGraph {
+            series: vec![GraphSeries {
+                name: "strain".to_string(),
+                data: vec![1.5, 2.5],
+            }],
+            xaxis: vec![0.0, 16.0],
+        };
+        let raw = PrecomputedGraph::new(&graph).raw.get().to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&raw).expect("graph parses");
+        assert_eq!(parsed["series"].as_array().map(Vec::len), Some(1));
+        assert_eq!(parsed["xaxis"].as_array().map(Vec::len), Some(2));
+    }
 
     #[test]
     fn test_v2_packet_serialization() {
