@@ -12,6 +12,7 @@ pub mod reader;
 pub mod server;
 pub mod session;
 pub mod tournament;
+pub mod v1;
 pub mod v2;
 
 #[cfg(feature = "instr")]

@@ -91,6 +91,9 @@ pub fn create_router(
             .route("/json/v2", get(handle_json_v2))
             .route("/json/v2/precise", get(handle_json_v2))
             .route("/json", get(handle_json_v2))
+            // The gosumemory-compatible payload. tosu serves this at `/json`;
+            // `/json` is already the v2 route here, so v1 has its own path.
+            .route("/json/v1", get(handle_json_v1))
             .route("/health", get(handle_health))
             // tosu file endpoints that overlays use to display the current
             // beatmap background, so drop-in overlays render unchanged.
@@ -109,7 +112,10 @@ pub fn create_router(
     if enable_ws {
         router = router
             .route("/websocket/v2", get(handle_ws_upgrade))
-            .route("/websocket/v2/precise", get(handle_ws_upgrade));
+            .route("/websocket/v2/precise", get(handle_ws_upgrade))
+            // tosu's v1 socket, serving the same shape as `/json/v1`. The overlay
+            // shim passes `/ws` straight through to here.
+            .route("/ws", get(handle_ws_upgrade_v1));
     }
 
     if state.overlays.is_some() {
@@ -157,6 +163,92 @@ fn json_response(json: Bytes) -> Response {
 async fn handle_json_v2(State(state): State<AppState>) -> Response {
     let published = state.packet_rx.borrow().clone();
     json_response(published.json)
+}
+
+/// Serve the gosumemory-compatible payload.
+///
+/// tosu serves this shape at `/json`. rtosu's `/json` is the v2 route and stays
+/// that way, so v1 lives at `/json/v1` -- a v1 consumer pointed at `/json` still
+/// receives v2 and cannot read it. That is the deliberate cost of not breaking
+/// anything already reading v2 from that path.
+///
+/// The v1 payload is built per request rather than pre-encoded by the poll loop,
+/// because it includes the strain graph and pre-encoding it would add a
+/// serialisation to every tick for a route almost nothing calls. See
+/// `audit-1.0.5.md` `L-07`.
+async fn handle_json_v1(State(state): State<AppState>) -> Response {
+    let published = state.packet_rx.borrow();
+    let v1 = crate::v1::GosuCompatibleApi::from_v2(&published.packet);
+    match serde_json::to_vec(&v1) {
+        Ok(json) => json_response(Bytes::from(json)),
+        Err(error) => {
+            tracing::error!("failed to build the v1 payload: {error}");
+            server_error("failed to build the v1 payload")
+        }
+    }
+}
+
+fn server_error(message: &str) -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+        message.to_string(),
+    )
+        .into_response()
+}
+
+/// Upgrade handler for the v1 socket, the tosu-compatible `/ws`.
+async fn handle_ws_upgrade_v1(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    tracing::debug!("Incoming v1 WebSocket upgrade request");
+    ws.on_upgrade(move |socket| handle_ws_stream_v1(socket, state.packet_rx))
+}
+
+/// Stream the v1 payload on each change.
+///
+/// Unlike the v2 stream this re-encodes per client per tick, because the v1 body
+/// is not pre-computed. That is a deliberate trade: pre-encoding it would tax every
+/// tick on the reader's hot path for a legacy endpoint, and v1 clients are rare.
+/// A v1 consumer is paying roughly what it would have paid to re-encode for itself.
+async fn handle_ws_stream_v1(
+    mut socket: WebSocket,
+    mut packet_rx: watch::Receiver<PublishedPacket>,
+) {
+    tracing::debug!("v1 WebSocket client connected");
+
+    if let Some(frame) = v1_frame(&mut packet_rx)
+        && socket.send(frame).await.is_err()
+    {
+        tracing::debug!("v1 WebSocket client disconnected during initial handshake");
+        return;
+    }
+
+    while packet_rx.changed().await.is_ok() {
+        let Some(frame) = v1_frame(&mut packet_rx) else {
+            continue;
+        };
+        if socket.send(frame).await.is_err() {
+            break;
+        }
+    }
+
+    tracing::debug!("v1 WebSocket client disconnected");
+}
+
+/// Build, encode and wrap the v1 payload for the current published state.
+fn v1_frame(packet_rx: &mut watch::Receiver<PublishedPacket>) -> Option<Message> {
+    let published = packet_rx.borrow_and_update();
+    let v1 = crate::v1::GosuCompatibleApi::from_v2(&published.packet);
+    let json = match serde_json::to_vec(&v1) {
+        Ok(json) => json,
+        Err(error) => {
+            tracing::error!("failed to build the v1 payload: {error}");
+            return None;
+        }
+    };
+    ws_text(Bytes::from(json))
 }
 
 async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
