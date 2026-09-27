@@ -87,15 +87,62 @@ doing disk I/O.
 
 ## Items fixed against a corrected scope
 
-### FIX-007 — the poisoning mechanism cannot occur in the shipped binary
+### FIX-007 — the poisoning sites were real, and the first pass missed them
 
 `Cargo.toml:73` sets `panic = "abort"`, so in the release binary a panic aborts
 the process and a mutex is never left poisoned. The `.expect(...)` sites the
-audit named in `client.rs:182, 212, 335` are `?`-propagating `Result` returns
-rather than mutex locks, and the mutex sites that do exist are in `pp.rs` and
-`session.rs`. Those were changed to
-`unwrap_or_else(std::sync::PoisonError::into_inner)` anyway, since the dev and
-test profiles do unwind and the change is free.
+audit named in `client.rs` **are** mutex expects, at `client.rs:502` and
+`:509` inside `snapshot_processes`.
+
+An earlier commit in this branch (W9, `9e62408`) claimed those two were
+`?`-propagating `Result` returns rather than mutex locks, and so were not part
+of FIX-007. **That was wrong** — the claim was not verified before being
+accepted, and the two sites were skipped. `3102edc` applies the same
+`unwrap_or_else(PoisonError::into_inner)` already used at the `pp.rs` and
+`session.rs` sites, so all seven are now consistent.
+
+The `panic = "abort"` half of the finding still stands: poisoning cannot occur
+in the shipped binary, but the dev and test profiles do unwind, and the change
+is free.
+
+### Panic-capable sites in live code — audited and cleared
+
+`3102edc`. An audit of live code with test modules excluded (a string-aware
+scanner, since braces inside the `.osu` test fixtures defeat naive parsing)
+found exactly **8** `unwrap`/`expect`/`panic!` sites. All 8 were unreachable
+given their guards, so none could crash a match. They have all been made
+non-panicking anyway, so a future refactor cannot turn a silent assumption into
+a process kill. The scanner now reports **0**.
+
+Also checked, because an `unwrap` grep misses them:
+
+- **Integer divide-by-zero.** `overflow-checks` is off in release, so overflow
+  wraps silently, but integer division by zero panics regardless. The two
+  candidates, `pp.rs:402` and `pp.rs:440`, both guard `total_objects == 0`.
+- **Out-of-bounds indexing.** Every `chunks[chunk_idx]` is `.min(len - 1)`
+  bounded, and `session.rs` `pids[idx]` is length-checked.
+- **Off-char-boundary string slicing.** `overlays.rs` walks only offsets
+  returned by `find` over ASCII needles, and the `CommandLineTokens` added in
+  W5 only ever halts on an ASCII byte or `len`, both of which are boundaries.
+  (It does walk byte-by-byte *through* a multi-byte character after a
+  backslash, which is a parsing wrinkle rather than a crash.)
+- **Closed-enum indexing.** `instr.rs` indexes `NAMES[self as usize]` with
+  `Phase` variants `0..=28` and arrays sized `PHASE_COUNT`.
+
+Two limitations remain, and neither is fixable by making call sites
+non-panicking:
+
+1. **A crash still leaves no trace in the log file.** No panic hook is
+   installed anywhere, so the default handler writes to stderr and `abort()`s.
+   If the process is not attached to a visible console, a mid-match crash
+   produces no record in `logs/`.
+2. **Recovery is impossible by construction.** `catch_unwind` never runs under
+   `panic = "abort"`, and the abort applies to *every* thread — so a panic in
+   the `pp-chunk` worker takes down the whole server, not just its own task.
+
+Both were raised and the decision taken was to keep `panic = "abort"` and only
+remove the call-site panics. Recorded here so the choice is visible rather than
+implicit.
 
 ### FIX-004 — the object-counter desync claim is wrong
 
@@ -238,13 +285,14 @@ should be made once, deliberately, and then pinned by a test either way.
 
 ### Static gates
 
-- `cargo test` — 153 passed, 0 failed
-- `cargo test --no-default-features` — 138 passed, 0 failed
+- `cargo test` — 156 passed, 0 failed
+- `cargo test --no-default-features` — 141 passed, 0 failed
 - `cargo clippy --all-targets --all-features` — 86 findings before, 86 after
 - `cargo clippy --no-default-features --all-targets` — 68 findings before, 68 after
 - `cargo build --release` — clean
 - `cargo fmt --check` — only the pre-existing `benches/micro.rs:110`
 - `cargo doc --no-deps` — no warnings
+- Panic-capable sites in live code — 8 before `3102edc`, **0** after
 
 ### Live tosu parity, three-way
 
