@@ -362,46 +362,6 @@ pub fn mod_acronyms(mods: u32) -> Vec<ModEntry> {
     entries
 }
 
-pub fn calculate_grade(
-    hit_300: i16,
-    hit_100: i16,
-    hit_50: i16,
-    hit_miss: i16,
-    player_hp: f64,
-    has_hd_fl: bool,
-) -> String {
-    if player_hp <= 0.0 {
-        return "F".to_string();
-    }
-    let total = hit_300 as f64 + hit_100 as f64 + hit_50 as f64 + hit_miss as f64;
-    if total <= 0.0 {
-        return "SS".to_string();
-    }
-    let r300 = hit_300 as f64 / total;
-    let r50 = hit_50 as f64 / total;
-    if hit_300 as f64 == total {
-        if has_hd_fl {
-            "SSH".to_string()
-        } else {
-            "SS".to_string()
-        }
-    } else if r300 > 0.90 && r50 <= 0.01 && hit_miss == 0 {
-        if has_hd_fl {
-            "SH".to_string()
-        } else {
-            "S".to_string()
-        }
-    } else if (r300 > 0.80 && hit_miss == 0) || r300 > 0.90 {
-        "A".to_string()
-    } else if (r300 > 0.70 && hit_miss == 0) || r300 > 0.80 {
-        "B".to_string()
-    } else if r300 > 0.60 {
-        "C".to_string()
-    } else {
-        "D".to_string()
-    }
-}
-
 pub fn snapshot_process(
     pid: u32,
     profile_name: &str,
@@ -1311,9 +1271,9 @@ pub fn find_pattern(
 mod tests {
     use super::{
         CommandLineTokens, GameplayState, MAX_HIT_ERRORS, ProcessSnapshotResult,
-        calculate_accuracy, calculate_grade, calculate_unstable_rate, compute_format_mods,
-        format_mods, hit_error_items_address, hit_error_window, is_tournament_manager_cmd,
-        mod_bits, parse_hit_errors, parse_spectate_client_arg,
+        calculate_accuracy, calculate_unstable_rate, compute_format_mods, format_mods,
+        hit_error_items_address, hit_error_window, is_tournament_manager_cmd, mod_bits,
+        parse_hit_errors, parse_spectate_client_arg,
     };
 
     /// `List<int>._items` as it looks in the game's address space: the 8-byte
@@ -1492,13 +1452,6 @@ mod tests {
         assert!(!is_tournament_manager_cmd(
             "osu!.exe \"C:\\Songs\\-tourney\\map.osu\""
         ));
-    }
-
-    #[test]
-    fn test_grade() {
-        assert_eq!(calculate_grade(100, 0, 0, 0, 100.0, false), "SS");
-        assert_eq!(calculate_grade(100, 0, 0, 0, 100.0, true), "SSH");
-        assert_eq!(calculate_grade(100, 0, 0, 0, 0.0, false), "F");
     }
 
     #[test]

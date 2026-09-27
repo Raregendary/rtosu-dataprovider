@@ -50,8 +50,55 @@ pub mod calculator {
         IN_PROGRESS.get_or_init(|| Mutex::new(HashSet::new()))
     }
 
+    /// Holds a key in `in_progress` for as long as its chunks are being built.
+    ///
+    /// The key is what stops two threads computing the same chunks at once, so
+    /// it has to leave on every exit path: success, a failure to spawn the
+    /// worker, and a panic inside it. A manual insert/remove pair puts that
+    /// burden on every early return, and the spawn already forgot once -- a
+    /// failed spawn left the key behind and pinned that (map, mods) to the
+    /// synchronous fallback for the life of the process. Moving the guard into
+    /// the worker closure covers the success and panic paths, and a failed
+    /// spawn drops the closure, which drops the guard.
+    ///
+    /// The release profile sets `panic = "abort"`, so in the shipped binary a
+    /// panic takes the process down and this never runs. It still matters in
+    /// the dev and test profiles, which unwind.
+    struct InProgressGuard {
+        key: (u64, u32),
+    }
+
+    impl InProgressGuard {
+        /// Take the key, or `None` when another thread already holds it.
+        ///
+        /// The guard is only ever constructed once the key is actually held.
+        /// Building one unconditionally and discarding it would drop it here,
+        /// while this thread still holds the same non-reentrant mutex.
+        fn acquire(key: (u64, u32)) -> Option<Self> {
+            let mut in_progress = in_progress()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if in_progress.insert(key) {
+                Some(Self { key })
+            } else {
+                None
+            }
+        }
+    }
+
+    impl Drop for InProgressGuard {
+        fn drop(&mut self) {
+            in_progress()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.key);
+        }
+    }
+
     fn insert_chunks(key: (u64, u32), chunks: Arc<Vec<DifficultyAttributes>>) {
-        let mut cache = chunks_cache().lock().unwrap();
+        let mut cache = chunks_cache()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if cache.len() >= 100 && !cache.contains_key(&key) {
             if let Some(old_key) = cache.keys().next().copied() {
                 cache.remove(&old_key);
@@ -134,7 +181,9 @@ pub mod calculator {
 
         // 1. Check if already computed
         {
-            let cache = chunks_cache().lock().unwrap();
+            let cache = chunks_cache()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(chunks) = cache.get(&key) {
                 if chunk_count <= 1 || chunks.len() > 1 {
                     crate::instr_scope!(PpChunksCached);
@@ -162,26 +211,24 @@ pub mod calculator {
 
         // 4. For larger maps (marathons, long songs):
         // Avoid blocking the poll loop! Spawn background task to compute full gradual chunks.
-        let already_in_progress = {
-            let mut in_prog = in_progress().lock().unwrap();
-            !in_prog.insert(key)
-        };
-
-        if !already_in_progress {
+        if let Some(guard) = InProgressGuard::acquire(key) {
             let map_clone = rosu_map.clone();
-            std::thread::Builder::new()
+            // A failed spawn returns the closure in the error, which drops the
+            // guard and releases the key.
+            let _ = std::thread::Builder::new()
                 .name(format!("pp-chunk-{map_id}"))
                 .spawn(move || {
+                    let _guard = guard;
                     let chunks = compute_chunks(&map_clone, mods, chunk_count);
                     insert_chunks(key, chunks);
-                    in_progress().lock().unwrap().remove(&key);
-                })
-                .ok();
+                });
         }
 
         // Check if cache already has a fallback entry
         {
-            let cache = chunks_cache().lock().unwrap();
+            let cache = chunks_cache()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(chunks) = cache.get(&key) {
                 return chunks.clone();
             }
@@ -421,6 +468,42 @@ pub mod calculator {
             let chunks = vec![];
             let pp = calc_live_pp_from_chunks(&chunks, GameModsLegacy::default(), 0, 0, 0, 0, 0);
             assert_eq!(pp, 0.0);
+        }
+
+        /// The in-progress key has to leave on every exit path, or that
+        /// `(map, mods)` is pinned to the synchronous fallback for the life of
+        /// the process. The guard is what makes that automatic, and this pins
+        /// both halves of its contract: a second acquire is refused while the
+        /// first is held, and dropping it releases the key.
+        ///
+        /// The keys are unique per test because `in_progress` is a process-wide
+        /// static and the test harness runs tests in parallel.
+        #[test]
+        fn the_in_progress_guard_releases_its_key_on_drop() {
+            let key = (0xfeed_face_0000_0001, 4);
+            let held = InProgressGuard::acquire(key).expect("first acquire takes the key");
+            assert!(
+                InProgressGuard::acquire(key).is_none(),
+                "a second acquire must be refused while the key is held"
+            );
+            drop(held);
+            assert!(
+                InProgressGuard::acquire(key).is_some(),
+                "dropping the guard must release the key"
+            );
+        }
+
+        /// The original defect: a failed `spawn` dropped the closure but not the
+        /// key, because the key was removed by hand inside the closure that
+        /// never ran. Dropping the guard from a scope that never spawns models
+        /// that path without needing the spawn to actually fail.
+        #[test]
+        fn a_worker_that_never_starts_still_releases_the_key() {
+            let key = (0xfeed_face_0000_0002, 8);
+            {
+                let _guard = InProgressGuard::acquire(key).expect("acquire takes the key");
+            }
+            assert!(InProgressGuard::acquire(key).is_some());
         }
 
         #[test]

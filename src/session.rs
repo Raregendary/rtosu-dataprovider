@@ -182,7 +182,10 @@ impl TournamentSession {
                                 }
                                 let pid = pids[idx];
                                 match self.init_process(pid) {
-                                    Ok(state) => initialized.lock().unwrap().push((pid, state)),
+                                    Ok(state) => initialized
+                                        .lock()
+                                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                        .push((pid, state)),
                                     Err(e) => tracing::warn!("Process {pid} init error: {e}"),
                                 }
                             }
@@ -190,7 +193,10 @@ impl TournamentSession {
                     }
                 });
 
-                for (pid, state) in initialized.into_inner().unwrap() {
+                for (pid, state) in initialized
+                    .into_inner()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                {
                     self.clients.insert(pid, state);
                 }
             }
