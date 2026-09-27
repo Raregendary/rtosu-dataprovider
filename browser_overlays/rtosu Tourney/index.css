@@ -120,7 +120,8 @@ body {
   display: none;
 }
 
-/* Both sides read the same way down: name, score, stars. */
+/* Both sides read the same way down: name, score, stars. The right side is
+ * pushed to the right edge so the two scorelines face each other. */
 .side {
   display: flex;
   flex: 1 1 0;
@@ -130,15 +131,18 @@ body {
   padding: 7px 10px;
   border-radius: 8px;
   background: rgba(16, 19, 25, 0.72);
-  border-left: 3px solid transparent;
 }
 
 .side.left {
-  border-left-color: var(--left);
+  border-left: 3px solid var(--left);
+  align-items: flex-start;
+  text-align: left;
 }
 
 .side.right {
-  border-left-color: var(--right);
+  border-right: 3px solid var(--right);
+  align-items: flex-end;
+  text-align: right;
 }
 
 .side-name {

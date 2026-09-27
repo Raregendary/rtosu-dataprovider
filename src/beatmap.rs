@@ -184,19 +184,19 @@ pub fn read_live_time(memory: &ProcessMemory, play_time_addr: Option<u64>) -> i3
     }
 }
 
-/// Read only the beatmap checksum from an already resolved beatmap pointer.
+/// Read only the beatmap id from an already resolved beatmap pointer.
 ///
-/// Cheap enough to poll every tick, which is what lets a map change be detected
-/// when osu! keeps the same beatmap object and only swaps its contents.
-pub fn read_beatmap_checksum(
-    memory: &ProcessMemory,
-    beatmap_addr: u64,
-    pointer_width: usize,
-) -> String {
+/// A single integer at a fixed offset, so it can be polled every tick to detect
+/// a map change without allocating. The checksum would work too, but reading it
+/// means building a String sixty times a second for nothing.
+pub fn read_beatmap_id(memory: &ProcessMemory, beatmap_addr: u64) -> i32 {
     if beatmap_addr == 0 {
-        return String::new();
+        return 0;
     }
-    read_net_string(memory, beatmap_addr, 0x6C, pointer_width).unwrap_or_default()
+    let Ok(addr) = checked_add_signed(beatmap_addr, 0xC8) else {
+        return 0;
+    };
+    memory.read_i32(addr).unwrap_or(0)
 }
 
 /// Read beatmap details from an already resolved beatmap pointer address.

@@ -29,9 +29,8 @@
    * with a trailing H for the silver variant awarded when a vision-obscuring
    * mod is active. SS and SSH are accepted as aliases.
    *
-   * B stays purple and C blue, as in osu!, but the two are pushed apart in
-   * lightness and saturation because at 11px on a dark card they otherwise read
-   * as the same colour. */
+   * B is blue and C is purple, kept far apart in hue and lightness so the two
+   * are never confused at a glance. */
   var GRADE_COLORS = {
     X: '#ffe9a3',
     SS: '#ffe9a3',
@@ -40,8 +39,8 @@
     S: '#ffc44d',
     SH: '#c3cbd9',
     A: '#5cd6a0',
-    B: '#d38bff',
-    C: '#4aa8f0',
+    B: '#4aa8f0',
+    C: '#d38bff',
     D: '#9aa3b5',
     F: '#ff5f73'
   };

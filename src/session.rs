@@ -1235,6 +1235,9 @@ pub struct SoloSession {
     #[cfg(feature = "pp")]
     cached_stats: crate::beatmap::BeatmapStats,
     cached_beatmap_ptr: u64,
+    /// Difficulty id of the map behind `cached_beatmap`, so a map swap that
+    /// reuses the same beatmap object is still noticed.
+    cached_beatmap_id: i32,
     last_skin_read: Instant,
     last_profile_read: Instant,
     last_scan_attempt: Instant,
@@ -1302,6 +1305,7 @@ impl SoloSession {
             #[cfg(feature = "pp")]
             cached_stats: crate::beatmap::BeatmapStats::default(),
             cached_beatmap_ptr: 0,
+            cached_beatmap_id: 0,
             last_skin_read: Instant::now() - Duration::from_secs(10),
             last_profile_read: Instant::now() - Duration::from_secs(10),
             last_scan_attempt: Instant::now() - Duration::from_secs(10),
@@ -1583,30 +1587,29 @@ impl SoloSession {
         if let Some(base_addr) = self.base_pattern_addr {
             if let Ok(beatmap_addr) = crate::beatmap::read_beatmap_ptr(memory, base_addr) {
                 if beatmap_addr == 0 {
-                    if self.cached_beatmap_ptr != 0 {
-                        self.cached_beatmap_ptr = 0;
-                        self.cached_packet.beatmap = BeatmapSnapshot::default();
-                    }
+                    // osu! clears the beatmap pointer the moment a map ends, so
+                    // wiping the snapshot here would blank an overlay's header
+                    // between maps. The last map is kept until a different one
+                    // is actually selected; it goes away with the rest of the
+                    // packet when osu! itself does.
+                    self.cached_beatmap_ptr = 0;
+                    self.cached_beatmap_id = 0;
                 } else {
                     let beatmap_ptr_changed = beatmap_addr != self.cached_beatmap_ptr;
-                    // osu! can select a different map while keeping the same
-                    // beatmap object, so a stable pointer does not mean a stable
-                    // map. Comparing the checksum is a single string read, and it
-                    // is what stops a tournament overlay from being left showing
-                    // "no beatmap" after the map changes.
-                    let live_checksum = crate::beatmap::read_beatmap_checksum(
-                        memory,
-                        beatmap_addr,
-                        self.pointer_width,
-                    );
-                    let beatmap_changed = beatmap_ptr_changed
-                        || (!live_checksum.is_empty() && live_checksum != self.current_checksum);
+                    // A stable pointer does not mean a stable map: osu! can
+                    // select a different map while keeping the same beatmap
+                    // object. The id is one integer read at a fixed offset, so
+                    // polling it every tick costs a read and no allocation.
+                    let live_id = crate::beatmap::read_beatmap_id(memory, beatmap_addr);
+                    let beatmap_changed =
+                        beatmap_ptr_changed || (live_id > 0 && live_id != self.cached_beatmap_id);
                     let active_mods = self.cached_packet.play.mods.number;
                     #[cfg(feature = "pp")]
                     let mods_changed =
                         self.cached_mods != active_mods || self.cached_difficulty_attrs.is_none();
 
                     if beatmap_changed {
+                        self.cached_beatmap_id = live_id;
                         if beatmap_ptr_changed {
                             self.cached_beatmap_ptr = beatmap_addr;
                         }

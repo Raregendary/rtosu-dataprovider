@@ -128,8 +128,8 @@
     S: '#ffc44d',
     SH: '#c3cbd9',
     A: '#5cd6a0',
-    B: '#d38bff',
-    C: '#4aa8f0',
+    B: '#4aa8f0',
+    C: '#d38bff',
     D: '#9aa3b5',
     F: '#ff5f73'
   };
