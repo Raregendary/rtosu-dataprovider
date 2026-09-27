@@ -199,6 +199,17 @@ pub fn read_beatmap_id(memory: &ProcessMemory, beatmap_addr: u64) -> i32 {
     memory.read_i32(addr).unwrap_or(0)
 }
 
+/// Whether a cached beatmap snapshot must be re-read.
+///
+/// osu! stable reuses the same beatmap object when the map changes, so a stable
+/// pointer is not proof of a stable map. The id is a single integer at a fixed
+/// offset (see [`read_beatmap_id`]) and costs one read per tick. A `live_id` of
+/// zero or less means the id has not resolved yet, so only a pointer change
+/// counts: acting on an unresolved id would re-read a map that has not changed.
+pub fn beatmap_refresh_needed(ptr: u64, cached_ptr: u64, live_id: i32, cached_id: i32) -> bool {
+    ptr != cached_ptr || (live_id > 0 && live_id != cached_id)
+}
+
 /// Read beatmap details from an already resolved beatmap pointer address.
 pub fn read_beatmap_from_ptr(
     memory: &ProcessMemory,
@@ -776,5 +787,40 @@ mod tests {
             .iter()
             .any(|b| 10.0 >= b.start_time && 10.0 <= b.end_time);
         assert!(!is_break);
+    }
+
+    #[test]
+    fn refresh_needed_when_pointer_changed_with_same_id() {
+        assert!(beatmap_refresh_needed(0x2000, 0x1000, 7, 7));
+    }
+
+    #[test]
+    fn refresh_needed_when_reused_pointer_has_new_id() {
+        assert!(beatmap_refresh_needed(0x1000, 0x1000, 8, 7));
+    }
+
+    #[test]
+    fn refresh_needed_when_pointer_and_id_both_changed() {
+        assert!(beatmap_refresh_needed(0x2000, 0x1000, 8, 7));
+    }
+
+    #[test]
+    fn no_refresh_when_pointer_and_id_both_stable() {
+        assert!(!beatmap_refresh_needed(0x1000, 0x1000, 7, 7));
+    }
+
+    #[test]
+    fn no_refresh_while_id_is_unresolved() {
+        assert!(!beatmap_refresh_needed(0x1000, 0x1000, 0, 7));
+    }
+
+    #[test]
+    fn no_refresh_for_negative_live_id() {
+        assert!(!beatmap_refresh_needed(0x1000, 0x1000, -1, 7));
+    }
+
+    #[test]
+    fn refresh_needed_on_first_resolution() {
+        assert!(beatmap_refresh_needed(0x1000, 0x1000, 7, 0));
     }
 }

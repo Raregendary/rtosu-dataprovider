@@ -77,6 +77,9 @@ pub struct CachedClientState {
     pub cached_unstable_rate: f64,
     pub cached_gameplay: Option<GameplayState>,
     pub cached_beatmap_ptr: u64,
+    /// Difficulty id of the map behind `cached_beatmap_snapshot`, so a map swap
+    /// that reuses the same beatmap object is still noticed.
+    pub cached_beatmap_id: i32,
     pub cached_beatmap_snapshot: Option<BeatmapSnapshot>,
     pub cached_user_ptr: u64,
     pub cached_user: Option<TournamentUser>,
@@ -253,6 +256,7 @@ impl TournamentSession {
                 {
                     if beatmap_addr == 0 {
                         client.cached_beatmap_ptr = 0;
+                        client.cached_beatmap_id = 0;
                         client.cached_beatmap_snapshot = None;
                         None
                     } else {
@@ -260,9 +264,16 @@ impl TournamentSession {
                             &client.memory,
                             client.play_time_pattern_addr,
                         );
-                        if beatmap_addr == client.cached_beatmap_ptr
-                            && client.cached_beatmap_snapshot.is_some()
-                        {
+                        let live_id =
+                            crate::beatmap::read_beatmap_id(&client.memory, beatmap_addr);
+                        let reuse = client.cached_beatmap_snapshot.is_some()
+                            && !crate::beatmap::beatmap_refresh_needed(
+                                beatmap_addr,
+                                client.cached_beatmap_ptr,
+                                live_id,
+                                client.cached_beatmap_id,
+                            );
+                        if reuse {
                             let mut bm = client.cached_beatmap_snapshot.clone().unwrap();
                             bm.time.live = live_time;
                             Some(bm)
@@ -276,6 +287,11 @@ impl TournamentSession {
                                 self.pointer_width.unwrap_or(4),
                             ) {
                                 if bm.id > 0 || !bm.title.is_empty() {
+                                    // Caching the id only alongside a snapshot that
+                                    // carries an id or a title: a partial read with no
+                                    // id would pin the cache to 0 and the real map
+                                    // would never be picked up.
+                                    client.cached_beatmap_id = bm.id;
                                     client.cached_beatmap_snapshot = Some(bm.clone());
                                     Some(bm)
                                 } else {
@@ -933,6 +949,7 @@ impl TournamentSession {
             cached_unstable_rate: 0.0,
             cached_gameplay: None,
             cached_beatmap_ptr: 0,
+            cached_beatmap_id: 0,
             cached_beatmap_snapshot: None,
             cached_user_ptr: 0,
             cached_user: None,
@@ -1606,13 +1623,13 @@ impl SoloSession {
                     self.cached_beatmap_id = 0;
                 } else {
                     let beatmap_ptr_changed = beatmap_addr != self.cached_beatmap_ptr;
-                    // A stable pointer does not mean a stable map: osu! can
-                    // select a different map while keeping the same beatmap
-                    // object. The id is one integer read at a fixed offset, so
-                    // polling it every tick costs a read and no allocation.
                     let live_id = crate::beatmap::read_beatmap_id(memory, beatmap_addr);
-                    let beatmap_changed =
-                        beatmap_ptr_changed || (live_id > 0 && live_id != self.cached_beatmap_id);
+                    let beatmap_changed = crate::beatmap::beatmap_refresh_needed(
+                        beatmap_addr,
+                        self.cached_beatmap_ptr,
+                        live_id,
+                        self.cached_beatmap_id,
+                    );
                     let active_mods = self.cached_packet.play.mods.number;
                     #[cfg(feature = "pp")]
                     let mods_changed =
