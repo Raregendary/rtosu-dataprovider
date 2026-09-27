@@ -1,5 +1,6 @@
 /target
 /references/tosu
+/tosu-sourcecode
 __pycache__/
 Cargo.lock
 /scripts/
