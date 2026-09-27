@@ -46,7 +46,7 @@ body {
 
 .banner {
   display: flex;
-  flex: 0 0 60px;
+  flex: 0 0 68px;
   align-items: flex-end;
   justify-content: space-between;
   gap: 12px;
@@ -90,6 +90,15 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
   text-shadow: 0 1px 3px rgba(0, 0, 0, 0.7);
+}
+
+/* Difficulty name and mapper, under the title. */
+.sub {
+  font-size: 10px;
+  color: #aab2c4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .stars {
@@ -262,7 +271,9 @@ body {
   display: flex;
   flex: 0 0 auto;
   justify-content: space-between;
-  padding: 0 4px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px 0 11px;
 }
 
 .colheads[hidden] {
@@ -276,8 +287,25 @@ body {
   color: #6d7486;
 }
 
+/* Mirrors the row's stat cells exactly, gap included, so every heading sits
+ * over its own column and both sides are right-anchored. */
 .ch.tail {
-  color: #4d5568;
+  display: flex;
+  gap: 6px;
+}
+
+.ch-cell {
+  width: 48px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.ch-cell:nth-child(3) {
+  width: 56px;
+}
+
+.ch-cell:nth-child(4) {
+  width: 80px;
 }
 
 /* --- player board --- */
@@ -390,17 +418,19 @@ body.ffa .tag {
   width: 48px;
 }
 
+/* Wide enough for "124/2110" as well as a bare combo. */
 .cell.combo {
-  width: 48px;
+  width: 58px;
 }
 
+/* Wide enough for "433.9pp". */
 .cell.pp {
-  width: 54px;
+  width: 56px;
   color: #e7e9ee;
 }
 
 .cell.score {
-  width: 78px;
+  width: 80px;
   font-weight: 600;
 }
 

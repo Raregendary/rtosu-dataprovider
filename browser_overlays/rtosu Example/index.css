@@ -89,7 +89,24 @@ body {
   text-shadow: 0 1px 3px rgba(0, 0, 0, 0.7);
 }
 
+/* Difficulty and mapper share a line with the star rating. */
+.banner-foot {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  min-width: 0;
+}
+
+.sub {
+  font-size: 11px;
+  color: #aab2c4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .diff {
+  flex: 0 0 auto;
   font-size: 11px;
   font-weight: 600;
 }

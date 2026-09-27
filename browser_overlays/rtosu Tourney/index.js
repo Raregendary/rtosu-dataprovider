@@ -54,8 +54,8 @@
       banner: document.getElementById('banner'),
       artist: document.getElementById('artist'),
       title: document.getElementById('title'),
-      stars: document.getElementById('stars'),
-      teambar: document.getElementById('teambar'),
+      sub: document.getElementById('sub'),
+      stars: document.getElementById('stars'),      teambar: document.getElementById('teambar'),
       leftName: document.getElementById('leftName'),
       rightName: document.getElementById('rightName'),
       leftScore: document.getElementById('leftScore'),
@@ -159,11 +159,17 @@
   /* --- header --- */
 
   function applyBeatmap(beatmap) {
-    var title = beatmap.titleUnicode || beatmap.title || 'no beatmap';
-    if (beatmap.version) title += ' [' + beatmap.version + ']';
-
-    text(el.artist, beatmap.artistUnicode || beatmap.artist || 'unknown artist');
+    // Romanized title and artist, not the Unicode variants, which are the ones
+    // most viewers cannot read.
+    var title = beatmap.title || 'no beatmap';
+    text(el.artist, beatmap.artist || 'unknown artist');
     text(el.title, title);
+
+    // Difficulty and mapper under the title.
+    var bits = [];
+    if (beatmap.version) bits.push('[' + beatmap.version + ']');
+    if (beatmap.mapper) bits.push('by ' + beatmap.mapper);
+    text(el.sub, bits.length ? bits.join(' \u00b7 ') : '\u00a0');
 
     var stars = beatmap.stats && beatmap.stats.stars;
     text(el.stars, starLevel(stars) > 0 ? starLevel(stars).toFixed(2) + ' \u2605' : '\u00a0');
@@ -172,9 +178,7 @@
     // Only ask for art when the map is actually identified. A tournament client
     // often selects a map it has not downloaded, in which case the title is
     // empty and a background request is a guaranteed miss.
-    var known = Boolean(
-      beatmap.title || beatmap.artist || beatmap.titleUnicode || beatmap.artistUnicode
-    );
+    var known = Boolean(beatmap.title || beatmap.artist);
     if (!el.banner) return;
     if (!known || !beatmap.set) {
       el.banner.dataset.set = '';
@@ -193,7 +197,13 @@
   /* Best performing first. Score decides; accuracy then name break ties so the
    * order never jitters between equal scores. */
   function nameOf(client) {
-    return (client.user && client.user.name) || 'unknown';
+    return (client.user && client.user.name) || '';
+  }
+
+  /* A slot with nobody logged in is not a player, so it is hidden rather than
+   * shown as a nameless row. */
+  function isAnonymous(client) {
+    return nameOf(client) === '';
   }
 
   function byScore(a, b) {
@@ -204,6 +214,15 @@
     var ab = Number((b.play && b.play.accuracy) || 0);
     if (ab !== aa) return ab - aa;
     return nameOf(a).localeCompare(nameOf(b));
+  }
+
+  /* Combo collapses to one number once the run reaches its own maximum, the
+   * same rule the solo overlay uses. */
+  function comboText(combo) {
+    var current = Math.round(Number(combo.current) || 0);
+    var max = Math.round(Number(combo.max) || 0);
+    if (current === max) return int(current) + 'x';
+    return int(current) + '/' + int(max);
   }
 
   function isIdle(client) {
@@ -233,8 +252,8 @@
 
     var cells =
       '<span class="cell acc">' + (judged > 0 ? num(play.accuracy, 1) + '%' : '\u2014') + '</span>' +
-      '<span class="cell combo">' + (judged > 0 ? int(combo.current) + 'x' : '\u2014') + '</span>' +
-      '<span class="cell pp">' + (judged > 0 ? num(pp.current, 2) : '\u2014') + '</span>' +
+      '<span class="cell combo">' + (judged > 0 ? comboText(combo) : '\u2014') + '</span>' +
+      '<span class="cell pp">' + (judged > 0 ? num(pp.current, 1) + 'pp' : '\u2014') + '</span>' +
       '<span class="cell score">' + int(play.score) + '</span>';
 
     return (
@@ -249,7 +268,11 @@
   }
 
   function applyBoard(tourney) {
-    var clients = (tourney && tourney.clients) || [];
+    // Anonymous slots are dropped before ranking, so positions only count real
+    // players.
+    var clients = ((tourney && tourney.clients) || []).filter(function (client) {
+      return !isAnonymous(client);
+    });
 
     if (clients.length === 0) {
       el.colAll.innerHTML =
@@ -329,8 +352,7 @@
       if (isIdle(client)) return;
       if (!best || byScore(client, best) < 0) best = client;
     });
-    text(el.leadName, best ? nameOf(best) : '\u2014');
-    text(el.playerCount, clients.length);
+    text(el.leadName, best ? nameOf(best) : '\u2014');    text(el.playerCount, clients.length);
     var topPp = 0;
     clients.forEach(function (client) {
       var pp = (client.play && client.play.pp && client.play.pp.current) || 0;
@@ -342,7 +364,9 @@
   function render(data) {
     applyBeatmap(data.beatmap || {});
     var tourney = data.tourney || {};
-    var clients = tourney.clients || [];
+    var clients = (tourney.clients || []).filter(function (client) {
+      return !isAnonymous(client);
+    });
     var hasClients = clients.length > 0;
 
     if (mode === 'ffa') {

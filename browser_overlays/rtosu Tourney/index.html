@@ -13,6 +13,7 @@
     <div class="banner-text">
       <div class="artist" id="artist">waiting for a tournament&hellip;</div>
       <div class="title" id="title">no beatmap</div>
+      <div class="sub" id="sub">&nbsp;</div>
     </div>
     <div class="stars" id="stars">&nbsp;</div>
   </header>
@@ -51,10 +52,15 @@
     </div>
   </section>
 
-  <!-- Column headings. -->
+  <!-- Column headings, one per stat column so they sit over their numbers. -->
   <div class="colheads" id="colheads">
     <span class="ch">rank &middot; player</span>
-    <span class="ch tail">acc &middot; combo &middot; pp &middot; score</span>
+    <span class="ch tail">
+      <span class="ch-cell">acc</span>
+      <span class="ch-cell">combo</span>
+      <span class="ch-cell">pp</span>
+      <span class="ch-cell">score</span>
+    </span>
   </div>
 
   <!-- One column: both teams stacked, branded by team colour. -->

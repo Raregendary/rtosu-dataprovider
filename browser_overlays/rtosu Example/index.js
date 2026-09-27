@@ -33,6 +33,7 @@
       banner: document.getElementById('banner'),
       artist: document.getElementById('artist'),
       title: document.getElementById('title'),
+      sub: document.getElementById('sub'),
       diff: document.getElementById('diff'),
       pp: document.getElementById('pp'),
       ppfc: document.getElementById('ppfc'),
@@ -88,18 +89,25 @@
   }
 
   function applyBeatmap(beatmap) {
-    var title = beatmap.titleUnicode || beatmap.title || 'no beatmap';
-    if (beatmap.version) title += ' [' + beatmap.version + ']';
+    // Romanized title and artist, not the Unicode variants, which are the ones
+    // most viewers cannot read.
+    text(el.artist, beatmap.artist || 'unknown artist');
+    text(el.title, beatmap.title || 'no beatmap');
 
-    text(el.artist, beatmap.artistUnicode || beatmap.artist || 'unknown artist');
-    text(el.title, title);
+    // Difficulty and mapper under the title.
+    var bits = [];
+    if (beatmap.version) bits.push('[' + beatmap.version + ']');
+    if (beatmap.mapper) bits.push('by ' + beatmap.mapper);
+    text(el.sub, bits.length ? bits.join(' \u00b7 ') : '\u00a0');
+
     text(el.diff, starText(beatmap.stats && beatmap.stats.stars));
     if (el.diff) el.diff.style.color = starColor(beatmap.stats && beatmap.stats.stars);
 
     // The art is stretched across the header as a cover banner. Only refetch on
     // a map change. The shim rewrites the tosu path to
     // /files/beatmap/background, which serves the loaded map's image from disk.
-    if (el.banner && beatmap.set && el.banner.dataset.set !== String(beatmap.set)) {
+    var known = Boolean(beatmap.title || beatmap.artist);
+    if (el.banner && beatmap.set && known && el.banner.dataset.set !== String(beatmap.set)) {
       el.banner.dataset.set = String(beatmap.set);
       el.banner.style.backgroundImage =
         'url("' + providerUrl('/backgroundImage?mapset=' + beatmap.set + '&t=' + Date.now()) + '")';
