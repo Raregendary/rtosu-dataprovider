@@ -15,6 +15,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// How many consecutive ticks a map is re-read for while its title is still
+/// unreadable, before the reader accepts the partial result. At the default
+/// 60 Hz that is about half a second of retrying, which covers osu! assembling
+/// a beatmap, without costing a full memory read every tick indefinitely.
+const BEATMAP_RESOLVE_RETRIES: u32 = 30;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct TournamentClientView {
     pub pid: u32,
@@ -1238,6 +1244,9 @@ pub struct SoloSession {
     /// Difficulty id of the map behind `cached_beatmap`, so a map swap that
     /// reuses the same beatmap object is still noticed.
     cached_beatmap_id: i32,
+    /// Consecutive ticks the current map has read back without a title, before
+    /// giving up and settling for whatever did come through.
+    cached_beatmap_retry: u32,
     last_skin_read: Instant,
     last_profile_read: Instant,
     last_scan_attempt: Instant,
@@ -1306,6 +1315,7 @@ impl SoloSession {
             cached_stats: crate::beatmap::BeatmapStats::default(),
             cached_beatmap_ptr: 0,
             cached_beatmap_id: 0,
+            cached_beatmap_retry: 0,
             last_skin_read: Instant::now() - Duration::from_secs(10),
             last_profile_read: Instant::now() - Duration::from_secs(10),
             last_scan_attempt: Instant::now() - Duration::from_secs(10),
@@ -1609,7 +1619,6 @@ impl SoloSession {
                         self.cached_mods != active_mods || self.cached_difficulty_attrs.is_none();
 
                     if beatmap_changed {
-                        self.cached_beatmap_id = live_id;
                         if beatmap_ptr_changed {
                             self.cached_beatmap_ptr = beatmap_addr;
                         }
@@ -1629,9 +1638,35 @@ impl SoloSession {
                                     bm.time.mp3_length = audio_length as i32;
                                 }
 
+                                // Title, folder and filename are memory reads and
+                                // can all come back empty while osu! is still
+                                // assembling the beatmap. Treating that first
+                                // partial read as final left overlays showing no
+                                // beatmap for the rest of the map, because both
+                                // the checksum and the id were cached on a result
+                                // that had nothing in it. Retry instead, with a
+                                // bound so a map that never resolves costs a few
+                                // reads rather than one full read per tick
+                                // forever.
+                                let resolved = !bm.title.is_empty();
+                                if resolved {
+                                    self.cached_beatmap_retry = 0;
+                                    self.cached_beatmap_id = live_id;
+                                } else {
+                                    self.cached_beatmap_retry += 1;
+                                    // Leave the id uncached so the next tick tries
+                                    // again, up to the retry limit.
+                                    self.cached_beatmap_id =
+                                        if self.cached_beatmap_retry < BEATMAP_RESOLVE_RETRIES {
+                                            0
+                                        } else {
+                                            live_id
+                                        };
+                                }
+
                                 let checksum_changed =
                                     bm.checksum != self.current_checksum && !bm.checksum.is_empty();
-                                if checksum_changed {
+                                if resolved && checksum_changed {
                                     self.current_checksum = bm.checksum.clone();
                                     // `self.memory` is borrowed for this whole
                                     // function, so write the disjoint fields in
@@ -1667,7 +1702,7 @@ impl SoloSession {
                                         self.cached_difficulty_attrs = None;
                                         self.cached_mods = u32::MAX;
                                     }
-                                } else if !self.current_checksum.is_empty() {
+                                } else if resolved && !self.current_checksum.is_empty() {
                                     // Restore cached file metadata without reading disk!
                                     bm.source = self.cached_beatmap_metadata.source.clone();
                                     bm.tags = self.cached_beatmap_metadata.tags.clone();
