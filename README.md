@@ -131,7 +131,7 @@ enable_overlays = true    # Serve overlays from overlays_dir (needs enable_http)
 overlays_dir = "browser_overlays"  # One subfolder per overlay, each with index.html
 
 [poll]
-poll_rate_hz = 60         # 60 Hz = ~16.6ms update interval (1-1000 Hz)
+poll_rate_hz = 60         # 60 Hz = ~16.6ms update interval (1-120 Hz)
 scan_budget_mb = 128      # Memory signature scan limit (16-1024 MB)
 default_profile = "tournament"
 auto_mode = true          # Auto-detect tournament vs single-player mode

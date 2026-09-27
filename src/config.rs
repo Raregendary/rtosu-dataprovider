@@ -5,6 +5,13 @@ use std::path::Path;
 
 pub const DEFAULT_CONFIG_FILE: &str = "config.toml";
 
+/// The highest `poll.poll_rate_hz` a config may ask for.
+///
+/// 120 Hz, not a round number by accident: it is the fastest osu! stable
+/// itself updates, so anything above it re-reads the same memory for every real
+/// change. See [`PollConfig::poll_rate_hz`].
+pub const MAX_POLL_RATE_HZ: u32 = 120;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
@@ -53,7 +60,15 @@ pub struct ServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PollConfig {
-    /// Polling frequency in Hertz / frames per second (default: 60 Hz, min: 1 Hz, max: 1000 Hz)
+    /// Polling frequency in Hertz / frames per second (default: 60 Hz, min: 1 Hz, max: 120 Hz)
+    ///
+    /// 120 Hz is the ceiling because it is the fastest the game itself updates:
+    /// osu! stable renders on the display's refresh, and no consumer of this
+    /// payload can observe a change that the game has not made yet. Above 120 Hz
+    /// the poll reads the same memory twice for every real update, so the extra
+    /// frequency buys no fresher data and costs a proportional share of a core
+    /// in `ReadProcessMemory` syscalls.
+    ///
     /// 60 Hz = ~16.6 ms interval; 120 Hz = ~8.3 ms interval
     pub poll_rate_hz: u32,
     /// Memory signature scanning budget in Megabytes (default: 128 MB, min: 16 MB, max: 1024 MB)
@@ -185,9 +200,9 @@ impl AppConfig {
                 anyhow::bail!("server.overlays_dir must not be empty when overlays are enabled");
             }
         }
-        if self.poll.poll_rate_hz == 0 || self.poll.poll_rate_hz > 1000 {
+        if self.poll.poll_rate_hz == 0 || self.poll.poll_rate_hz > MAX_POLL_RATE_HZ {
             anyhow::bail!(
-                "poll.poll_rate_hz must be between 1 and 1000 Hz (got {})",
+                "poll.poll_rate_hz must be between 1 and {MAX_POLL_RATE_HZ} Hz (got {})",
                 self.poll.poll_rate_hz
             );
         }
@@ -287,7 +302,7 @@ overlays_dir = "browser_overlays"
 # 60 Hz = ~16.6 ms per update
 # 120 Hz = ~8.3 ms per update
 # Default: 60
-# Range: 1 to 1000 Hz
+# Range: 1 to 120 Hz
 poll_rate_hz = 60
 
 # Maximum memory scan search budget in Megabytes per osu! process.
@@ -350,5 +365,43 @@ log_to_file = true
 # Range: 1 to 365
 max_log_files = 7
 "#
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AppConfig, MAX_POLL_RATE_HZ};
+
+    /// The poll rate is capped at 120 Hz, and both edges of the range are
+    /// accepted while either side of them is rejected.
+    ///
+    /// The cap used to be 1000 Hz. osu! stable renders on the display's refresh,
+    /// so a poll above 120 Hz re-reads memory that has not changed since the
+    /// previous poll and pays for the syscall; the ceiling is there to keep a
+    /// typo in a config file from spending a core on it.
+    #[test]
+    fn the_poll_rate_is_capped_at_the_games_own_refresh_rate() {
+        assert_eq!(MAX_POLL_RATE_HZ, 120, "osu!stable's own ceiling");
+
+        for hz in [1, 60, 120] {
+            let mut config = AppConfig::default();
+            config.poll.poll_rate_hz = hz;
+            config
+                .validate()
+                .unwrap_or_else(|error| panic!("{hz} Hz should be accepted: {error}"));
+            assert_eq!(config.poll_interval_ms(), 1000 / hz as u64, "{hz} Hz");
+        }
+
+        for hz in [0, 121, 1000] {
+            let mut config = AppConfig::default();
+            config.poll.poll_rate_hz = hz;
+            let error = config
+                .validate()
+                .expect_err(&format!("{hz} Hz should be rejected"));
+            assert!(
+                error.to_string().contains("1 and 120 Hz"),
+                "the message should name the range, got: {error}"
+            );
+        }
     }
 }

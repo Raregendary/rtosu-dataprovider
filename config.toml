@@ -47,7 +47,7 @@ overlays_dir = "browser_overlays"
 # 60 Hz = ~16.6 ms per update
 # 120 Hz = ~8.3 ms per update
 # Default: 60
-# Range: 1 to 1000 Hz
+# Range: 1 to 120 Hz
 poll_rate_hz = 60
 
 # Maximum memory scan search budget in Megabytes per osu! process.
