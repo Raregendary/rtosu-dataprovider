@@ -761,6 +761,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "pp")]
     fn test_ar_od_conversion() {
         // HT: 0.75 clock rate
         let ar_ht = round_value(calculate_converted_ar(10.0, 256, 0.75), 2);

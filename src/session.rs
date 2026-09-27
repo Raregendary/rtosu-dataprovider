@@ -1659,6 +1659,7 @@ impl SoloSession {
                         live_id,
                         self.cached_beatmap_id,
                     );
+                    #[cfg(feature = "pp")]
                     let active_mods = self.cached_packet.play.mods.number;
                     #[cfg(feature = "pp")]
                     let mods_changed =
@@ -1718,14 +1719,17 @@ impl SoloSession {
                                     // function, so write the disjoint fields in
                                     // place rather than through a `&mut self` method.
                                     clear_play_state_for_new_map(&mut self.cached_packet);
-                                    self.cached_gameplay_hits = (0, 0, 0, 0, 0, 0);
-                                    self.cached_results_hits = (0, 0, 0, 0, 0, 0);
                                     self.cached_hit_errors = Arc::default();
                                     self.cached_hit_errors_total_hits = 0;
                                     self.cached_unstable_rate = 0.0;
-                                    self.cached_live_pp = None;
-                                    self.cached_results_pp = None;
-                                    self.cached_idle_pp_key = None;
+                                    #[cfg(feature = "pp")]
+                                    {
+                                        self.cached_gameplay_hits = (0, 0, 0, 0, 0, 0);
+                                        self.cached_results_hits = (0, 0, 0, 0, 0, 0);
+                                        self.cached_live_pp = None;
+                                        self.cached_results_pp = None;
+                                        self.cached_idle_pp_key = None;
+                                    }
                                     let osu_path = std::path::Path::new(&self.songs_folder)
                                         .join(&bm.folder)
                                         .join(&bm.filename);
@@ -2068,6 +2072,7 @@ impl SoloSession {
                     self.cached_packet.play.rank.max_this_play = res.grade.clone();
                     self.cached_packet.play.mods = mods_state.clone();
                     self.play_state_dirty = true;
+                    #[cfg(feature = "pp")]
                     if self.cached_mods != res.mods {
                         if let Some(map) = &self.cached_beatmap {
                             self.cached_mods = res.mods;
