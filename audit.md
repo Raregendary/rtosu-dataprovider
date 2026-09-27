@@ -175,41 +175,68 @@ small reads instead of a 500-slot walk. See the follow-up on `+0xC` below.
 
 ## Follow-ups found but not fixed
 
-1. **`play.rank` in song select.** tosu recomputes the grade in
-   `GameplayState.init`. For a stable client with zero hits,
-   `utils/calculators.ts:145-150` returns `'X'` (`'XH'` only if the *cleared*
-   gameplay mods were silver, which they never are). We emit `""`. The audit
-   never raised this, and the map-change path has the same divergence, so fixing
-   only the exit path would recreate the drift FIX-023 was about. One line, in
-   `clear_play_state_for_new_map`, once both paths are decided together.
-2. **`overlays::resolve_within` double-decodes.** It percent-decodes a path Axum
+1. **`play.rank` in song select — confirmed to already match.** A previous
+   revision of this file claimed tosu emits `'X'` here (from
+   `utils/calculators.ts:145-150`) while we emit `""`. Live verification against
+   a running tosu shows **both report `""`**, so there is no divergence. The
+   reason is the same `!isDefaultState` latch as FIX-026: `gameplay.init()` only
+   runs when leaving gameplay, so a client that was never in a map keeps the
+   initialised `""`. No action needed; the earlier claim was wrong.
+2. **`play.pp.fc` and `play.pp.maxAchievable` in song select — real, pre-existing
+   divergence.** tosu reports **0** for `play.pp.fc`, `play.pp.maxAchievable` and
+   all four `play.pp.detailed.fc.*` values; rtosu reports the highlighted map's
+   FC PP (308.0 in the observed case). Identical on `main`, so this branch did
+   not cause it. Source: `resetAttributes()` sets `maxAchievable: 0.0`, and
+   `maxAchievable` is never assigned anywhere else in `beatmap.ts`, so tosu's
+   value is always 0; `fcPP` is `this.ppAcc[100] || 0.0`, which is 0 whenever
+   tosu's accuracy sweep has not run for the selected map. **Left unfixed
+   deliberately** — see the note below the table.
+3. **`overlays::resolve_within` double-decodes.** It percent-decodes a path Axum
    has already decoded. It fails safe and the traversal tests call it directly,
    so it was left out of FIX-030. Practical consequence: an *asset* inside a
    folder whose name or path contains a literal `%` will not resolve.
-3. **`parse_spectate_client_arg` has the same quoting weakness FIX-003 fixed.**
+4. **`parse_spectate_client_arg` has the same quoting weakness FIX-003 fixed.**
    It does a raw `find` on the lowercased string. A `CommandLineTokens` now
    exists next to it and could replace this, but the tournament-flag semantics
    were the audited issue and this was left for a separate unit.
-4. **The `+0xC` identity is still unknown.** `client.rs::read_hit_errors_arc`
+5. **The `+0xC` identity is still unknown.** `client.rs::read_hit_errors_arc`
    also reads that field for `MAX_HIT_ERRORS` truncation, so it inherits the same
    uncertainty. Resolving it needs a running osu! client and a `jdb`/WinDbg
    session, or `rosu-mem`'s offset table.
-5. **`TournamentSession` has no retry bound on an unresolved beatmap.**
+6. **`TournamentSession` has no retry bound on an unresolved beatmap.**
    `SoloSession` has `BEATMAP_RESOLVE_RETRIES`; the tournament path re-reads
    every tick until the snapshot resolves. Pre-existing and unchanged.
-6. **`play_state_dirty` is not reset when a process is lost and reattached.**
+7. **`play_state_dirty` is not reset when a process is lost and reattached.**
    Harmless (the latch only causes an extra clear on the first poll in a new
    state), but it is a small leak.
-7. **`objects.total` vs the per-type sum under `pp`.** See FIX-004 above.
-8. **86 pre-existing clippy style findings**, all `collapsible_if`,
-   `field_reassign_with_default`, `map_or` → `map_or_else` and similar. Cleaning
-   them is a separate style pass; this work only held the count at 86 in both
-   feature configurations.
-9. **Pre-existing rustfmt diff at `benches/micro.rs:110`.** Left alone to keep
-   the audit commits free of unrelated churn; `cargo fmt --check` reports this
-   and nothing else.
+8. **`objects.total` vs the per-type sum under `pp`.** See FIX-004 above.
+9. **`beatmap.time.mp3Length` is 1 ms low.** Observed tosu 119433 vs rtosu
+   119432. The value is a `f64` audio length truncated to `i32`; the audit does
+   not mention it and it predates this branch. One line, if it matters.
+10. **rtosu emits no `settings.*` object at all.** tosu populates 72 leaves
+    there (keybinds, volume, resolution, skin, mode, sort, group, ...). rtosu
+    omits the whole subtree. This is a feature gap rather than a defect, and it
+    is the single largest source of byte-level divergence from tosu.
+11. **86 pre-existing clippy style findings**, all `collapsible_if`,
+    `field_reassign_with_default`, `map_or` → `map_or_else` and similar. Cleaning
+    them is a separate style pass; this work only held the count at 86 in both
+    feature configurations.
+12. **Pre-existing rustfmt diff at `benches/micro.rs:110`.** Left alone to keep
+    the audit commits free of unrelated churn; `cargo fmt --check` reports this
+    and nothing else.
+
+### Why `play.pp.fc` was left as-is
+
+Matching tosu here means rtosu would report `0` in song select, discarding a
+number an overlay can genuinely compute and that osu! itself knows. That is a
+product decision — parity versus a strictly more useful field — and it predates
+this branch, so it is reported rather than changed unilaterally. The decision
+should be made once, deliberately, and then pinned by a test either way.
+
 
 ## Validation performed
+
+### Static gates
 
 - `cargo test` — 153 passed, 0 failed
 - `cargo test --no-default-features` — 138 passed, 0 failed
@@ -219,7 +246,88 @@ small reads instead of a 500-slot walk. See the follow-up on `+0xC` below.
 - `cargo fmt --check` — only the pre-existing `benches/micro.rs:110`
 - `cargo doc --no-deps` — no warnings
 
-**Not run:** `cargo run --release -- compare-tosu` needs a live osu! client and
-a running tosu instance, and neither was available. `target/release/osumemoryreading.exe`
-is a stale 25 Sep binary that misdetects Auto mode (recorded in `validations.md`)
-and was deliberately not executed.
+### Live tosu parity, three-way
+
+Run against a live osu! stable client (pid 26360) and a live tosu on
+`127.0.0.1:24050`, with osu! idle in **state 5 (`selectPlay`)** and one map
+selected. Both this branch and `main` were built in release and served on
+separate ports, and all three packets were compared leaf by leaf.
+
+```
+leaves compared outside `performance` : 241
+  main    diverges from tosu : 81
+  branch  diverges from tosu : 81
+  REGRESSIONS introduced by the branch  : 0
+  divergences FIXED by the branch       : 0
+  still diverging, identical on both    : 81
+```
+
+**Zero regressions.** All 81 remaining divergences are byte-identical between
+`main` and the branch, so none of them was introduced here. They break down as
+72 leaves of `settings.*` that rtosu does not emit at all (see follow-up 10),
+6 leaves of `play.pp` (follow-up 2), and `beatmap.time.mp3Length` 1 ms low
+(follow-up 9). `session.playTime` advances between two sequential reads and is
+excluded as inherently volatile.
+
+The values this pass specifically touched all match tosu **exactly**:
+
+| field | tosu | branch |
+| --- | --- | --- |
+| `beatmap.stats.stars` (aim/speed/sliderFactor/reading/hitWindow/total) | 3.15 / 2.77 / 0.98 / 0.99 / 28.5 / 6.06 | identical |
+| `beatmap.stats.hitWindow` (miss/meh/ok/great) | 400 / 115.5 / 71.5 / 28.5 | identical |
+| `beatmap.stats.bpm` (realtime/common/min/max) | 200 / 200 / 200 / 200 | identical |
+| `state.number` / `state.name` | 5 / `selectPlay` | identical |
+| `beatmap.id` / `set` / `title` | 2964306 / 1404277 / Toono Gensou Monogatari | identical |
+| `beatmap.time.firstObject` / `lastObject` / `live` | 1134 / 112584 / 75533 | identical |
+| `play.rank.current` / `maxThisPlay` | `""` / `""` | identical |
+| `play.pp.current` / `maxAchieved` | 0 / 0 | identical |
+
+The matching BPM row is direct evidence for the FIX-002 fix: the clock-rate
+conversion is now idempotent and a repeat call no longer double-scales.
+The matching `stars` and `hitWindow` rows are the osu!std arm, which FIX-029
+deliberately left untouched.
+
+`compare-tosu` also ran, but with no tournament active it compares tosu's zeros
+against rtosu's uninitialised tournament memory, so its `ipcState`/`points`/
+`score` DIFF lines are not a parity signal.
+
+### Performance
+
+**Steady-state poll cost — the number that matters for the tick budget:**
+
+```
+branch  n=18  min=31 µs  median=32 µs  mean=32-33 µs
+main    n=18  min=31 µs  median=32 µs  mean=31-34 µs
+```
+
+Measured with the tool built for it (`compare-tosu`, 18 interleaved samples per
+binary against the same live process). Identical, and at ~0.3% of a 10 ms tick
+budget. No change.
+
+**Criterion micro-benchmarks — not able to support a claim either way.** The
+first branch-vs-main comparison appeared to show the branch slower by a median
+of +6.3%, but untouched control benchmarks moved by the same amount (including
+`scoring/calculate_tosu_grade`, which this branch does not touch, at +20%). A
+null control settled it — the **same binary benchmarked twice**:
+
+```
+NULL CONTROL  branch-run2 vs branch-run1 (identical code)
+  n=33  median=-7.00%  mean=-6.11%  stdev=7.42%  |max|=25.4%
+
+TEST         branch-run1 vs main-run1
+  n=33  median=+6.30%  mean=+8.10%  stdev=11.22% |max|=50.0%
+```
+
+Run-to-run noise on *identical* code (−7.0% median, 25.4% worst case) is the
+same size as the entire branch-vs-main signal (+6.3% median, 50% worst case),
+with the opposite sign. `scoring/calculate_accuracy` — one of the few functions
+this pass actually changed — measured +12.59% against main but **−12.69% against
+itself** in the null control, a 25-point swing for unchanged code. The
+measurement is not sensitive enough to attribute any of this to the branch, and
+the noise is not attributable to it either. Criterion's own within-run detection
+reported "No change in performance detected" for the touched benchmarks.
+
+Anything stronger needs a pinned host with CPU frequency locking and more
+samples per bench; the `target/criterion` baselines already in the tree are from
+an unknown build and should not be trusted as a reference.
+
