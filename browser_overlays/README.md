@@ -91,13 +91,24 @@ awards when a vision-obscuring mod (Hidden, Flashlight, or Fade In) is active:
 `SS` and `SSH` are accepted as aliases for `X` and `XH`. An empty grade means
 the gameplay state could not be read, so do not substitute a default.
 
+## The bundled examples
+
+| Folder | For | Shows |
+| --- | --- | --- |
+| `rtosu Example` | single player | map art banner, current pp, pp if FC, combo, UR, grade-coloured accuracy, judgement counts |
+| `rtosu Tourney` | tournaments | a ranked column of every player, branded by team colour, with a score bar, set stars and a lead indicator |
+
+Copy either folder to start your own. They are deliberately different shapes,
+which is the point: a folder is just a design plus a v2 API consumer, and the
+server serves both without knowing what they are.
+
 ## Tournaments
 
-In a tournament the root `play` object is **not** populated. Every client has
-its own `play` under `tourney.clients[]`, and the v2 schema carries no marker for
+In a tournament the root `play` object is **not** populated. Every client has its
+own `play` under `tourney.clients[]`, and the v2 schema carries no marker for
 which client is the manager. An overlay that wants a single "featured" readout
-must therefore pick a client itself; the bundled example uses the lowest
-`ipcId`, which is stable for the whole set, and marks that row in the list.
+must therefore pick a client itself; `rtosu Example` uses the lowest `ipcId`,
+which is stable for the whole set, and marks that row in the list.
 
 `beatmap` at the root *is* populated in a tournament, so the map header works
 either way. A client's own `beatmap` carries only `stats`, not the title or set
@@ -105,6 +116,19 @@ id.
 
 More clients than fit is normal, so truncate the list deliberately and show the
 total rather than letting a row get sliced in half.
+
+**`clients[].team` is not read from the lobby.** The provider synthesises it by
+splitting the ipc list in half, so it is always a clean even/odd split. Two
+consequences worth knowing before you rely on it:
+
+- A Free For All lobby is indistinguishable from a symmetric Team vs Team one.
+  `rtosu Tourney` therefore takes its layout from `Mode:` in its own
+  `metadata.txt`, overridable per source with `?mode=ffa` or `?mode=tvt`, and
+  always prints the active mode in the footer.
+- An uneven lobby is mislabelled. A 4v2 is reported as 3v3.
+
+Reading the real match type would need a new memory offset for the lobby
+settings, which is not implemented.
 
 If you would rather address the provider directly, the shim exposes it:
 

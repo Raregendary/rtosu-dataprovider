@@ -1,0 +1,9 @@
+Usecase: obs-overlay
+Name: rtosu Tourney
+Version: 1.0.0
+Author: rtosu-dataprovider
+CompatibleWith: tosu
+Resolution: 640x360
+Notes: Tournament leaderboard. Reads Mode from this file to pick the layout: ffa
+(ranked list of every player) or tvt (red left column, blue right column, each
+ranked on its own). Force it per source with ?mode=ffa or ?mode=tvt.

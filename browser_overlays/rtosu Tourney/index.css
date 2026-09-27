@@ -1,0 +1,442 @@
+/* rtosu Tourney overlay.
+ *
+ * A tournament leaderboard. Team vs Team and Free For All share one column of
+ * rows stacked on top of each other; in Team vs Team each row is branded with
+ * its team colour (red left, blue right) and ranked within its own team, and a
+ * score bar across the top carries the set score and who is leading.
+ *
+ * Fully transparent: the panel has no fill, border or shadow, so the cards
+ * float over the stream. Sizing follows the Resolution in metadata.txt.
+ */
+
+:root {
+  color-scheme: dark;
+
+  --left: #ff6b6b;
+  --right: #4da6ff;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  width: 640px;
+  height: 360px;
+  overflow: hidden;
+  background: transparent;
+  font: 14px/1.3 "Segoe UI", system-ui, sans-serif;
+  color: #e7e9ee;
+  -webkit-font-smoothing: antialiased;
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 640px;
+  height: 360px;
+  padding: 10px;
+}
+
+/* --- map banner --- */
+
+.banner {
+  display: flex;
+  flex: 0 0 60px;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: #161a22 center/cover no-repeat;
+  position: relative;
+  isolation: isolate;
+}
+
+.banner::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  background: linear-gradient(
+    to top,
+    rgba(8, 10, 14, 0.92) 0%,
+    rgba(8, 10, 14, 0.55) 45%,
+    rgba(8, 10, 14, 0.2) 100%
+  );
+}
+
+.banner-text {
+  min-width: 0;
+}
+
+.artist {
+  font-size: 10px;
+  color: #aab2c4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.title {
+  font-size: 15px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.7);
+}
+
+.stars {
+  flex: 0 0 auto;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+/* --- team score bar --- */
+
+.teambar {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: stretch;
+  gap: 8px;
+}
+
+.teambar[hidden] {
+  display: none;
+}
+
+/* Both sides read the same way down: name, score, stars. */
+.side {
+  display: flex;
+  flex: 1 1 0;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: rgba(16, 19, 25, 0.72);
+  border-left: 3px solid transparent;
+}
+
+.side.left {
+  border-left-color: var(--left);
+}
+
+.side.right {
+  border-left-color: var(--right);
+}
+
+.side-name {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.side.left .side-name {
+  color: var(--left);
+}
+
+.side.right .side-name {
+  color: var(--right);
+}
+
+.side-score {
+  font-size: 22px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.1;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.side-stars {
+  font-size: 10px;
+  color: #8b93a7;
+  font-variant-numeric: tabular-nums;
+}
+
+.side-stars b {
+  color: #e7e9ee;
+  font-size: 12px;
+}
+
+/* --- lead indicator --- */
+
+.teambar-mid {
+  display: flex;
+  flex: 0 0 168px;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  padding: 4px 6px;
+  border-radius: 8px;
+  background: rgba(16, 19, 25, 0.72);
+  text-align: center;
+}
+
+/* Names the leading side and the margin, in that side's colour. */
+.lead {
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.2;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+
+.lead.left {
+  color: var(--left);
+}
+
+.lead.right {
+  color: var(--right);
+}
+
+.lead.tie {
+  color: #8b93a7;
+}
+
+.format {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #6d7486;
+  white-space: nowrap;
+}
+
+/* --- FFA summary strip --- */
+
+.summary {
+  display: grid;
+  flex: 0 0 auto;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+}
+
+.summary[hidden] {
+  display: none;
+}
+
+.summary-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 5px 8px;
+  border-radius: 7px;
+  background: rgba(16, 19, 25, 0.72);
+}
+
+.label {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #8b93a7;
+}
+
+.value {
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.25;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* --- column headings --- */
+
+.colheads {
+  display: flex;
+  flex: 0 0 auto;
+  justify-content: space-between;
+  padding: 0 4px;
+}
+
+.colheads[hidden] {
+  display: none;
+}
+
+.ch {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #6d7486;
+}
+
+.ch.tail {
+  color: #4d5568;
+}
+
+/* --- player board --- */
+
+.board {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.column {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 4px;
+  min-height: 0;
+  min-width: 0;
+}
+
+.row {
+  display: flex;
+  flex: 1 1 0;
+  /* Rows share the leftover height so a short roster leaves no dead space. */
+  min-height: 20px;
+  max-height: 40px;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 8px;
+  border-radius: 6px;
+  background: rgba(16, 19, 25, 0.72);
+  border-left: 3px solid transparent;
+  font-variant-numeric: tabular-nums;
+  min-width: 0;
+}
+
+/* Team branding. In FFA there are no teams, so the accent marks the leader. */
+.row.left {
+  border-left-color: var(--left);
+}
+
+.row.right {
+  border-left-color: var(--right);
+}
+
+body.ffa .row {
+  border-left-color: #39405a;
+}
+
+body.ffa .row.leader {
+  border-left-color: #ffd166;
+}
+
+.rank {
+  flex: 0 0 auto;
+  width: 16px;
+  font-size: 10px;
+  font-weight: 700;
+  color: #6d7486;
+  text-align: right;
+}
+
+/* Small team tag so the colour is not the only cue. */
+.tag {
+  flex: 0 0 auto;
+  width: 12px;
+  font-size: 9px;
+  font-weight: 700;
+  text-align: center;
+}
+
+.row.left .tag {
+  color: var(--left);
+}
+
+.row.right .tag {
+  color: var(--right);
+}
+
+body.ffa .tag {
+  visibility: hidden;
+}
+
+.player {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.grade {
+  flex: 0 0 auto;
+  width: 18px;
+  font-size: 11px;
+  font-weight: 700;
+  text-align: center;
+}
+
+.cell {
+  flex: 0 0 auto;
+  font-size: 11px;
+  color: #b6bdcd;
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+}
+
+.cell.acc {
+  width: 48px;
+}
+
+.cell.combo {
+  width: 48px;
+}
+
+.cell.pp {
+  width: 54px;
+  color: #e7e9ee;
+}
+
+.cell.score {
+  width: 78px;
+  font-weight: 600;
+}
+
+/* A client with nothing judged yet is dimmed, not shown as a real zero. */
+.row.idle .player,
+.row.idle .cell,
+.row.idle .grade {
+  color: #6d7486;
+}
+
+/* --- footer --- */
+
+.footer {
+  display: flex;
+  flex: 0 0 auto;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  padding: 0 2px;
+  font-size: 10px;
+  color: #8b93a7;
+}
+
+.state {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.state.offline {
+  color: #e05c6e;
+}
+
+.mode {
+  flex: 0 0 auto;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #6d7486;
+}

@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>rtosu Tourney</title>
+<link rel="stylesheet" href="index.css">
+<script src="index.js" defer></script>
+</head>
+<body>
+<div class="panel">
+  <!-- Map art spans the header; the gradient keeps the text readable. -->
+  <header class="banner" id="banner">
+    <div class="banner-text">
+      <div class="artist" id="artist">waiting for a tournament&hellip;</div>
+      <div class="title" id="title">no beatmap</div>
+    </div>
+    <div class="stars" id="stars">&nbsp;</div>
+  </header>
+
+  <!-- Team score bar. Both sides read name, score, stars top to bottom. -->
+  <section class="teambar" id="teambar" hidden>
+    <div class="side left">
+      <div class="side-name" id="leftName">left</div>
+      <div class="side-score" id="leftScore">0</div>
+      <div class="side-stars" id="leftPoints"></div>
+    </div>
+    <div class="teambar-mid">
+      <div class="lead" id="lead">tie</div>
+      <div class="format" id="format">best of 1</div>
+    </div>
+    <div class="side right">
+      <div class="side-name" id="rightName">right</div>
+      <div class="side-score" id="rightScore">0</div>
+      <div class="side-stars" id="rightPoints"></div>
+    </div>
+  </section>
+
+  <!-- Headline figures shown in FFA. -->
+  <section class="summary" id="summary" hidden>
+    <div class="summary-cell">
+      <span class="label">leader</span>
+      <span class="value" id="leadName">&mdash;</span>
+    </div>
+    <div class="summary-cell">
+      <span class="label">players</span>
+      <span class="value" id="playerCount">0</span>
+    </div>
+    <div class="summary-cell">
+      <span class="label">best pp</span>
+      <span class="value" id="bestPp">0.00</span>
+    </div>
+  </section>
+
+  <!-- Column headings. -->
+  <div class="colheads" id="colheads">
+    <span class="ch">rank &middot; player</span>
+    <span class="ch tail">acc &middot; combo &middot; pp &middot; score</span>
+  </div>
+
+  <!-- One column: both teams stacked, branded by team colour. -->
+  <div class="board" id="board">
+    <div class="column" id="colAll"></div>
+  </div>
+
+  <footer class="footer">
+    <span class="state" id="state">connecting&hellip;</span>
+    <span class="mode" id="mode"></span>
+  </footer>
+</div>
+</body>
+</html>
