@@ -224,7 +224,7 @@ pub struct ModEntry {
 /// is what makes a combination readable. The bit order here is osu!'s, not a
 /// sorted one: the key-count mods are scattered (`K4`..`K8` at 15..19, then
 /// `FI`..`CN` at 20..22, then `K9`, `K10`, `K1`, `K3`, `K2` at 24..28), so the
-/// grouping below follows [`compute_format_mods`]'s table rather than
+/// grouping below follows `compute_format_mods`'s table rather than
 /// alphabetising it.
 pub mod mod_bits {
     pub const NF: u32 = 1 << 0;
@@ -649,7 +649,7 @@ const MANIA_MAX_SCORE_V2: f64 = 305.0;
 ///
 /// osu!mania weights MAX/rainbow 300s (`hit_geki`) as the primary judgement,
 /// which is why this takes the whole mod mask: the MAX weight is
-/// [`MANIA_MAX_SCORE_V1`] unless the ScoreV2 bit (`mod_bits::SCORE_V2`) is set.
+/// `MANIA_MAX_SCORE_V1` unless the ScoreV2 bit (`mod_bits::SCORE_V2`) is set.
 #[allow(clippy::too_many_arguments)]
 pub fn calculate_accuracy(
     mode: i32,
@@ -978,7 +978,7 @@ pub fn read_hit_errors(memory: &ProcessMemory, score_base: u64) -> Result<Vec<i1
 /// to be divided by the clock rate to describe the play, not the wall clock.
 /// Nightcore shares Double Time's branch: it is the same 1.5x clock, and osu!
 /// stable normally sets the DT bit *alongside* NC — the `DTNC` -> `NC` collapse
-/// in [`compute_format_mods`] only makes sense if both arrive — so testing NC on
+/// in `compute_format_mods` only makes sense if both arrive — so testing NC on
 /// its own is hardening rather than a user-visible fix.
 pub fn calculate_unstable_rate(hit_errors: &[i16], mods: u32) -> f64 {
     if hit_errors.is_empty() {

@@ -554,6 +554,49 @@ pub fn populate_beatmap_statistics(
 /// never parsed) rather than from whatever the previous call left behind. A
 /// DT then nomod round trip therefore returns the BPM to its base instead of
 /// stranding it at the 1.5x it was last scaled to.
+///
+/// # The per-mode `stars` breakdown
+///
+/// The breakdown arm matches on the [`rosu_pp::any::DifficultyAttributes`] the
+/// calculation already produced for `stars.total` and `max_combo`, and copies
+/// the skill values out of it. The source is rosu-pp, never the game: osu!
+/// **stable** memory holds none of these values, and the `BeatmapDifficulty`
+/// object that tosu v2's own `stats` breakdown is built from comes from osu!
+/// lazer, which is not reachable from this process either. So these values match
+/// the *shape* of tosu's payload and make no claim to its numbers.
+///
+/// osu!standard, unchanged: `aim`, `speed`, `slider_factor` and `reading` are
+/// rosu-pp's, `flashlight` is dropped when it is zero so that a non-FL map does
+/// not report a flashlight, and the miss window is the osu!stable `400.0`
+/// constant divided by the clock rate.
+///
+/// osu!taiko, from [`rosu_pp::taiko::TaikoDifficultyAttributes`]:
+///
+/// * `stamina`, `rhythm` and `color` are taiko's three rosu-pp skills, wrapped
+///   in `Some` so the `Option::is_none` serializer guard keeps emitting them;
+///   `reading` is its fourth and is a plain `f32`.
+/// * `stars.hit_window` and `hit_window.great` are both
+///   `great_hit_window`; `hit_window.ok` is `ok_hit_window`. Both are documented
+///   upstream as *already* inclusive of rate-adjusting mods, so unlike the
+///   osu!standard miss constant they are deliberately **not** divided by the
+///   clock rate a second time.
+/// * `flashlight` stays `None`: taiko has no flashlight.
+/// * `slider_factor` stays `0.0`: it is an osu!standard-only concept, since
+///   taiko converts every slider to a plain note.
+/// * `hit_window.meh` and `hit_window.miss` stay `0.0`. osu!taiko has neither a
+///   meh nor a miss judgement, and `TaikoDifficultyAttributes` carries no
+///   equivalent to them, so reusing the osu!standard `400.0 / clock_rate` miss
+///   constant would be inventing a number rather than reporting one.
+///
+/// osu!catch, osu!mania and osu!criterion keep the whole default breakdown.
+/// This is a dependency limitation, not an oversight:
+/// [`rosu_pp::catch::CatchDifficultyAttributes`] and
+/// [`rosu_pp::mania::ManiaDifficultyAttributes`] expose no skill values and no
+/// hit windows whatsoever -- only `stars`, object counts, `max_combo` and
+/// `is_convert` -- so there is nothing to copy into `stamina`, `rhythm`, `color`,
+/// `reading` or the four hit windows. Mapping osu!standard numbers onto them
+/// would report difficulty the calculation never produced, which is worse than
+/// a zero that reads as "not available".
 #[cfg(feature = "pp")]
 pub fn populate_beatmap_statistics_with_diff(
     snapshot: &mut BeatmapSnapshot,
@@ -644,20 +687,36 @@ pub fn populate_beatmap_statistics_with_diff(
         2,
     );
     snapshot.stats.hp.converted = round_value(calculate_converted_hp(map.hp, mods), 2);
-    if let rosu_pp::any::DifficultyAttributes::Osu(osu_diff) = diff {
-        snapshot.stats.stars.aim = round_value(osu_diff.aim as f32, 2);
-        snapshot.stats.stars.speed = round_value(osu_diff.speed as f32, 2);
-        snapshot.stats.stars.slider_factor = round_value(osu_diff.slider_factor as f32, 2);
-        snapshot.stats.stars.flashlight =
-            (osu_diff.flashlight > 0.0).then(|| round_value(osu_diff.flashlight as f32, 2));
-        snapshot.stats.stars.reading = round_value(osu_diff.reading as f32, 2);
-        snapshot.stats.stars.hit_window = round_value(osu_diff.great_hit_window as f32, 2);
-        snapshot.stats.hit_window = HitWindowState {
-            miss: 400.0 / (clock_rate as f64),
-            meh: osu_diff.meh_hit_window,
-            ok: osu_diff.ok_hit_window,
-            great: osu_diff.great_hit_window,
-        };
+    match diff {
+        rosu_pp::any::DifficultyAttributes::Osu(osu_diff) => {
+            snapshot.stats.stars.aim = round_value(osu_diff.aim as f32, 2);
+            snapshot.stats.stars.speed = round_value(osu_diff.speed as f32, 2);
+            snapshot.stats.stars.slider_factor = round_value(osu_diff.slider_factor as f32, 2);
+            snapshot.stats.stars.flashlight =
+                (osu_diff.flashlight > 0.0).then(|| round_value(osu_diff.flashlight as f32, 2));
+            snapshot.stats.stars.reading = round_value(osu_diff.reading as f32, 2);
+            snapshot.stats.stars.hit_window = round_value(osu_diff.great_hit_window as f32, 2);
+            snapshot.stats.hit_window = HitWindowState {
+                miss: 400.0 / (clock_rate as f64),
+                meh: osu_diff.meh_hit_window,
+                ok: osu_diff.ok_hit_window,
+                great: osu_diff.great_hit_window,
+            };
+        }
+        rosu_pp::any::DifficultyAttributes::Taiko(taiko_diff) => {
+            snapshot.stats.stars.stamina = Some(round_value(taiko_diff.stamina as f32, 2));
+            snapshot.stats.stars.rhythm = Some(round_value(taiko_diff.rhythm as f32, 2));
+            snapshot.stats.stars.color = Some(round_value(taiko_diff.color as f32, 2));
+            snapshot.stats.stars.reading = round_value(taiko_diff.reading as f32, 2);
+            snapshot.stats.stars.hit_window = round_value(taiko_diff.great_hit_window as f32, 2);
+            snapshot.stats.hit_window = HitWindowState {
+                miss: 0.0,
+                meh: 0.0,
+                ok: taiko_diff.ok_hit_window,
+                great: taiko_diff.great_hit_window,
+            };
+        }
+        _ => {}
     }
     snapshot.stats.pp.ss = crate::pp::calculator::calc_fc_pp(diff, mods_legacy);
     snapshot.stats.pp.fc = snapshot.stats.pp.ss;
@@ -1013,6 +1072,223 @@ mod tests {
             json.contains(
                 "\"bpm\":{\"realtime\":180.0,\"common\":180.0,\"min\":180.0,\"max\":360.0}"
             )
+        );
+    }
+
+    /// A 300 BPM alternating stream of 24 hit circles, timed 0-3800 ms, with a
+    /// 1/8 note dropped into every other bar so the rhythm evaluator has a
+    /// pattern that is not a flat quarter-note grid.
+    ///
+    /// The hit sound alternates `0` (normal) and `8` (clap), and that is the
+    /// point: rosu derives a taiko note's inner/outer type from the `CLAP` or
+    /// `WHISTLE` sound flag, not from the `x` position, so an all-`0` fixture
+    /// would be a single-colour stream and would report `color: 0`. Alternating
+    /// the two gives the colour evaluator real colour changes.
+    ///
+    /// The same bytes are reused for `Mode: 2` and `Mode: 3`. Hit circles are
+    /// valid in every mode, so one fixture can drive the taiko, osu!catch,
+    /// osu!mania and osu!standard arms with only the `Mode:` line differing.
+    #[cfg(feature = "pp")]
+    const MODE_FIXTURE_OBJECTS: &str = "\
+0,192,0,1,0,0:0:0:0:
+192,320,200,1,8,0:0:0:0:
+0,192,400,1,0,0:0:0:0:
+192,320,600,1,8,0:0:0:0:
+0,192,800,1,0,0:0:0:0:
+192,320,1000,1,8,0:0:0:0:
+0,192,1100,1,0,0:0:0:0:
+192,320,1200,1,8,0:0:0:0:
+0,192,1400,1,0,0:0:0:0:
+192,320,1600,1,8,0:0:0:0:
+0,192,1800,1,0,0:0:0:0:
+192,320,1900,1,8,0:0:0:0:
+0,192,2000,1,0,0:0:0:0:
+192,320,2200,1,8,0:0:0:0:
+0,192,2400,1,0,0:0:0:0:
+192,320,2500,1,8,0:0:0:0:
+0,192,2600,1,0,0:0:0:0:
+192,320,2800,1,8,0:0:0:0:
+0,192,3000,1,0,0:0:0:0:
+192,320,3200,1,8,0:0:0:0:
+0,192,3400,1,0,0:0:0:0:
+192,320,3500,1,8,0:0:0:0:
+0,192,3600,1,0,0:0:0:0:
+192,320,3800,1,8,0:0:0:0:
+";
+
+    /// The [`MODE_FIXTURE_OBJECTS`] stream behind a `[General] Mode:` line.
+    ///
+    /// `Mode: 0` is osu!standard, `1` osu!taiko, `2` osu!catch and `3`
+    /// osu!mania. Everything else is identical on purpose, so any difference in
+    /// the emitted breakdown is caused by the mode and by nothing else.
+    #[cfg(feature = "pp")]
+    fn mode_fixture(mode: u8) -> String {
+        format!(
+            "osu file format v14\n\n[General]\nMode:{mode}\n\n[Difficulty]\nHPDrainRate:6\nCircleSize:5\nOverallDifficulty:7\nApproachRate:8\nSliderMultiplier:1.4\nSliderTickRate:1\n\n[TimingPoints]\n0,200,4,1,0\n\n[HitObjects]\n{MODE_FIXTURE_OBJECTS}"
+        )
+    }
+
+    /// The rosu beatmap and the attributes the arm under test will see for
+    /// `mode`, with no mods applied.
+    #[cfg(feature = "pp")]
+    fn mode_fixture_diff(mode: u8) -> (rosu_pp::Beatmap, rosu_pp::any::DifficultyAttributes) {
+        let map = rosu_pp::Beatmap::from_bytes(mode_fixture(mode).as_bytes())
+            .unwrap_or_else(|err| panic!("parse mode {mode} fixture: {err}"));
+        let diff = bpm_fixture_diff(&map, 0);
+        (map, diff)
+    }
+
+    /// FIX-029, osu!taiko. Every skill rosu-pp reports for taiko reaches the
+    /// snapshot, including the three that only taiko has: `stamina`, `rhythm`
+    /// and `color` are all populated and all above zero on this fixture, and
+    /// `reading` is a real value rather than a left-over default.
+    #[test]
+    #[cfg(feature = "pp")]
+    fn taiko_populates_its_own_skills_and_hit_windows() {
+        let (map, diff) = mode_fixture_diff(1);
+        let mut snapshot = BeatmapSnapshot::default();
+        populate_beatmap_statistics_with_diff(&mut snapshot, &map, &diff, 0);
+
+        let stars = &snapshot.stats.stars;
+        assert!(stars.stamina.expect("taiko stamina is populated") > 0.0);
+        assert!(stars.rhythm.expect("taiko rhythm is populated") > 0.0);
+        assert!(stars.color.expect("taiko color is populated") > 0.0);
+        assert!(stars.reading > 0.0);
+        assert!(stars.hit_window > 0.0);
+        assert!(stars.total > 0.0);
+        assert!(snapshot.stats.hit_window.great > 0.0);
+        assert!(snapshot.stats.hit_window.ok > 0.0);
+
+        assert_eq!(stars.stamina, Some(1.1));
+        assert_eq!(stars.rhythm, Some(0.17));
+        assert_eq!(stars.color, Some(0.15));
+        assert_eq!(stars.reading, 0.14);
+        assert_eq!(stars.hit_window, 28.5);
+        assert_eq!(stars.total, 1.56);
+        assert_eq!(stars.live, stars.total);
+        assert_eq!(snapshot.stats.hit_window.great, 28.5);
+        assert_eq!(snapshot.stats.hit_window.ok, 67.5);
+    }
+
+    /// The values the taiko arm deliberately refuses to invent. `flashlight`
+    /// has no taiko equivalent at all, `slider_factor` is an osu!standard-only
+    /// concept, and `meh` and `miss` are judgements osu!taiko does not have.
+    ///
+    /// Each of these is a zero that means "not available", so they are pinned
+    /// here: filling any of them in with an osu!standard number would be a
+    /// regression that looks like a feature, and nothing else would catch it.
+    #[test]
+    #[cfg(feature = "pp")]
+    fn taiko_leaves_flashlight_and_the_meh_and_miss_windows_alone() {
+        let (map, diff) = mode_fixture_diff(1);
+        let mut snapshot = BeatmapSnapshot::default();
+        populate_beatmap_statistics_with_diff(&mut snapshot, &map, &diff, 0);
+
+        assert_eq!(snapshot.stats.stars.flashlight, None);
+        assert_eq!(snapshot.stats.stars.slider_factor, 0.0);
+        assert_eq!(
+            snapshot.stats.hit_window,
+            HitWindowState {
+                miss: 0.0,
+                meh: 0.0,
+                ok: 67.5,
+                great: 28.5,
+            }
+        );
+
+        let json = serde_json::to_string(&snapshot).expect("serialize beatmap");
+        assert!(!json.contains("flashlight"));
+        assert!(json.contains("\"stamina\":1.1"));
+        assert!(json.contains("\"rhythm\":0.17"));
+        assert!(json.contains("\"color\":0.15"));
+    }
+
+    /// The reason the taiko arm does not divide by the clock rate.
+    ///
+    /// `great_hit_window` and `ok_hit_window` come out of rosu-pp already
+    /// inclusive of rate-adjusting mods, so DT moves the nomod 28.5/67.5 down to
+    /// 19.0/45.0 on its own. Dividing again would report 12.67 and 30.0. The
+    /// osu!standard arm *does* divide, because its `400.0` miss constant is a
+    /// raw osu!stable number rather than a rosu-pp attribute, so the two arms
+    /// disagree on purpose and this is what keeps them from being
+    /// "reconciled" into one.
+    #[test]
+    #[cfg(feature = "pp")]
+    fn taiko_hit_windows_already_include_the_clock_rate() {
+        let map =
+            rosu_pp::Beatmap::from_bytes(mode_fixture(1).as_bytes()).expect("parse taiko fixture");
+        let mut snapshot = BeatmapSnapshot::default();
+        populate_beatmap_statistics_with_diff(
+            &mut snapshot,
+            &map,
+            &bpm_fixture_diff(&map, mod_bits::DT),
+            mod_bits::DT,
+        );
+
+        assert_eq!(snapshot.stats.hit_window.great, 19.0);
+        assert_eq!(snapshot.stats.hit_window.ok, 45.0);
+        assert_eq!(snapshot.stats.hit_window.miss, 0.0);
+        assert_eq!(snapshot.stats.hit_window.meh, 0.0);
+        assert_eq!(snapshot.stats.stars.hit_window, 19.0);
+    }
+
+    /// FIX-029, osu!catch and osu!mania. Neither attribute struct carries a
+    /// skill value or a hit window, so both breakdowns must stay at the
+    /// default -- which is the whole point of leaving those two arms out rather
+    /// than copying osu!standard numbers onto them.
+    ///
+    /// The same bytes in `Mode: 0` *do* fill the osu!standard breakdown, which
+    /// is asserted here too: without that contrast, a fixture that parsed badly
+    /// would produce the same all-zero result and the test would pass for the
+    /// wrong reason.
+    #[test]
+    #[cfg(feature = "pp")]
+    fn catch_and_mania_keep_the_default_breakdown() {
+        for mode in [2u8, 3] {
+            let (map, diff) = mode_fixture_diff(mode);
+            let mut snapshot = BeatmapSnapshot::default();
+            populate_beatmap_statistics_with_diff(&mut snapshot, &map, &diff, 0);
+
+            assert!(
+                snapshot.stats.stars.total > 0.0,
+                "mode {mode} still calculates stars"
+            );
+            assert_eq!(snapshot.stats.stars.stamina, None, "mode {mode}");
+            assert_eq!(snapshot.stats.stars.rhythm, None, "mode {mode}");
+            assert_eq!(snapshot.stats.stars.color, None, "mode {mode}");
+            assert_eq!(snapshot.stats.stars.flashlight, None, "mode {mode}");
+            assert_eq!(snapshot.stats.stars.reading, 0.0, "mode {mode}");
+            assert_eq!(snapshot.stats.stars.aim, 0.0, "mode {mode}");
+            assert_eq!(snapshot.stats.stars.speed, 0.0, "mode {mode}");
+            assert_eq!(snapshot.stats.stars.slider_factor, 0.0, "mode {mode}");
+            assert_eq!(snapshot.stats.stars.hit_window, 0.0, "mode {mode}");
+            assert_eq!(
+                snapshot.stats.hit_window,
+                HitWindowState::default(),
+                "mode {mode}"
+            );
+
+            let json = serde_json::to_string(&snapshot).expect("serialize beatmap");
+            assert!(!json.contains("stamina"), "mode {mode}");
+            assert!(!json.contains("rhythm"), "mode {mode}");
+            assert!(!json.contains("color"), "mode {mode}");
+        }
+
+        let (map, diff) = mode_fixture_diff(0);
+        let mut snapshot = BeatmapSnapshot::default();
+        populate_beatmap_statistics_with_diff(&mut snapshot, &map, &diff, 0);
+        assert_eq!(snapshot.stats.stars.aim, 2.16);
+        assert_eq!(snapshot.stats.stars.speed, 1.29);
+        assert_eq!(snapshot.stats.stars.reading, 1.09);
+        assert_eq!(snapshot.stats.stars.hit_window, 37.5);
+        assert_eq!(
+            snapshot.stats.hit_window,
+            HitWindowState {
+                miss: 400.0,
+                meh: 129.5,
+                ok: 83.5,
+                great: 37.5,
+            }
         );
     }
 }
