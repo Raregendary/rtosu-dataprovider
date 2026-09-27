@@ -110,9 +110,7 @@ fn crate_combo(v: i32) -> rtosu_dataprovider::v2::ComboState {
 /// 9 740-point graph over 5 series), so it dominates serialization cost too.
 fn marathon_packet(points: usize, series: usize) -> TosuV2Packet {
     let mut packet = representative_packet(0);
-    let xaxis = (0..points)
-        .map(|i| (i as f64) * 400.0 + 48.0)
-        .collect();
+    let xaxis = (0..points).map(|i| (i as f64) * 400.0 + 48.0).collect();
     let mut graph = rtosu_dataprovider::v2::PerformanceGraph {
         series: Vec::new(),
         xaxis,
