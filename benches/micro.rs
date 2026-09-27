@@ -231,6 +231,9 @@ fn bench_scoring(c: &mut Criterion) {
                 black_box(0),
                 black_box(0),
                 black_box(0),
+                black_box(0),
+                black_box(0),
+                black_box(0),
             )
         })
     });

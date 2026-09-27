@@ -507,12 +507,42 @@ pub fn resolve_ruleset(
         .ok_or_else(|| anyhow::anyhow!("active ruleset is null"))
 }
 
+/// Score weight of an osu!mania MAX/rainbow 300 under the original ScoreV1 rules,
+/// where a MAX is worth the same 300 points as a plain 300 (osu! wiki,
+/// "Gameplay/Accuracy"; ppy/osu `ManiaScoreProcessor` before the ScoreV2 change).
+const MANIA_MAX_SCORE_V1: f64 = 300.0;
+
+/// Score weight of an osu!mania MAX/rainbow 300 under ScoreV2. In ppy/osu,
+/// `ManiaScoreProcessor.GetBaseScoreForResult` returns 305 for
+/// `HitResult.Perfect`, and `ScoreProcessor` gates accuracy on
+/// `Judgement.MaxResult`, so a miss is also worth 305 in the denominator -- which
+/// is why the weight multiplies `total` and not just the MAX count.
+const MANIA_MAX_SCORE_V2: f64 = 305.0;
+
+/// Per-ruleset accuracy as a percentage, from the raw result-screen judgement
+/// counters (osu! wiki, "Gameplay/Accuracy").
+///
+/// osu! and taiko weight the judgements the way the score does. osu!catch does
+/// not weight them at all: its counters are object counts, so accuracy is caught
+/// objects over all objects, with `hit_miss` covering dropped fruit and drops and
+/// `hit_katu` covering missed droplets. `hit_geki` is excluded from catch on
+/// purpose -- the wiki states "countGeki should not be used to calculate the
+/// accuracy at all", because it only counts caught combo-ending fruit, which is
+/// already counted in `hit_300`.
+///
+/// osu!mania weights MAX/rainbow 300s (`hit_geki`) as the primary judgement,
+/// which is why this takes the whole mod mask: the MAX weight is
+/// [`MANIA_MAX_SCORE_V1`] unless the ScoreV2 bit (`1 << 29`) is set.
+#[allow(clippy::too_many_arguments)]
 pub fn calculate_accuracy(
     mode: i32,
     hit_300: i16,
     hit_100: i16,
     hit_50: i16,
     hit_miss: i16,
+    hit_geki: i16,
+    hit_katu: i16,
+    mods: u32,
 ) -> f64 {
     match mode {
         0 => {
@@ -534,20 +564,30 @@ pub fn calculate_accuracy(
             }
         }
         2 => {
-            let total = (hit_300 + hit_100 + hit_50 + hit_miss) as f64;
+            let total = (hit_300 + hit_100 + hit_50 + hit_miss + hit_katu) as f64;
             if total == 0.0 {
                 100.0
             } else {
-                (hit_300 as f64 * 300.0 + hit_100 as f64 * 100.0 + hit_50 as f64 * 50.0) / total
-                    * 100.0
+                (hit_300 + hit_100 + hit_50) as f64 / total * 100.0
             }
         }
         3 => {
-            let total = (hit_300 + hit_100 + hit_50 + hit_miss) as f64;
+            let max_score = if mods & (1 << 29) != 0 {
+                MANIA_MAX_SCORE_V2
+            } else {
+                MANIA_MAX_SCORE_V1
+            };
+            let total = (hit_geki + hit_300 + hit_katu + hit_100 + hit_50 + hit_miss) as f64;
             if total == 0.0 {
                 100.0
             } else {
-                (hit_300 as f64 / total) * 100.0
+                (max_score * hit_geki as f64
+                    + 300.0 * hit_300 as f64
+                    + 200.0 * hit_katu as f64
+                    + 100.0 * hit_100 as f64
+                    + 50.0 * hit_50 as f64)
+                    / (total * max_score)
+                    * 100.0
             }
         }
         _ => 0.0,
@@ -614,7 +654,9 @@ pub fn read_result_screen_state(
         .read_i16(checked_add(result_screen_base, 0x92)?)
         .unwrap_or(0);
 
-    let accuracy = calculate_accuracy(mode, hit_300, hit_100, hit_50, hit_miss);
+    let accuracy = calculate_accuracy(
+        mode, hit_300, hit_100, hit_50, hit_miss, hit_geki, hit_katu, mods,
+    );
     let created_at = net_date_to_iso(memory, result_screen_base).unwrap_or_default();
     let grade = calculate_tosu_grade(mode, accuracy, hit_300, hit_100, hit_50, hit_miss, mods);
 
@@ -1142,7 +1184,7 @@ pub fn find_pattern(
 #[cfg(test)]
 mod tests {
     use super::{
-        GameplayState, MAX_HIT_ERRORS, ProcessSnapshotResult, calculate_grade,
+        GameplayState, MAX_HIT_ERRORS, ProcessSnapshotResult, calculate_accuracy, calculate_grade,
         calculate_unstable_rate, format_mods, hit_error_items_address, hit_error_window,
         is_tournament_manager_cmd, parse_hit_errors, parse_spectate_client_arg,
     };
@@ -1398,5 +1440,90 @@ mod tests {
         let json = serde_json::to_string(&hits).unwrap();
         // Serializes as standard JSON array of numbers, identical to tosu's Vec<i32> format
         assert_eq!(json, "[-15,0,12,35,-4]");
+    }
+
+    /// A perfect CtB run is 100%, not `300 * 100`. The old catch arm divided
+    /// score weights by an unweighted total, so 300 caught fruits scored 30000%.
+    #[test]
+    fn catch_perfect_play_is_one_hundred_percent() {
+        assert_eq!(calculate_accuracy(2, 300, 0, 0, 0, 0, 0, 0), 100.0);
+    }
+
+    /// 1000 caught fruits + 200 caught drops + 50 caught droplets = 1250 caught,
+    /// over 1250 + 10 dropped + 5 missed droplets = 1265 objects.
+    #[test]
+    fn catch_accuracy_counts_objects_and_charges_missed_droplets_to_katu() {
+        let accuracy = calculate_accuracy(2, 1000, 200, 50, 10, 0, 5, 0);
+        assert_eq!(accuracy, 1250.0 / 1265.0 * 100.0);
+        assert!((accuracy - 98.8142292490119).abs() < 1e-9);
+    }
+
+    /// `hit_geki` is caught combo-ending fruit, already counted in `hit_300`, so
+    /// the wiki excludes it from catch accuracy entirely.
+    #[test]
+    fn catch_accuracy_ignores_geki() {
+        let with_geki = calculate_accuracy(2, 1000, 200, 50, 10, 900, 5, 0);
+        let without_geki = calculate_accuracy(2, 1000, 200, 50, 10, 0, 5, 0);
+        assert_eq!(with_geki, without_geki);
+        assert_eq!(with_geki, 1250.0 / 1265.0 * 100.0);
+    }
+
+    /// Under ScoreV1 a MAX is worth the same 300 as a plain 300, so an all-MAX
+    /// play is 300 * n over 300 * n.
+    #[test]
+    fn mania_accuracy_of_an_all_max_play_is_one_hundred_percent_under_score_v1() {
+        assert_eq!(calculate_accuracy(3, 0, 0, 0, 0, 1000, 0, 0), 100.0);
+    }
+
+    /// Under ScoreV2 the MAX weight is 305 in numerator *and* denominator, so an
+    /// all-MAX play is 305 * n over 305 * n. Putting 305 only in the numerator
+    /// would make this read 101.66666666666667%.
+    #[test]
+    fn mania_accuracy_of_an_all_max_play_is_one_hundred_percent_under_score_v2() {
+        let accuracy = calculate_accuracy(3, 0, 0, 0, 0, 1000, 0, 1 << 29);
+        assert_eq!(accuracy, 100.0);
+    }
+
+    /// 1000 MAX + 500 300 + 200 200s + 100 100s + 50 50s + 20 misses = 1870
+    /// objects. ScoreV1 numerator `300*1000 + 300*500 + 200*200 + 100*100 + 50*50`
+    /// = 502500 over `300 * 1870` = 561000. ScoreV2 swaps the 300 MAX weight for
+    /// 305: numerator 507500 over `305 * 1870` = 570350, which is a lower
+    /// percentage because the miss is now also worth 305.
+    #[test]
+    fn mania_accuracy_matches_both_score_versions() {
+        let v1 = calculate_accuracy(3, 500, 100, 50, 20, 1000, 200, 0);
+        let v2 = calculate_accuracy(3, 500, 100, 50, 20, 1000, 200, 1 << 29);
+
+        assert_eq!(v1, 502_500.0 / 561_000.0 * 100.0);
+        assert_eq!(v2, 507_500.0 / 570_350.0 * 100.0);
+        assert!((v1 - 89.5721925133690).abs() < 1e-9);
+        assert!((v2 - 88.9804506005085).abs() < 1e-9);
+        assert_ne!(v1, v2);
+        assert!(v1 > v2);
+    }
+
+    /// osu! and taiko already matched the wiki and must not drift: 800 300s + 150
+    /// 100s + 50 50s + 20 misses is `300*800 + 100*150 + 50*50` = 257500 over
+    /// `300 * 1020` = 306000, and 900 300s + 80 100s + 20 misses is
+    /// `900 + 80*0.5` = 940 over 1000.
+    #[test]
+    fn osu_and_taiko_accuracy_are_unchanged() {
+        let osu = calculate_accuracy(0, 800, 150, 50, 20, 0, 0, 0);
+        let taiko = calculate_accuracy(1, 900, 80, 0, 20, 0, 0, 0);
+
+        assert_eq!(osu, 257_500.0 / 306_000.0 * 100.0);
+        assert!((osu - 84.1503267973856).abs() < 1e-9);
+        assert_eq!(taiko, 94.0);
+    }
+
+    /// Every ruleset with no objects reads as a vacuous 100%; anything past the
+    /// four rulesets is not an accuracy calculation at all.
+    #[test]
+    fn empty_hit_counts_read_as_one_hundred_percent_for_every_ruleset() {
+        for mode in 0..4 {
+            assert_eq!(calculate_accuracy(mode, 0, 0, 0, 0, 0, 0, 0), 100.0);
+            assert_eq!(calculate_accuracy(mode, 0, 0, 0, 0, 0, 0, 1 << 29), 100.0);
+        }
+        assert_eq!(calculate_accuracy(4, 0, 0, 0, 0, 0, 0, 0), 0.0);
     }
 }
