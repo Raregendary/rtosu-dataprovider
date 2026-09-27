@@ -24,6 +24,14 @@
   /* Used when metadata.txt has no Mode line. */
   var DEFAULT_MODE = 'tvt';
 
+  /* osu! rank colours, keyed by the grade string the provider reports, which
+   * uses the legacy letters: X for a perfect and S for an FC-equivalent, each
+   * with a trailing H for the silver variant awarded when a vision-obscuring
+   * mod is active. SS and SSH are accepted as aliases.
+   *
+   * B stays purple and C blue, as in osu!, but the two are pushed apart in
+   * lightness and saturation because at 11px on a dark card they otherwise read
+   * as the same colour. */
   var GRADE_COLORS = {
     X: '#ffe9a3',
     SS: '#ffe9a3',
@@ -32,10 +40,10 @@
     S: '#ffc44d',
     SH: '#c3cbd9',
     A: '#5cd6a0',
-    B: '#b692f0',
-    C: '#7fc4e8',
-    D: '#a9b4c7',
-    F: '#ff7b8a'
+    B: '#d38bff',
+    C: '#4aa8f0',
+    D: '#9aa3b5',
+    F: '#ff5f73'
   };
 
   var el = null;
@@ -251,7 +259,7 @@
     if (!team && position === 1 && !idle) classes.push('leader');
 
     var cells =
-      '<span class="cell acc">' + (judged > 0 ? num(play.accuracy, 1) + '%' : '\u2014') + '</span>' +
+      '<span class="cell acc">' + (judged > 0 ? num(play.accuracy, 2) + '%' : '\u2014') + '</span>' +
       '<span class="cell combo">' + (judged > 0 ? comboText(combo) : '\u2014') + '</span>' +
       '<span class="cell pp">' + (judged > 0 ? num(pp.current, 1) + 'pp' : '\u2014') + '</span>' +
       '<span class="cell score">' + int(play.score) + '</span>';

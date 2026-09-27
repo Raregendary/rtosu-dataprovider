@@ -128,10 +128,10 @@
     S: '#ffc44d',
     SH: '#c3cbd9',
     A: '#5cd6a0',
-    B: '#b692f0',
-    C: '#7fc4e8',
-    D: '#a9b4c7',
-    F: '#ff7b8a'
+    B: '#d38bff',
+    C: '#4aa8f0',
+    D: '#9aa3b5',
+    F: '#ff5f73'
   };
 
   function applyAccuracy(play) {

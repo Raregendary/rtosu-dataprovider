@@ -184,6 +184,21 @@ pub fn read_live_time(memory: &ProcessMemory, play_time_addr: Option<u64>) -> i3
     }
 }
 
+/// Read only the beatmap checksum from an already resolved beatmap pointer.
+///
+/// Cheap enough to poll every tick, which is what lets a map change be detected
+/// when osu! keeps the same beatmap object and only swaps its contents.
+pub fn read_beatmap_checksum(
+    memory: &ProcessMemory,
+    beatmap_addr: u64,
+    pointer_width: usize,
+) -> String {
+    if beatmap_addr == 0 {
+        return String::new();
+    }
+    read_net_string(memory, beatmap_addr, 0x6C, pointer_width).unwrap_or_default()
+}
+
 /// Read beatmap details from an already resolved beatmap pointer address.
 pub fn read_beatmap_from_ptr(
     memory: &ProcessMemory,
@@ -590,8 +605,7 @@ pub fn populate_beatmap_statistics_with_diff(
     snapshot.stats.cs.original = map.cs;
     snapshot.stats.od.original = map.od;
     snapshot.stats.hp.original = map.hp;
-    snapshot.stats.ar.converted =
-        round_value(calculate_converted_ar(map.ar, mods, clock_rate), 2);
+    snapshot.stats.ar.converted = round_value(calculate_converted_ar(map.ar, mods, clock_rate), 2);
     snapshot.stats.cs.converted = round_value(calculate_converted_cs(map.cs, mods), 2);
     snapshot.stats.od.converted = round_value(
         calculate_converted_od(map.od, mods, clock_rate, map.mode as u8),
@@ -746,10 +760,21 @@ mod tests {
         let ar_dt = round_value(calculate_converted_ar(9.0, 64, 1.5), 2);
         assert_eq!(ar_dt, 10.33);
 
-        let test_map = rosu_pp::Beatmap::from_bytes(b"osu file format v14\n[TimingPoints]\n0,500,4,1,0,100,1,1\n").unwrap();
-        let kiai = test_map.effect_points.iter().rev().find(|ep| ep.time <= 10.0).map_or(false, |ep| ep.kiai);
+        let test_map = rosu_pp::Beatmap::from_bytes(
+            b"osu file format v14\n[TimingPoints]\n0,500,4,1,0,100,1,1\n",
+        )
+        .unwrap();
+        let kiai = test_map
+            .effect_points
+            .iter()
+            .rev()
+            .find(|ep| ep.time <= 10.0)
+            .map_or(false, |ep| ep.kiai);
         assert!(kiai);
-        let is_break = test_map.breaks.iter().any(|b| 10.0 >= b.start_time && 10.0 <= b.end_time);
+        let is_break = test_map
+            .breaks
+            .iter()
+            .any(|b| 10.0 >= b.start_time && 10.0 <= b.end_time);
         assert!(!is_break);
     }
 }

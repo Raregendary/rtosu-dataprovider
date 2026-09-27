@@ -267,45 +267,43 @@ body {
 
 /* --- column headings --- */
 
-.colheads {
-  display: flex;
-  flex: 0 0 auto;
-  justify-content: space-between;
-  align-items: center;
+/* Every row and the heading strip share one grid template, so each heading
+ * sits exactly over its column and both sides stay right-anchored. */
+.colheads,
+.row {
+  display: grid;
+  grid-template-columns: 16px 12px 1fr 18px 48px 58px 56px 80px;
   gap: 6px;
+  align-items: center;
+}
+
+.colheads {
+  flex: 0 0 auto;
   padding: 0 8px 0 11px;
-}
-
-.colheads[hidden] {
-  display: none;
-}
-
-.ch {
   font-size: 9px;
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: #6d7486;
 }
 
-/* Mirrors the row's stat cells exactly, gap included, so every heading sits
- * over its own column and both sides are right-anchored. */
-.ch.tail {
-  display: flex;
-  gap: 6px;
+.colheads[hidden] {
+  display: none;
 }
 
-.ch-cell {
-  width: 48px;
-  text-align: right;
+/* Covers rank, tag, player and grade so the four stat labels below land on the
+ * same columns as the numbers. */
+.ch {
+  grid-column: 1 / span 4;
   white-space: nowrap;
 }
 
-.ch-cell:nth-child(3) {
-  width: 56px;
+.ch.tail {
+  display: contents;
 }
 
-.ch-cell:nth-child(4) {
-  width: 80px;
+.ch-cell {
+  text-align: right;
+  white-space: nowrap;
 }
 
 /* --- player board --- */
@@ -326,14 +324,11 @@ body {
 }
 
 .row {
-  display: flex;
   flex: 1 1 0;
   /* Rows share the leftover height so a short roster leaves no dead space. */
   min-height: 20px;
   max-height: 40px;
-  align-items: center;
-  gap: 6px;
-  padding: 3px 8px;
+  padding: 3px 8px 3px 11px;
   border-radius: 6px;
   background: rgba(16, 19, 25, 0.72);
   border-left: 3px solid transparent;
@@ -359,8 +354,6 @@ body.ffa .row.leader {
 }
 
 .rank {
-  flex: 0 0 auto;
-  width: 16px;
   font-size: 10px;
   font-weight: 700;
   color: #6d7486;
@@ -369,8 +362,6 @@ body.ffa .row.leader {
 
 /* Small team tag so the colour is not the only cue. */
 .tag {
-  flex: 0 0 auto;
-  width: 12px;
   font-size: 9px;
   font-weight: 700;
   text-align: center;
@@ -389,7 +380,6 @@ body.ffa .tag {
 }
 
 .player {
-  flex: 1 1 auto;
   min-width: 0;
   font-size: 12px;
   font-weight: 600;
@@ -399,38 +389,25 @@ body.ffa .tag {
 }
 
 .grade {
-  flex: 0 0 auto;
-  width: 18px;
   font-size: 11px;
   font-weight: 700;
   text-align: center;
 }
 
 .cell {
-  flex: 0 0 auto;
   font-size: 11px;
   color: #b6bdcd;
   font-variant-numeric: tabular-nums;
   text-align: right;
+  white-space: nowrap;
+  overflow: hidden;
 }
 
-.cell.acc {
-  width: 48px;
-}
-
-/* Wide enough for "124/2110" as well as a bare combo. */
-.cell.combo {
-  width: 58px;
-}
-
-/* Wide enough for "433.9pp". */
 .cell.pp {
-  width: 56px;
   color: #e7e9ee;
 }
 
 .cell.score {
-  width: 80px;
   font-weight: 600;
 }
 

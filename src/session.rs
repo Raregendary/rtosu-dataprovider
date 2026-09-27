@@ -1589,13 +1589,27 @@ impl SoloSession {
                     }
                 } else {
                     let beatmap_ptr_changed = beatmap_addr != self.cached_beatmap_ptr;
+                    // osu! can select a different map while keeping the same
+                    // beatmap object, so a stable pointer does not mean a stable
+                    // map. Comparing the checksum is a single string read, and it
+                    // is what stops a tournament overlay from being left showing
+                    // "no beatmap" after the map changes.
+                    let live_checksum = crate::beatmap::read_beatmap_checksum(
+                        memory,
+                        beatmap_addr,
+                        self.pointer_width,
+                    );
+                    let beatmap_changed = beatmap_ptr_changed
+                        || (!live_checksum.is_empty() && live_checksum != self.current_checksum);
                     let active_mods = self.cached_packet.play.mods.number;
                     #[cfg(feature = "pp")]
                     let mods_changed =
                         self.cached_mods != active_mods || self.cached_difficulty_attrs.is_none();
 
-                    if beatmap_ptr_changed {
-                        self.cached_beatmap_ptr = beatmap_addr;
+                    if beatmap_changed {
+                        if beatmap_ptr_changed {
+                            self.cached_beatmap_ptr = beatmap_addr;
+                        }
                         if let Ok(mut bm) = crate::beatmap::read_beatmap_from_ptr(
                             memory,
                             beatmap_addr,
