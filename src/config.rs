@@ -27,6 +27,12 @@ pub struct ServerConfig {
     pub enable_websocket: bool,
     /// Enable HTTP REST endpoints on /json/v2, /json, and /health
     pub enable_http: bool,
+    /// Serve user-supplied, tosu v2 API compatible browser overlays from a
+    /// directory of overlay folders and render a dashboard to browse them
+    pub enable_overlays: bool,
+    /// Directory containing one subfolder per browser overlay, each with an
+    /// index.html. Relative paths resolve against the working directory.
+    pub overlays_dir: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -86,6 +92,8 @@ impl Default for ServerConfig {
             cors_allow_all: true,
             enable_websocket: true,
             enable_http: true,
+            enable_overlays: true,
+            overlays_dir: "browser_overlays".to_string(),
         }
     }
 }
@@ -150,6 +158,16 @@ impl AppConfig {
     pub fn validate(&self) -> Result<()> {
         if self.server.port < 1024 {
             anyhow::bail!("server.port must be >= 1024 (got {})", self.server.port);
+        }
+        if self.server.enable_overlays {
+            if !self.server.enable_http {
+                anyhow::bail!(
+                    "server.enable_overlays requires server.enable_http = true; overlay pages and assets are served over HTTP"
+                );
+            }
+            if self.server.overlays_dir.trim().is_empty() {
+                anyhow::bail!("server.overlays_dir must not be empty when overlays are enabled");
+            }
         }
         if self.poll.poll_rate_hz == 0 || self.poll.poll_rate_hz > 1000 {
             anyhow::bail!(
@@ -232,6 +250,20 @@ enable_websocket = true
 # Enable HTTP REST endpoints on http://<host>:<port>/json/v2 and /health
 # Default: true
 enable_http = true
+
+# Serve browser overlays from a local directory.
+# Every subfolder containing an index.html is treated as one overlay and served
+# at http://<host>:<port>/overlays/<folder>/, which is the URL to paste into an
+# OBS "Browser" source. Drop-in tosu v2 overlays work unmodified: the server
+# injects a compatibility shim that points their API calls back at this server.
+# Requires enable_http = true.
+# Default: true
+enable_overlays = true
+
+# Directory holding one subfolder per browser overlay.
+# Relative paths resolve against the current working directory.
+# Default: "browser_overlays"
+overlays_dir = "browser_overlays"
 
 
 [poll]

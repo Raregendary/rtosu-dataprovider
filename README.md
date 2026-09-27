@@ -7,7 +7,7 @@
 
 A lightweight native Rust data provider emitting **[tosu](https://github.com/KotRikD/tosu)**-compatible `v2` JSON and WebSocket feeds for osu!.
 
-> ⚠️ **Note**: This is **strictly a data provider**, not a full tosu client replacement. It does not include built-in browser overlays, in-game overlay rendering, or stream elements. It is built for developers and users who need raw, low-overhead memory data without the bloatware of a full Electron application.
+> ⚠️ **Note**: This is primarily a **data provider**, not a full tosu client replacement. It does not bundle its own overlay designs — instead it serves **any** tosu v2 compatible browser overlay you drop into `browser_overlays/`. It also does not include in-game overlay rendering or stream elements. It is built for developers and users who need raw, low-overhead memory data without the bloatware of a full Electron application.
 
 ---
 
@@ -18,6 +18,7 @@ A lightweight native Rust data provider emitting **[tosu](https://github.com/Kot
 - **tosu v2 Compatible**: Serves the exact tosu v2 JSON payload on `GET /json/v2` and broadcasts 60 Hz real-time state updates over `WS /websocket/v2`.
 - **Solo & Tournament Support**: Supports both standard gameplay and multi-client tournament setups (3v3, 4v4, etc.) with automatic team splitting (`left` / `right`), score aggregation, and `#multiplayer` chat extraction.
 - **Modern Performance Calculation**: Built-in gradual PP calculation powered by `rosu-pp` with modern Combo Scaling Removal (CSR) rework support.
+- **Browser Overlay Hosting**: Serves any tosu v2 compatible overlay dropped into `browser_overlays/`, with a dashboard to browse them and a compatibility shim so drop-in overlays work unmodified.
 
 ---
 
@@ -28,6 +29,12 @@ A lightweight native Rust data provider emitting **[tosu](https://github.com/Kot
   - `GET /json/v2/precise` — High-precision JSON endpoint.
   - `WS /websocket/v2` — 60 Hz real-time WebSocket state stream.
   - `GET /health` — Service health check.
+  - `GET /files/beatmap/background` — Current beatmap background, for overlays.
+- **Browser Overlays**:
+  - `GET /overlays` — Dashboard listing every overlay found in `browser_overlays/`.
+  - `GET /overlays/<folder>/` — The overlay itself; paste this URL into an OBS **Browser** source.
+  - Automatic shim injection rewrites tosu API calls (`ws://127.0.0.1:24050/ws`, `/websocket/v2`, `/backgroundImage`, `/Songs/...`) onto the page's own origin, so drop-in overlays need no edits.
+  - Live directory re-scan: drop a folder in mid-session and it appears without a restart.
 - **Solo Gameplay State**:
   - Live score, accuracy, current combo, max combo, HP, and smooth HP bar.
   - Hit counts: 300, 100, 50, misses, geki, katu.
@@ -77,6 +84,21 @@ cargo run --release -- serve --port 24050
 cargo run --release -- --config ./my-config.toml serve
 ```
 
+### Browser Overlays
+
+Put each tosu v2 compatible overlay in its own folder under `browser_overlays/`
+(a folder counts as an overlay as soon as it contains an `index.html`), then
+open the dashboard:
+
+```
+http://127.0.0.1:24050/overlays/
+```
+
+Copy a card's URL into an OBS **Browser** source. Drop-in overlays that hardcode
+a tosu address keep working — the server injects a compatibility shim into each
+page that redirects those calls back to itself. See
+[`browser_overlays/README.md`](browser_overlays/README.md) for details.
+
 ---
 
 ## ⚙️ Configuration (`config.toml`)
@@ -90,6 +112,8 @@ port = 24050              # Drop-in tosu port (1024-65535)
 cors_allow_all = true     # Permissive CORS headers for browser overlays
 enable_websocket = true   # Mount /websocket/v2 stream
 enable_http = true        # Mount /json/v2 and /health REST endpoints
+enable_overlays = true    # Serve overlays from overlays_dir (needs enable_http)
+overlays_dir = "browser_overlays"  # One subfolder per overlay, each with index.html
 
 [poll]
 poll_rate_hz = 60         # 60 Hz = ~16.6ms update interval (1-1000 Hz)

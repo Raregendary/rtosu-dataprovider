@@ -558,6 +558,34 @@ fn execute(
     Ok(())
 }
 
+/// Resolve the configured browser-overlay directory, creating it when missing.
+///
+/// Returns `None` when overlays are disabled, which keeps the overlay routes
+/// off the router entirely rather than serving an empty dashboard.
+fn resolve_overlays_dir(config: &AppConfig) -> Option<std::path::PathBuf> {
+    if !config.server.enable_overlays {
+        return None;
+    }
+
+    let dir = std::path::PathBuf::from(&config.server.overlays_dir);
+    if !dir.is_dir() {
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            tracing::error!(
+                "failed to create browser overlays directory {}: {err:#}; browser overlays are disabled",
+                dir.display()
+            );
+            return None;
+        }
+        tracing::info!(
+            "Created browser overlays directory {}; drop an overlay folder in and it will appear at {}",
+            dir.display(),
+            rtosu_dataprovider::overlays::OVERLAYS_BASE
+        );
+    }
+
+    Some(dir)
+}
+
 async fn run_serve_loop(
     host: &str,
     port: u16,
@@ -570,6 +598,7 @@ async fn run_serve_loop(
     let enable_http = config.server.enable_http;
     let enable_ws = config.server.enable_websocket;
     let cors_allow_all = config.server.cors_allow_all;
+    let overlays_dir = resolve_overlays_dir(&config);
 
     let listener = if enable_http || enable_ws {
         match rtosu_dataprovider::server::bind_listener(host, port).await {
@@ -612,12 +641,14 @@ async fn run_serve_loop(
     };
 
     if let Some(listener) = listener {
+        let server_overlays_dir = overlays_dir.clone();
         tokio::spawn(async move {
             if let Err(e) = rtosu_dataprovider::server::serve_with_listener(
                 listener,
                 enable_http,
                 enable_ws,
                 cors_allow_all,
+                server_overlays_dir,
                 rx,
             )
             .await
@@ -659,6 +690,19 @@ async fn run_serve_loop(
             println!(
                 "   - WebSocket Stream: ws://{}:{}/websocket/v2",
                 display_host, port
+            );
+        }
+        if enable_http && let Some(dir) = overlays_dir.as_ref() {
+            println!(" Browser Overlays:");
+            println!(
+                "   - Dashboard:        http://{}:{}{}/",
+                display_host,
+                port,
+                rtosu_dataprovider::overlays::OVERLAYS_BASE
+            );
+            println!("   - Overlay folder:  {}", dir.display());
+            println!(
+                "     (add any tosu v2 overlay folder containing an index.html; use its URL as an OBS Browser source)"
             );
         }
     } else {

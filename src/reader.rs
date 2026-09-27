@@ -297,10 +297,7 @@ impl OsuReaderStream {
     }
 }
 
-pub fn format_tourney_packet(
-    snap: &TournamentSnapshot,
-    enable_hit_errors: bool,
-) -> TosuV2Packet {
+pub fn format_tourney_packet(snap: &TournamentSnapshot, enable_hit_errors: bool) -> TosuV2Packet {
     let mut packet = TosuV2Packet {
         client: "stable".to_string(),
         server: "ppy.sh".to_string(),
@@ -368,10 +365,10 @@ pub fn format_tourney_packet(
         if !enable_hit_errors {
             play.hit_error_array = std::sync::Arc::default();
         }
-        if play.rank.current.is_empty() {
-            play.rank.current = "XH".to_string();
-            play.rank.max_this_play = "XH".to_string();
-        }
+        // An empty rank means gameplay state could not be read at all. Leave it
+        // empty rather than inventing a grade: a fabricated "XH" reports a
+        // silver perfect on every client, including ones that are merely idle
+        // or unreadable. Overlays decide what to show for an absent grade.
         if let Some(ref pp) = client.pp {
             play.pp = pp.clone();
         }

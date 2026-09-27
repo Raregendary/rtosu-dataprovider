@@ -27,6 +27,20 @@ enable_websocket = true
 # Default: true
 enable_http = true
 
+# Serve browser overlays from a local directory.
+# Every subfolder containing an index.html is treated as one overlay and served
+# at http://<host>:<port>/overlays/<folder>/, which is the URL to paste into an
+# OBS "Browser" source. Drop-in tosu v2 overlays work unmodified: the server
+# injects a compatibility shim that points their API calls back at this server.
+# Requires enable_http = true.
+# Default: true
+enable_overlays = true
+
+# Directory holding one subfolder per browser overlay.
+# Relative paths resolve against the current working directory.
+# Default: "browser_overlays"
+overlays_dir = "browser_overlays"
+
 
 [poll]
 # Polling update frequency in Hertz (updates per second).

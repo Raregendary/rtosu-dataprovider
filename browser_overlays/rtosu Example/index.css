@@ -1,0 +1,286 @@
+/* rtosu Example overlay.
+ *
+ * Fully transparent: the panel has no fill, border, or shadow, so only the
+ * stat cards float over the stream. The map art is stretched across the whole
+ * header as a cover banner.
+ *
+ * Sizing follows the Resolution in metadata.txt (420x230).
+ */
+
+:root {
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body {
+  width: 420px;
+  height: 230px;
+  overflow: hidden;
+  background: transparent;
+  font: 14px/1.3 "Segoe UI", system-ui, sans-serif;
+  color: #e7e9ee;
+  -webkit-font-smoothing: antialiased;
+}
+
+.panel {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 420px;
+  height: 230px;
+  padding: 8px;
+}
+
+/* --- map banner --- */
+
+.banner {
+  display: flex;
+  /* Grows to absorb the leftover height so the art fills the whole element. */
+  flex: 1 1 auto;
+  min-height: 76px;
+  align-items: flex-end;
+  padding: 8px 10px;
+  border-radius: 10px;
+  /* Filled in by JS with the loaded map's background. */
+  background: #161a22 center/cover no-repeat;
+  /* Scrim so the text stays readable over any artwork. */
+  position: relative;
+  isolation: isolate;
+}
+
+.banner::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  border-radius: inherit;
+  background: linear-gradient(
+    to top,
+    rgba(8, 10, 14, 0.92) 0%,
+    rgba(8, 10, 14, 0.55) 45%,
+    rgba(8, 10, 14, 0.2) 100%
+  );
+}
+
+.banner-text {
+  min-width: 0;
+}
+
+.artist {
+  font-size: 10px;
+  color: #aab2c4;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.title {
+  font-size: 15px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.7);
+}
+
+.diff {
+  font-size: 11px;
+  font-weight: 600;
+}
+
+/* --- stat cards --- */
+
+.stats {
+  display: grid;
+  flex: 0 0 auto;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+}
+
+/* A tournament client list takes the place of the hit counts. */
+body.tournament .stats.hits {
+  display: none;
+}
+
+.stat {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 5px 8px;
+  border-radius: 7px;
+  background: rgba(16, 19, 25, 0.72);
+  backdrop-filter: blur(2px);
+}
+
+/* Keep the stat cards a uniform height even if a value is wide. */
+.stat {
+  justify-content: center;
+}
+
+.label {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #8b93a7;
+}
+
+/* Judgement labels read as counts, not headings. Uppercasing turned "50s" into
+ * "50S", which is easy to misread as "505" at a distance. */
+.label-plain {
+  text-transform: none;
+  letter-spacing: 0;
+  font-size: 10px;
+}
+
+/* The plural marker is set smaller so it never competes with the digits. */
+.unit {
+  font-size: 7.5px;
+  font-weight: 600;
+  color: #6d7486;
+}
+
+.value {
+  font-size: 16px;
+  font-weight: 600;
+  line-height: 1.25;
+  font-variant-numeric: tabular-nums;
+  /* Two numbers must never wrap, or the row heights drift apart. */
+  white-space: nowrap;
+}
+
+/* Combo carries two numbers, so it needs a little less type. */
+.stat-combo .value {
+  font-size: 14px;
+}
+
+/* osu! judgement colours */
+.hit-100 .value {
+  color: #5cd6a0;
+}
+
+.hit-50 .value {
+  color: #5c9dd6;
+}
+
+.hit-miss .value {
+  color: #ff7b8a;
+}
+
+/* A miss count of zero should not shout. */
+.hit-miss.quiet .value {
+  color: #6b7280;
+}
+
+/* Accuracy is coloured by the current grade, which JS sets inline. The
+ * ungraded state keeps the default text colour. */
+.hit-acc .value {
+  color: #e7e9ee;
+}
+
+.hit-acc.graded .value {
+  color: inherit;
+}
+
+/* --- tournament client list --- */
+
+.tourney {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 3px;
+  min-height: 0;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: rgba(16, 19, 25, 0.72);
+}
+
+.tourney[hidden] {
+  display: none;
+}
+
+.tourney-title {
+  flex: 0 0 auto;
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: #8b93a7;
+}
+
+.tourney-title .count {
+  color: #b6bdcd;
+}
+
+.players {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 2px;
+  min-height: 0;
+  overflow: hidden;
+  /* A tournament can have more players than fit, so fade the cut-off row
+   * instead of slicing a row in half. */
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 12px), transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 12px), transparent 100%);
+}
+
+.player {
+  display: grid;
+  flex: 0 0 auto;
+  grid-template-columns: 1fr auto auto;
+  gap: 10px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.player .name {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Marks the client whose play the top row is showing. */
+.player .featured {
+  color: #ffb26b;
+  margin-right: 3px;
+}
+
+/* --- footer --- */
+
+.footer {
+  display: flex;
+  flex: 0 0 auto;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  padding: 0 2px;
+  font-size: 11px;
+  color: #8b93a7;
+}
+
+.state {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
+}
+
+.state.offline {
+  color: #e05c6e;
+}
+
+/* No mod selected is not a mod, so nothing is shown. */
+.mods {
+  flex: 0 0 auto;
+  color: #ffb26b;
+  font-weight: 600;
+}
+
+.mods[hidden] {
+  display: none;
+}

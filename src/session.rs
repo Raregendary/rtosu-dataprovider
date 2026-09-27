@@ -242,14 +242,21 @@ impl TournamentSession {
 
         for client in self.clients.values_mut() {
             let mut beatmap = if let Some(base_addr) = client.base_pattern_addr {
-                if let Ok(beatmap_addr) = crate::beatmap::read_beatmap_ptr(&client.memory, base_addr) {
+                if let Ok(beatmap_addr) =
+                    crate::beatmap::read_beatmap_ptr(&client.memory, base_addr)
+                {
                     if beatmap_addr == 0 {
                         client.cached_beatmap_ptr = 0;
                         client.cached_beatmap_snapshot = None;
                         None
                     } else {
-                        let live_time = crate::beatmap::read_live_time(&client.memory, client.play_time_pattern_addr);
-                        if beatmap_addr == client.cached_beatmap_ptr && client.cached_beatmap_snapshot.is_some() {
+                        let live_time = crate::beatmap::read_live_time(
+                            &client.memory,
+                            client.play_time_pattern_addr,
+                        );
+                        if beatmap_addr == client.cached_beatmap_ptr
+                            && client.cached_beatmap_snapshot.is_some()
+                        {
                             let mut bm = client.cached_beatmap_snapshot.clone().unwrap();
                             bm.time.live = live_time;
                             Some(bm)
@@ -297,8 +304,7 @@ impl TournamentSession {
                     client.cached_hit_errors = Arc::default();
                     client.cached_unstable_rate = 0.0;
                 }
-                if beatmap_ref.checksum != self.current_checksum
-                    && !beatmap_ref.checksum.is_empty()
+                if beatmap_ref.checksum != self.current_checksum && !beatmap_ref.checksum.is_empty()
                 {
                     self.current_checksum = beatmap_ref.checksum.clone();
                     self.cached_stats_by_mods.clear();
@@ -312,26 +318,41 @@ impl TournamentSession {
                             let mods_legacy = crate::pp::calculator::parse_mods_bits(0);
                             let diff = rosu_pp::Difficulty::new().mods(mods_legacy).calculate(&map);
                             let mut temp_snap = beatmap.as_ref().cloned().unwrap_or_default();
-                            crate::beatmap::populate_beatmap_statistics_with_diff(&mut temp_snap, &map, &diff, 0);
+                            crate::beatmap::populate_beatmap_statistics_with_diff(
+                                &mut temp_snap,
+                                &map,
+                                &diff,
+                                0,
+                            );
                             temp_snap.stats.stars.live = 0.0;
                             self.cached_stats = temp_snap.stats;
-                            self.cached_accuracy = crate::pp::calculator::calc_accuracy_table_from_diff(&diff);
-                            let first_obj = beatmap.as_ref().map_or(temp_snap.time.first_object, |b| {
-                                if b.time.first_object > 0 { b.time.first_object } else { temp_snap.time.first_object }
-                            });
-                            let last_obj = beatmap.as_ref().map_or(temp_snap.time.last_object, |b| {
-                                if b.time.last_object > 0 { b.time.last_object } else { temp_snap.time.last_object }
-                            });
+                            self.cached_accuracy =
+                                crate::pp::calculator::calc_accuracy_table_from_diff(&diff);
+                            let first_obj =
+                                beatmap.as_ref().map_or(temp_snap.time.first_object, |b| {
+                                    if b.time.first_object > 0 {
+                                        b.time.first_object
+                                    } else {
+                                        temp_snap.time.first_object
+                                    }
+                                });
+                            let last_obj =
+                                beatmap.as_ref().map_or(temp_snap.time.last_object, |b| {
+                                    if b.time.last_object > 0 {
+                                        b.time.last_object
+                                    } else {
+                                        temp_snap.time.last_object
+                                    }
+                                });
                             let mp3_len = beatmap.as_ref().map_or(temp_snap.time.mp3_length, |b| {
-                                if b.time.mp3_length > 0 { b.time.mp3_length } else { temp_snap.time.mp3_length }
+                                if b.time.mp3_length > 0 {
+                                    b.time.mp3_length
+                                } else {
+                                    temp_snap.time.mp3_length
+                                }
                             });
-                            self.cached_graph = performance_graph(
-                                &map,
-                                0,
-                                first_obj,
-                                last_obj,
-                                mp3_len,
-                            );
+                            self.cached_graph =
+                                performance_graph(&map, 0, first_obj, last_obj, mp3_len);
                             self.cached_beatmap = Some(map);
                         }
                     }
@@ -367,7 +388,8 @@ impl TournamentSession {
                 }
             }
             let need_ruleset = client.ruleset_container_addr.is_none();
-            let need_user = client.ipc_id.is_some() && client.spectating_user_pattern_addr.is_none();
+            let need_user =
+                client.ipc_id.is_some() && client.spectating_user_pattern_addr.is_none();
             if (need_ruleset || need_user)
                 && client.last_pattern_retry.elapsed() >= std::time::Duration::from_millis(2000)
             {
@@ -381,9 +403,16 @@ impl TournamentSession {
                     .ok();
                 }
                 if need_user {
-                    if let Ok((user_pat_src, user_pat_off)) = self.profile.pattern("spectating_user_ptr") {
+                    if let Ok((user_pat_src, user_pat_off)) =
+                        self.profile.pattern("spectating_user_ptr")
+                    {
                         if let Ok(user_pat) = BytePattern::parse(user_pat_src) {
-                            if let Ok(matches) = client.memory.scan_pattern(&user_pat, None, 1, self.scan_limit_bytes) {
+                            if let Ok(matches) = client.memory.scan_pattern(
+                                &user_pat,
+                                None,
+                                1,
+                                self.scan_limit_bytes,
+                            ) {
                                 if let Some(&first) = matches.first() {
                                     if let Ok(addr) = checked_add_signed(first, user_pat_off) {
                                         client.spectating_user_pattern_addr = Some(addr);
@@ -420,9 +449,12 @@ impl TournamentSession {
                             } else {
                                 None
                             };
-                            if let Ok(chat) =
-                                read_tournament_chat(&client.memory, chat_pat, &spectator_teams, cached)
-                            {
+                            if let Ok(chat) = read_tournament_chat(
+                                &client.memory,
+                                chat_pat,
+                                &spectator_teams,
+                                cached,
+                            ) {
                                 client.cached_chat_size = chat.len();
                                 client.cached_chat = chat.clone();
                                 tourney.chat = chat;
@@ -469,7 +501,10 @@ impl TournamentSession {
 
                 let user = if let Some(user_pat) = client.spectating_user_pattern_addr {
                     if let Ok(user_addr) = client.memory.read_indirect_pointer(user_pat) {
-                        if user_addr != 0 && user_addr == client.cached_user_ptr && client.cached_user.is_some() {
+                        if user_addr != 0
+                            && user_addr == client.cached_user_ptr
+                            && client.cached_user.is_some()
+                        {
                             client.cached_user.clone()
                         } else if user_addr != 0 {
                             client.cached_user_ptr = user_addr;
@@ -527,7 +562,10 @@ impl TournamentSession {
                         } else if let Some(stats) = self.cached_stats_by_mods.get(&diff_mods) {
                             beatmap.stats = stats.clone();
                         } else {
-                            let mut temp = self.cached_metadata.clone().unwrap_or_else(|| beatmap.clone());
+                            let mut temp = self
+                                .cached_metadata
+                                .clone()
+                                .unwrap_or_else(|| beatmap.clone());
                             crate::beatmap::populate_beatmap_statistics(&mut temp, map, diff_mods);
                             let stats = temp.stats;
                             self.cached_stats_by_mods.insert(diff_mods, stats.clone());
@@ -551,7 +589,15 @@ impl TournamentSession {
                         );
                         let (combo, n300, n100, n50, n0) = gameplay
                             .as_ref()
-                            .map(|g| (g.combo as u32, g.hit_300 as u32, g.hit_100 as u32, g.hit_50 as u32, g.hit_miss as u32))
+                            .map(|g| {
+                                (
+                                    g.combo as u32,
+                                    g.hit_300 as u32,
+                                    g.hit_100 as u32,
+                                    g.hit_50 as u32,
+                                    g.hit_miss as u32,
+                                )
+                            })
                             .unwrap_or((0, 0, 0, 0, 0));
                         let pp = crate::pp::calculator::calc_detailed_live_and_fc_pp(
                             &chunks,
@@ -582,7 +628,9 @@ impl TournamentSession {
                 #[cfg(not(feature = "pp"))]
                 let live_pp: Option<crate::pp::LivePpResult> = None;
 
-                let is_playing = gameplay.as_ref().map_or(false, |g| g.combo > 0 || (g.hit_300 + g.hit_100 + g.hit_50 + g.hit_miss) > 0);
+                let is_playing = gameplay.as_ref().map_or(false, |g| {
+                    g.combo > 0 || (g.hit_300 + g.hit_100 + g.hit_50 + g.hit_miss) > 0
+                });
                 if !is_playing {
                     if let Some(b) = beatmap.as_mut() {
                         b.stats.stars.live = 0.0;
@@ -613,7 +661,8 @@ impl TournamentSession {
         }
 
         // Propagate ranked status from manager beatmap (valid status range: 1..=7)
-        let manager_status = self.clients
+        let manager_status = self
+            .clients
             .values()
             .find(|c| c.is_manager || c.ipc_id.is_none())
             .and_then(|c| c.cached_beatmap_snapshot.as_ref())
@@ -664,10 +713,9 @@ impl TournamentSession {
                             .rev()
                             .find(|ep| ep.time <= live_f)
                             .map_or(false, |ep| ep.kiai);
-                        b.is_break = map
-                            .breaks
-                            .iter()
-                            .any(|b_break| live_f >= b_break.start_time && live_f <= b_break.end_time);
+                        b.is_break = map.breaks.iter().any(|b_break| {
+                            live_f >= b_break.start_time && live_f <= b_break.end_time
+                        });
                     }
                 }
             }
@@ -750,12 +798,9 @@ impl TournamentSession {
             || (!is_spectator && (command_line.contains("-go") || command_line.contains("/go")));
 
         // Scan rulesets_addr pattern to find container pointer address
-        let ruleset_container_addr = crate::client::resolve_ruleset_container(
-            &memory,
-            &self.profile,
-            self.scan_limit_bytes,
-        )
-        .ok();
+        let ruleset_container_addr =
+            crate::client::resolve_ruleset_container(&memory, &self.profile, self.scan_limit_bytes)
+                .ok();
 
         // If spectator, scan spectating_user_ptr
         let mut spectating_user_pattern_addr = None;
@@ -925,7 +970,9 @@ fn performance_graph(
     let mp3_time = if mp3_length > 0 {
         mp3_length as f64
     } else {
-        map.hit_objects.last().map_or(first_obj_time, |o| o.start_time)
+        map.hit_objects
+            .last()
+            .map_or(first_obj_time, |o| o.start_time)
     };
     let total_time = mp3_time / clock_rate;
 
@@ -1180,6 +1227,10 @@ pub struct SoloSession {
     cached_results_hits: (u32, u32, u32, u32, u32, u32),
     #[cfg(feature = "pp")]
     cached_results_pp: Option<crate::pp::LivePpResult>,
+    /// (beatmap id, mods) the menu PP was last computed for, so it is only
+    /// recalculated when the map or mods change.
+    #[cfg(feature = "pp")]
+    cached_idle_pp_key: Option<(u32, u32)>,
     cached_beatmap_metadata: crate::beatmap::BeatmapSnapshot,
     #[cfg(feature = "pp")]
     cached_stats: crate::beatmap::BeatmapStats,
@@ -1245,6 +1296,8 @@ impl SoloSession {
             cached_results_hits: (0, 0, 0, 0, 0, 0),
             #[cfg(feature = "pp")]
             cached_results_pp: None,
+            #[cfg(feature = "pp")]
+            cached_idle_pp_key: None,
             cached_beatmap_metadata: crate::beatmap::BeatmapSnapshot::default(),
             #[cfg(feature = "pp")]
             cached_stats: crate::beatmap::BeatmapStats::default(),
@@ -1292,6 +1345,7 @@ impl SoloSession {
                     self.cached_difficulty_attrs = None;
                     self.cached_live_pp = None;
                     self.cached_results_pp = None;
+                    self.cached_idle_pp_key = None;
                     self.cached_mods = u32::MAX;
                 }
                 self.cached_packet.client = "none".to_string();
@@ -1516,10 +1570,8 @@ impl SoloSession {
                 && let Ok(mods_val) = memory.read_indirect_pointer(mods_addr)
             {
                 let mods_val = mods_val as u32;
-                self.cached_packet.play.mods = crate::v2::create_mods_state(
-                    mods_val,
-                    &crate::client::format_mods(mods_val),
-                );
+                self.cached_packet.play.mods =
+                    crate::v2::create_mods_state(mods_val, &crate::client::format_mods(mods_val));
             }
         }
 
@@ -1564,6 +1616,18 @@ impl SoloSession {
                                     bm.checksum != self.current_checksum && !bm.checksum.is_empty();
                                 if checksum_changed {
                                     self.current_checksum = bm.checksum.clone();
+                                    // `self.memory` is borrowed for this whole
+                                    // function, so write the disjoint fields in
+                                    // place rather than through a `&mut self` method.
+                                    clear_play_state_for_new_map(&mut self.cached_packet);
+                                    self.cached_gameplay_hits = (0, 0, 0, 0, 0, 0);
+                                    self.cached_results_hits = (0, 0, 0, 0, 0, 0);
+                                    self.cached_hit_errors = Arc::default();
+                                    self.cached_hit_errors_total_hits = 0;
+                                    self.cached_unstable_rate = 0.0;
+                                    self.cached_live_pp = None;
+                                    self.cached_results_pp = None;
+                                    self.cached_idle_pp_key = None;
                                     let osu_path = std::path::Path::new(&self.songs_folder)
                                         .join(&bm.folder)
                                         .join(&bm.filename);
@@ -1721,12 +1785,16 @@ impl SoloSession {
 
         // 8. Read gameplay or resultsScreen based on state
         if self.ruleset_container_addr.is_none() && can_scan {
-            self.ruleset_container_addr =
-                crate::client::resolve_ruleset_container(memory, &self.profile, self.scan_limit_bytes)
-                    .ok();
+            self.ruleset_container_addr = crate::client::resolve_ruleset_container(
+                memory,
+                &self.profile,
+                self.scan_limit_bytes,
+            )
+            .ok();
         }
 
-        let active_ruleset_addr = self.ruleset_container_addr
+        let active_ruleset_addr = self
+            .ruleset_container_addr
             .and_then(|addr| crate::client::read_active_ruleset(memory, addr));
 
         if current_state_num == 2 {
@@ -1989,7 +2057,157 @@ impl SoloSession {
             }
         }
 
+        // PP outside of active gameplay. The playing branch above owns PP while
+        // osu! is in state 2, and the results branch owns state 7, so this only
+        // fills in the menu and song select instead of reporting zeros. Cached on
+        // (beatmap, mods) because nothing here changes between ticks.
+        #[cfg(feature = "pp")]
+        if self.enable_pp
+            && current_state_num != 2
+            && current_state_num != 7
+            && let Some(map) = self.cached_beatmap.as_ref()
+        {
+            let beatmap_id = self.cached_packet.beatmap.id as u32;
+            let mods_bits = self.cached_packet.play.mods.number;
+
+            if self.cached_idle_pp_key != Some((beatmap_id, mods_bits)) {
+                let mods_legacy = crate::pp::calculator::parse_mods_bits(mods_bits);
+                let chunks = crate::pp::calculator::get_or_compute_gradual_chunks(
+                    beatmap_id,
+                    map,
+                    mods_legacy,
+                    self.gradual_pp_chunks,
+                );
+                if !chunks.is_empty() {
+                    // No objects judged outside gameplay, so current and
+                    // maxAchieved stay 0 while fc is the real value.
+                    let idle_pp = crate::pp::calculator::calc_detailed_live_and_fc_pp(
+                        &chunks,
+                        map.hit_objects.len(),
+                        mods_legacy,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    );
+                    self.cached_packet.play.pp = idle_pp;
+                }
+                self.cached_idle_pp_key = Some((beatmap_id, mods_bits));
+            }
+        }
+        // Entering gameplay or the results screen must not leave a stale menu
+        // PP in place, and the results screen must keep its own PP.
+        #[cfg(feature = "pp")]
+        if self.enable_pp && (current_state_num == 2 || current_state_num == 7) {
+            self.cached_idle_pp_key = None;
+        }
+
         crate::instr_scope!(PacketClone);
         Ok(self.cached_packet.clone())
+    }
+}
+
+/// Zero every play-derived field so a previous map cannot leak into the next.
+#[cfg(any(feature = "pp", test))]
+fn clear_play_state_for_new_map(packet: &mut crate::v2::TosuV2Packet) {
+    let play = &mut packet.play;
+    play.player_name.clear();
+    play.failed = false;
+    play.score = 0;
+    play.accuracy = 0.0;
+    play.health_bar = Default::default();
+    play.hits = Default::default();
+    play.hit_error_array = Arc::default();
+    play.combo = Default::default();
+    play.rank = Default::default();
+    play.unstable_rate = 0.0;
+    play.pp = Default::default();
+
+    let results = &mut packet.results_screen;
+    results.player_name.clear();
+    results.score = 0;
+    results.accuracy = 0.0;
+    results.hits = Default::default();
+    results.mods = Default::default();
+    results.max_combo = 0;
+    results.rank.clear();
+    results.pp.current = 0.0;
+    results.pp.fc = 0.0;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clear_play_state_for_new_map;
+    use crate::v2::TosuV2Packet;
+
+    /// A finished attempt, as the provider would hold it between plays.
+    fn played_packet() -> TosuV2Packet {
+        let mut packet = TosuV2Packet::default();
+        packet.play.player_name = "player".to_string();
+        packet.play.score = 1_234_567;
+        packet.play.accuracy = 98.7654;
+        packet.play.combo.current = 412;
+        packet.play.combo.max = 1103;
+        packet.play.hits.n300 = 1502;
+        packet.play.hits.n100 = 143;
+        packet.play.hits.n50 = 12;
+        packet.play.hits.n0 = 7;
+        packet.play.rank.current = "S".to_string();
+        packet.play.unstable_rate = 12.3456;
+        packet.play.health_bar.normal = 42.0;
+        packet.play.failed = true;
+        packet.results_screen.score = 1_234_567;
+        packet.results_screen.rank = "S".to_string();
+        packet.results_screen.max_combo = 1103;
+        packet
+    }
+
+    #[test]
+    fn new_map_clears_previous_play_state() {
+        let mut packet = played_packet();
+        clear_play_state_for_new_map(&mut packet);
+
+        assert_eq!(packet.play.score, 0);
+        assert_eq!(packet.play.accuracy, 0.0);
+        assert_eq!(packet.play.combo.current, 0);
+        assert_eq!(packet.play.combo.max, 0, "max combo is per map");
+        assert_eq!(packet.play.hits.n300, 0);
+        assert_eq!(packet.play.hits.n100, 0);
+        assert_eq!(packet.play.hits.n50, 0);
+        assert_eq!(packet.play.hits.n0, 0);
+        assert_eq!(packet.play.rank.current, "");
+        assert_eq!(packet.play.unstable_rate, 0.0);
+        assert_eq!(packet.play.health_bar.normal, 0.0);
+        assert!(!packet.play.failed);
+        assert!(packet.play.player_name.is_empty());
+    }
+
+    #[test]
+    fn new_map_clears_the_results_screen() {
+        let mut packet = played_packet();
+        clear_play_state_for_new_map(&mut packet);
+
+        assert_eq!(packet.results_screen.score, 0);
+        assert_eq!(packet.results_screen.rank, "");
+        assert_eq!(packet.results_screen.max_combo, 0);
+        assert_eq!(packet.results_screen.accuracy, 0.0);
+    }
+
+    #[test]
+    fn new_map_keeps_the_beatmap_and_mods() {
+        let mut packet = played_packet();
+        packet.beatmap.set = 4242;
+        packet.beatmap.title = "kept".to_string();
+        packet.play.mods.number = 40;
+        packet.play.mods.name = "HDDT".to_string();
+        clear_play_state_for_new_map(&mut packet);
+
+        // Mods are re-read from memory and PP is recalculated per map, so both
+        // must survive; the map metadata is unrelated to the previous attempt.
+        assert_eq!(packet.beatmap.set, 4242);
+        assert_eq!(packet.beatmap.title, "kept");
+        assert_eq!(packet.play.mods.number, 40);
+        assert_eq!(packet.play.mods.name, "HDDT");
     }
 }

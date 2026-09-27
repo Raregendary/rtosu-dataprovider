@@ -1,0 +1,8 @@
+Usecase: obs-overlay
+Name: rtosu Example
+Version: 1.0.0
+Author: rtosu-dataprovider
+CompatibleWith: tosu
+Resolution: 420x230
+Notes: Minimal example overlay that reads the tosu v2 WebSocket API. Copy this
+folder to write your own.

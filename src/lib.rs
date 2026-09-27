@@ -3,6 +3,7 @@ pub mod beatmap;
 pub mod client;
 pub mod config;
 pub mod logging;
+pub mod overlays;
 pub mod pattern;
 pub mod pp;
 pub mod process;

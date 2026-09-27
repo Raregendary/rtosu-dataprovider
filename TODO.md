@@ -72,6 +72,13 @@ Allow any existing tosu overlay, browser widget, or external tool to connect dir
   - [x] Port configurable in `config.toml` and CLI.
   - [x] Conditional route mounting for `enable_http` and `enable_websocket`.
   - [x] Zero-port bypass: when both are disabled, server skips binding any TCP socket or listener.
+- [x] **2.5. Browser Overlay Hosting**:
+  - [x] Serve any tosu v2 compatible overlay dropped into `browser_overlays/`, one folder per overlay.
+  - [x] Dashboard at `GET /overlays` listing every discovered overlay with its `metadata.txt`.
+  - [x] Compatibility shim injected into served HTML so drop-in overlays that hardcode a tosu
+        address work unmodified on any port or host.
+  - [x] Serve the tosu file endpoints overlays need (`/backgroundImage`, `/files/beatmap/background`).
+  - [x] Revalidatable responses (`Cache-Control: no-cache` + `ETag`) so overlay edits are picked up.
 - [x] **2.4. Production Structured Logging & Log Retention**:
   - [x] Tracing structured logging system respecting `[logging.level]`.
   - [x] Daily rolling log file writer emitting `logs/rtosu-YYYY-MM-DD.log`.
