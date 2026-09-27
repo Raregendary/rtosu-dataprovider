@@ -16,6 +16,8 @@ Benchmarks/
 # Validation harness & local test notes
 validations/
 validations.md
+fix.md
+audit.md
 
 # Logs & temp files
 logs/
