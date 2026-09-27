@@ -129,15 +129,83 @@ pub fn parse_spectate_client_arg(cmd: &str) -> Option<(usize, usize)> {
     None
 }
 
+/// Allocation-free tokenizer over a Windows command line.
+///
+/// Yields one borrowed `&str` per argument, quotes included, so a token can
+/// never be half of a quoted path. Double quotes open and close a quoted run
+/// and are kept in the emitted token, `""` inside a quoted run is one literal
+/// quote, and a backslash inside a quoted run escapes the character after it.
+///
+/// Simplification: Windows itself only treats a backslash as an escape when it
+/// is followed by one or more quotes, and counts a run of `2n` backslashes
+/// before a quote as `n` literal backslashes. This iterator escapes a
+/// backslash before *any* character and keeps the backslashes in the token,
+/// which covers the two shapes an osu! command line actually contains (paths
+/// with `\"` in them, and a quoted argument with an embedded quote).
+pub struct CommandLineTokens<'a> {
+    rest: &'a str,
+}
+
+impl<'a> CommandLineTokens<'a> {
+    pub fn new(cmd: &'a str) -> Self {
+        Self { rest: cmd }
+    }
+}
+
+impl<'a> Iterator for CommandLineTokens<'a> {
+    type Item = &'a str;
+
+    fn next(&mut self) -> Option<&'a str> {
+        let rest = self.rest;
+        let bytes = rest.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i == bytes.len() {
+            self.rest = "";
+            return None;
+        }
+        let start = i;
+        let mut in_quotes = false;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'"' if in_quotes && bytes.get(i + 1) == Some(&b'"') => i += 2,
+                b'"' => {
+                    in_quotes = !in_quotes;
+                    i += 1;
+                }
+                b'\\' if in_quotes && i + 1 < bytes.len() => i += 2,
+                c if c.is_ascii_whitespace() && !in_quotes => break,
+                _ => i += 1,
+            }
+        }
+        self.rest = &rest[i..];
+        Some(&rest[start..i])
+    }
+}
+
+const TOURNAMENT_MANAGER_FLAGS: [&str; 4] = ["-tourney", "/tourney", "-tournament", "/tournament"];
+
 /// Whether the command line marks osu! as a tournament manager.
 ///
-/// Only the tournament flags count. `-go`/`/go` used to be listed here, but
-/// that is osu!'s **autoplay** flag: a solo game launched with `-go` was
-/// classified as a tournament manager, and the provider then served an empty
-/// packet forever while reporting no error.
+/// The line is tokenized first and a flag is only recognised as a whole
+/// argument, up to an optional `=value` suffix and with any enclosing quotes
+/// stripped, so a song or replay path that merely contains the word —
+/// `osu!.exe "D:\Songs\tournament_pack\map.osu"` — is not a manager, and
+/// neither `-tournamentx` nor a bare `tournament` is.
+///
+/// `-go`/`/go` is deliberately absent: that is osu!'s **autoplay** flag, and
+/// classifying a solo game as a tournament manager made the provider serve an
+/// empty packet forever while reporting no error.
 pub fn is_tournament_manager_cmd(cmd: &str) -> bool {
-    let lower = cmd.to_ascii_lowercase();
-    lower.contains("-tourney") || lower.contains("/tourney") || lower.contains("tournament")
+    CommandLineTokens::new(cmd).any(|token| {
+        let token = token.strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(token);
+        let flag = token.split('=').next().unwrap_or(token);
+        TOURNAMENT_MANAGER_FLAGS
+            .iter()
+            .any(|candidate| flag.eq_ignore_ascii_case(candidate))
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -1184,9 +1252,10 @@ pub fn find_pattern(
 #[cfg(test)]
 mod tests {
     use super::{
-        GameplayState, MAX_HIT_ERRORS, ProcessSnapshotResult, calculate_accuracy, calculate_grade,
-        calculate_unstable_rate, format_mods, hit_error_items_address, hit_error_window,
-        is_tournament_manager_cmd, parse_hit_errors, parse_spectate_client_arg,
+        CommandLineTokens, GameplayState, MAX_HIT_ERRORS, ProcessSnapshotResult,
+        calculate_accuracy, calculate_grade, calculate_unstable_rate, format_mods,
+        hit_error_items_address, hit_error_window, is_tournament_manager_cmd, parse_hit_errors,
+        parse_spectate_client_arg,
     };
 
     /// `List<int>._items` as it looks in the game's address space: the 8-byte
@@ -1284,6 +1353,81 @@ mod tests {
         assert!(is_tournament_manager_cmd(
             "\"D:\\osu\\osu!.exe\" -Tournament"
         ));
+    }
+
+    /// The FIX-003 regression: arguments are inspected whole, so a song or
+    /// beatmap path that merely contains `tournament` or `-tourney` is not a
+    /// manager, on its own or next to autoplay.
+    #[test]
+    fn tournament_inside_a_path_is_not_a_manager() {
+        assert!(!is_tournament_manager_cmd(
+            "osu!.exe \"D:\\Songs\\tournament\\map.osu\""
+        ));
+        assert!(!is_tournament_manager_cmd(
+            "osu!.exe \"D:\\Songs\\tournament_pack\\map.osu\" -go"
+        ));
+        assert!(!is_tournament_manager_cmd(
+            "osu!.exe \"C:\\Songs\\-tourney best\\map.osu\""
+        ));
+    }
+
+    /// Only a complete flag argument counts. osu! takes the lobby address
+    /// either as a separate argument or after `=`, while a longer word and a
+    /// missing dash or slash are a different argument entirely.
+    #[test]
+    fn tournament_flag_must_be_a_whole_argument() {
+        assert!(is_tournament_manager_cmd(
+            "osu!.exe -tourney=127.0.0.1:24050"
+        ));
+        assert!(is_tournament_manager_cmd(
+            "osu!.exe /tournament 127.0.0.1:24050"
+        ));
+        assert!(is_tournament_manager_cmd(
+            "osu!.exe \"C:\\My Songs\\x.osu\" -tourney 127.0.0.1:24050"
+        ));
+        assert!(!is_tournament_manager_cmd("osu!.exe -tournamentx"));
+        assert!(!is_tournament_manager_cmd("osu!.exe tournament"));
+    }
+
+    /// The quoting rules the matcher relies on: quotes group one argument,
+    /// `""` inside a quoted run is one literal quote, and a backslash escapes
+    /// the next character, so an escaped quote cannot close the run and
+    /// release `-tourney` as an argument of its own.
+    #[test]
+    fn command_line_tokens_respect_quoting() {
+        assert_eq!(
+            CommandLineTokens::new("\"D:\\osu\\osu!.exe\" -tourney 127.0.0.1:24050")
+                .collect::<Vec<_>>(),
+            ["\"D:\\osu\\osu!.exe\"", "-tourney", "127.0.0.1:24050"]
+        );
+        assert_eq!(
+            CommandLineTokens::new("  \"C:\\maps\\a b.osr\"  -replay ").collect::<Vec<_>>(),
+            ["\"C:\\maps\\a b.osr\"", "-replay"]
+        );
+        assert_eq!(
+            CommandLineTokens::new("osu!.exe \"C:\\Songs\\say \\\"hi\\\"\"").collect::<Vec<_>>(),
+            ["osu!.exe", "\"C:\\Songs\\say \\\"hi\\\"\""]
+        );
+        assert_eq!(
+            CommandLineTokens::new("osu!.exe \"C:\\Songs\\a\"\"b\\x.osu\"").collect::<Vec<_>>(),
+            ["osu!.exe", "\"C:\\Songs\\a\"\"b\\x.osu\""]
+        );
+        assert_eq!(
+            CommandLineTokens::new("").collect::<Vec<_>>(),
+            Vec::<&str>::new()
+        );
+        assert!(!is_tournament_manager_cmd("osu!.exe \"C:\\Songs\\a\\\" -tourney\""));
+    }
+
+    /// A flag still counts when it arrives wrapped in quotes, which is not how
+    /// osu! launches it but costs nothing to accept. Only a token that is
+    /// *exactly* the flag, once any enclosing quotes are stripped, matches --
+    /// so a quoted path that merely contains one still does not.
+    #[test]
+    fn a_quoted_flag_still_counts_as_a_manager() {
+        assert!(is_tournament_manager_cmd("osu!.exe \"-tourney\""));
+        assert!(is_tournament_manager_cmd("osu!.exe \"-tourney=127.0.0.1:24050\""));
+        assert!(!is_tournament_manager_cmd("osu!.exe \"C:\\Songs\\-tourney\\map.osu\""));
     }
 
     #[test]

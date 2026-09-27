@@ -91,7 +91,7 @@ Allow any existing tosu overlay, browser widget, or external tool to connect dir
 Make the binary / library zero-configuration and resilient to game restarts.
 
 - [x] **3.1. Automatic Mode Detection**:
-  - [x] Auto-detect whether the user is running Tournament mode (multiple `osu!.exe` / `-spectateclient` / `-go`) or Single-Player mode.
+  - [x] Auto-detect whether the user is running Tournament mode (multiple `osu!.exe` / `-spectateclient` / a whole-token `-tourney` flag) or Single-Player mode.
   - [x] Seamlessly transition JSON schemas between solo and tournament feeds.
 - [x] **3.2. Dynamic Attach & Hot-Reconnection**:
   - [x] Zero-overhead process checking using `GetExitCodeProcess` (~50ns).

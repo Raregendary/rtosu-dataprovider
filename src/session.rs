@@ -816,8 +816,7 @@ impl TournamentSession {
         let spectate_info = parse_spectate_client_arg(&command_line);
         let ipc_id = spectate_info.map(|(id, _)| id);
         let is_spectator = ipc_id.is_some();
-        let is_manager = is_tournament_manager_cmd(&command_line)
-            || (!is_spectator && (command_line.contains("-go") || command_line.contains("/go")));
+        let is_manager = is_tournament_manager_cmd(&command_line);
 
         // Scan rulesets_addr pattern to find container pointer address
         let ruleset_container_addr =
