@@ -1274,6 +1274,10 @@ pub struct SoloSession {
     cached_hit_errors_total_hits: u32,
     cached_hit_errors: Arc<[i16]>,
     cached_unstable_rate: f64,
+    /// tosu's `gameplay.isDefaultState` latch: set once a play or a results
+    /// screen has actually been read, so the exit clear runs once and never
+    /// fires for a client that was never in a map.
+    play_state_dirty: bool,
 }
 
 impl SoloSession {
@@ -1346,6 +1350,7 @@ impl SoloSession {
             cached_hit_errors_total_hits: 0,
             cached_hit_errors: Arc::default(),
             cached_unstable_rate: 0.0,
+            play_state_dirty: false,
         })
     }
 
@@ -1559,6 +1564,30 @@ impl SoloSession {
             self.cached_packet.game.paused = state == 7;
         } else {
             self.cached_packet.game.focused = memory.is_foreground();
+        }
+
+        // Leaving the map for song select, or for any other state the play
+        // block is not read in, must drop the finished run's numbers instead
+        // of keeping them until a different beatmap happens to be checksummed.
+        if state_changed && should_clear_play_state(self.play_state_dirty, current_state_num) {
+            clear_play_state_for_new_map(&mut self.cached_packet);
+            self.play_state_dirty = false;
+            self.cached_hit_errors = Arc::default();
+            self.cached_hit_errors_total_hits = 0;
+            self.cached_unstable_rate = 0.0;
+            #[cfg(feature = "pp")]
+            {
+                self.cached_gameplay_hits = (0, 0, 0, 0, 0, 0);
+                self.cached_live_pp = None;
+                self.cached_results_hits = (0, 0, 0, 0, 0, 0);
+                self.cached_results_pp = None;
+                // The idle PP path only recomputes when its (beatmap, mods) key
+                // changes, and the clear just zeroed `play.pp`. Dropping the key
+                // is what lets it refill, which is the shape tosu's
+                // `beatmapPP.resetAttributes()` leaves behind: a zeroed current
+                // against a real fc for the highlighted map.
+                self.cached_idle_pp_key = None;
+            }
         }
 
         // 2. Throttled Skin & Profile reads (on state change or low-frequency heartbeat)
@@ -1912,6 +1941,7 @@ impl SoloSession {
                         self.cached_packet.play.mods =
                             crate::v2::create_mods_state(g.mods, &g.mods_str);
                     }
+                    self.play_state_dirty = true;
 
                     #[cfg(feature = "pp")]
                     if self.enable_pp {
@@ -1995,6 +2025,7 @@ impl SoloSession {
                         self.cached_packet.play.mods =
                             crate::v2::create_mods_state(g.mods, &g.mods_str);
                     }
+                    self.play_state_dirty = true;
                 }
                 if let Ok(res) = crate::client::read_result_screen_state(memory, ruleset_addr) {
                     let mods_state = crate::v2::create_mods_state(res.mods, &res.mods_str);
@@ -2036,6 +2067,7 @@ impl SoloSession {
                     self.cached_packet.play.rank.current = res.grade.clone();
                     self.cached_packet.play.rank.max_this_play = res.grade.clone();
                     self.cached_packet.play.mods = mods_state.clone();
+                    self.play_state_dirty = true;
                     if self.cached_mods != res.mods {
                         if let Some(map) = &self.cached_beatmap {
                             self.cached_mods = res.mods;
@@ -2177,14 +2209,34 @@ impl SoloSession {
     }
 }
 
-/// Zero every play-derived field so a previous map cannot leak into the next.
-#[cfg(any(feature = "pp", test))]
+/// Whether entering `next_state` should reset the play-derived fields.
+///
+/// tosu resets its gameplay and result-screen state objects on entry to song
+/// select and again in the switch's `default:` arm, but its `case GameState.menu`
+/// does nothing at all, so the main menu keeps the last play frozen rather than
+/// zeroed. Match that: clearing on the way to state 0 would report values that
+/// osu! and tosu both still report.
+///
+/// `play_state_dirty` is tosu's `isDefaultState` latch: it is set once gameplay
+/// has actually been read, so nothing is cleared for a client that was never in
+/// a map, and the reset runs once rather than every tick.
+fn should_clear_play_state(play_state_dirty: bool, next_state: i32) -> bool {
+    play_state_dirty && !matches!(next_state, 0 | 2 | 7)
+}
+
+/// Drop every play-derived field so a finished attempt cannot leak into the
+/// next view of the client. Runs both on a beatmap checksum change and on
+/// leaving gameplay, mirroring tosu's `gameplay.init()` and
+/// `resultScreen.init()`.
 fn clear_play_state_for_new_map(packet: &mut crate::v2::TosuV2Packet) {
     let play = &mut packet.play;
     play.player_name.clear();
     play.failed = false;
     play.score = 0;
-    play.accuracy = 0.0;
+    // tosu's `GameplayState.init` sets accuracy to 100 for an empty play: an
+    // unjudged play is perfect, not 0%. `resultScreen.init` uses 0, which is
+    // why the results block below differs.
+    play.accuracy = 100.0;
     play.health_bar = Default::default();
     play.hits = Default::default();
     play.hit_error_array = Arc::default();
@@ -2207,7 +2259,7 @@ fn clear_play_state_for_new_map(packet: &mut crate::v2::TosuV2Packet) {
 
 #[cfg(test)]
 mod tests {
-    use super::clear_play_state_for_new_map;
+    use super::{clear_play_state_for_new_map, should_clear_play_state};
     use crate::v2::TosuV2Packet;
 
     /// A finished attempt, as the provider would hold it between plays.
@@ -2226,10 +2278,85 @@ mod tests {
         packet.play.unstable_rate = 12.3456;
         packet.play.health_bar.normal = 42.0;
         packet.play.failed = true;
+        packet.play.pp.current = 812.5;
+        packet.play.pp.fc = 1502.25;
         packet.results_screen.score = 1_234_567;
         packet.results_screen.rank = "S".to_string();
         packet.results_screen.max_combo = 1103;
+        packet.results_screen.pp.current = 812.5;
+        packet.results_screen.pp.fc = 1502.25;
         packet
+    }
+
+    /// Replay a state sequence through the latch, returning one clear decision
+    /// per state after the first. The leading state is the one that arms the
+    /// latch, and 2 or 7 can never itself clear, so it carries no decision.
+    fn clear_decisions(states: &[i32]) -> Vec<bool> {
+        let mut dirty = false;
+        let mut decisions = Vec::new();
+        for (index, next) in states.iter().enumerate() {
+            let clear = should_clear_play_state(dirty, *next);
+            if index > 0 {
+                decisions.push(clear);
+            }
+            // A state that reads gameplay or a results screen re-arms the
+            // latch; only a clear drops it again.
+            if matches!(*next, 2 | 7) {
+                dirty = true;
+            }
+            if clear {
+                dirty = false;
+            }
+        }
+        decisions
+    }
+
+    #[test]
+    fn clear_matrix_pins_tosus_state_handling() {
+        let cases: &[(bool, i32, bool)] = &[
+            (true, 5, true),
+            (true, 4, true),
+            (true, 0, false),
+            (true, 2, false),
+            (true, 7, false),
+            (true, 3, true),
+            (true, 6, true),
+            (true, 8, true),
+            (true, 13, true),
+            (false, 5, false),
+            (false, 0, false),
+        ];
+
+        for (dirty, next_state, expected) in cases {
+            assert_eq!(
+                should_clear_play_state(*dirty, *next_state),
+                *expected,
+                "dirty={dirty} next_state={next_state}"
+            );
+        }
+    }
+
+    /// State 0 is the one case a "sensible" implementation gets wrong. tosu's
+    /// `case GameState.menu` only calls `bassDensity.updateState()` and breaks,
+    /// so the main menu keeps the last play frozen instead of zeroing it.
+    /// Clearing here would report values osu! and tosu both still report.
+    #[test]
+    fn main_menu_freezes_the_last_play_instead_of_clearing_it() {
+        assert!(!should_clear_play_state(true, 0));
+    }
+
+    #[test]
+    fn the_latch_clears_only_once_across_a_repeated_state() {
+        assert_eq!(clear_decisions(&[2, 5, 5]), vec![true, false]);
+    }
+
+    /// Quitting to the main menu mid-lifecycle must not consume the clear: the
+    /// latch stays armed there, so the next song-select tick is the one that
+    /// drops the run. A prev/next transition table keyed on 2 -> 0 would clear
+    /// early and leave the second arrival doing nothing.
+    #[test]
+    fn a_visit_to_the_main_menu_does_not_consume_the_pending_clear() {
+        assert_eq!(clear_decisions(&[2, 0, 5]), vec![false, true]);
     }
 
     #[test]
@@ -2238,7 +2365,9 @@ mod tests {
         clear_play_state_for_new_map(&mut packet);
 
         assert_eq!(packet.play.score, 0);
-        assert_eq!(packet.play.accuracy, 0.0);
+        // An empty play is perfect: tosu's `GameplayState.init` sets accuracy to
+        // 100, not 0, because nothing has been judged yet.
+        assert_eq!(packet.play.accuracy, 100.0);
         assert_eq!(packet.play.combo.current, 0);
         assert_eq!(packet.play.combo.max, 0, "max combo is per map");
         assert_eq!(packet.play.hits.n300, 0);
@@ -2260,6 +2389,7 @@ mod tests {
         assert_eq!(packet.results_screen.score, 0);
         assert_eq!(packet.results_screen.rank, "");
         assert_eq!(packet.results_screen.max_combo, 0);
+        // tosu's `resultScreen.init` uses 0 here, unlike gameplay's 100.
         assert_eq!(packet.results_screen.accuracy, 0.0);
     }
 
@@ -2278,5 +2408,40 @@ mod tests {
         assert_eq!(packet.beatmap.title, "kept");
         assert_eq!(packet.play.mods.number, 40);
         assert_eq!(packet.play.mods.name, "HDDT");
+    }
+
+    /// Leaving the map shares the clear, and song select is the one place the
+    /// player still needs a beatmap and the mods they queued with. Dropping
+    /// either would blank the song-select header.
+    #[test]
+    fn leaving_play_keeps_the_beatmap_and_mods() {
+        let mut packet = played_packet();
+        packet.beatmap.set = 4242;
+        packet.beatmap.title = "kept".to_string();
+        packet.play.mods.number = 40;
+        packet.play.mods.name = "HDDT".to_string();
+        clear_play_state_for_new_map(&mut packet);
+
+        assert_eq!(packet.beatmap.set, 4242);
+        assert_eq!(packet.beatmap.title, "kept");
+        assert_eq!(packet.play.mods.number, 40);
+        assert_eq!(packet.play.mods.name, "HDDT");
+    }
+
+    #[test]
+    fn clear_zeroes_play_pp_and_the_whole_results_screen() {
+        let mut packet = played_packet();
+        clear_play_state_for_new_map(&mut packet);
+
+        // The idle PP path refills this with a zeroed current against a real fc
+        // for the highlighted map, which is what tosu's
+        // `beatmapPP.resetAttributes()` leaves behind.
+        assert_eq!(packet.play.pp.current, 0.0);
+        assert_eq!(packet.play.pp.fc, 0.0);
+        assert_eq!(packet.results_screen.pp.current, 0.0);
+        assert_eq!(packet.results_screen.pp.fc, 0.0);
+        assert!(packet.results_screen.player_name.is_empty());
+        assert_eq!(packet.results_screen.mods.number, 0);
+        assert_eq!(packet.results_screen.hits.n300, 0);
     }
 }
