@@ -54,7 +54,7 @@ pub struct Overlay {
 impl Overlay {
     /// URL a browser source should be pointed at.
     pub fn url(&self) -> String {
-        format!("{OVERLAYS_BASE}/{}/", slug_segment(&self.slug))
+        format!("{OVERLAYS_BASE}/{}/", percent_encode(&self.slug))
     }
 }
 
@@ -131,13 +131,6 @@ fn unescape_metadata_value(value: &str) -> String {
     value.replace("\\n", "\n").replace("\\r", "\r")
 }
 
-/// Percent-decode a single URL path segment into a filesystem-safe name.
-///
-/// Returns `None` for anything that is not a single, traversal-free segment.
-fn slug_segment(raw: &str) -> String {
-    percent_decode(raw)
-}
-
 /// Cached discovery result, keyed by the root directory's modification time.
 type DiscoveryCache = RwLock<Option<(Option<SystemTime>, Arc<Vec<Overlay>>)>>;
 
@@ -198,6 +191,34 @@ impl OverlayStore {
             .find(|overlay| overlay.slug == slug)
             .cloned()
     }
+}
+
+/// Minimal percent-encoder: RFC 3986 `unreserved` set only, so every other byte
+/// is escaped as `%XX`.
+///
+/// The escape set includes `%` itself, which is what makes the pair round-trip:
+/// a folder named `100% Pure` becomes `100%25%20Pure` and decodes back exactly,
+/// while leaving `%` bare would let an existing `%2F` in a folder name be read
+/// back as a path separator. `+` is escaped too, because the decoder does no
+/// form decoding and so would hand back `%2B` unchanged.
+pub fn percent_encode(raw: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+    let mut out = String::with_capacity(raw.len());
+    for byte in raw.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(*byte as char);
+            }
+            _ => {
+                out.push('%');
+                out.push(HEX[usize::from(byte >> 4)] as char);
+                out.push(HEX[usize::from(byte & 0x0F)] as char);
+            }
+        }
+    }
+
+    out
 }
 
 /// Minimal percent-decoder: overlays frequently use spaces in folder names
@@ -864,6 +885,87 @@ mod tests {
     fn discover_on_missing_root_is_empty() {
         let missing = std::env::temp_dir().join("rtosu-overlays-missing-does-not-exist");
         assert!(discover(&missing).is_empty());
+    }
+
+    #[test]
+    fn overlay_url_percent_encodes_a_slug_with_a_percent_sign() {
+        let root = temp_root("url-encode");
+        write(&root, "100% Pure/index.html", "<html></html>");
+
+        let overlays = discover(&root);
+        let overlay = overlays
+            .iter()
+            .find(|overlay| overlay.slug == "100% Pure")
+            .expect("folder with a percent sign and a space is discovered");
+        // A bare `%` would be read back as an escape and a raw space is not
+        // legal in a `Location` header, so the URL carries neither.
+        let url = overlay.url();
+        assert_eq!(url, "/overlays/100%25%20Pure/");
+        let segment = url
+            .strip_prefix(OVERLAYS_BASE)
+            .and_then(|rest| rest.strip_prefix('/'))
+            .and_then(|rest| rest.strip_suffix('/'))
+            .expect("the url is one segment under the overlays base");
+        assert_eq!(percent_decode(segment), "100% Pure");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn overlay_url_leaves_a_plain_slug_alone() {
+        let root = temp_root("url-plain");
+        write(&root, "Alpha/index.html", "<html></html>");
+
+        let overlays = discover(&root);
+        assert_eq!(overlays[0].url(), "/overlays/Alpha/");
+
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn percent_encode_and_decode_round_trip() {
+        for raw in [
+            "Alpha",
+            "rtosu Example",
+            "100% Pure",
+            "a+b",
+            "a#b",
+            "a?b",
+            "a&b",
+            "Café Münster",
+            "",
+        ] {
+            let encoded = percent_encode(raw);
+            assert_eq!(
+                percent_decode(&encoded),
+                raw,
+                "round trip failed for {raw:?}"
+            );
+            // Nothing outside the unreserved set may survive, or the value is
+            // not a legal path segment.
+            assert!(
+                encoded
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-._~%".contains(&b)),
+                "{raw:?} encoded to {encoded:?} with a character RFC 3986 forbids"
+            );
+        }
+    }
+
+    #[test]
+    fn percent_encode_escapes_everything_outside_the_unreserved_set() {
+        assert_eq!(percent_encode("rtosu Tourney"), "rtosu%20Tourney");
+        assert_eq!(percent_encode("100%20Pure"), "100%2520Pure");
+        assert_eq!(percent_encode("a+b"), "a%2Bb");
+        assert_eq!(percent_encode("a/b"), "a%2Fb");
+        assert_eq!(percent_encode("a\\b"), "a%5Cb");
+        assert_eq!(percent_encode("a#b"), "a%23b");
+        assert_eq!(percent_encode("a?b"), "a%3Fb");
+        assert_eq!(percent_encode("a&b"), "a%26b");
+        assert_eq!(percent_encode("-._~"), "-._~");
+        assert_eq!(percent_encode(""), "");
+        // Non-ASCII is escaped byte-wise, as RFC 3986 requires.
+        assert_eq!(percent_encode("é"), "%C3%A9");
     }
 
     #[test]

@@ -217,20 +217,32 @@ async fn handle_beatmap_background(State(state): State<AppState>, raw_query: Raw
     }
 
     // tosu reports the background as a path relative to the songs folder, so
-    // try that first and fall back to treating the values as absolute paths.
-    let songs_folder = std::path::Path::new(songs.trim());
+    // try that first, fall back to the raw value, and finally to the files
+    // sitting in the beatmap folder itself.
+    let songs_root = canonical_songs_root(&songs);
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    if !songs.trim().is_empty() && !relative.trim().is_empty() {
-        candidates.push(songs_folder.join(relative.trim()));
+    if let Some(root) = songs_root.as_deref()
+        && !relative.trim().is_empty()
+    {
+        candidates.push(root.join(relative.trim()));
     }
     if !background.trim().is_empty() {
         candidates.push(std::path::PathBuf::from(background.trim()));
     }
 
-    let path = candidates
-        .into_iter()
-        .find(|candidate| candidate.is_file())
-        .or_else(|| find_beatmap_background(songs_folder, &folder, loaded_set));
+    // A background is only ever served from inside the songs folder, so the
+    // fallback goes through the same gate as the memory-read candidates rather
+    // than carrying a second, weaker copy of the rule.
+    let path = songs_root.as_deref().and_then(|root| {
+        let fallback = find_beatmap_background(root, &folder, loaded_set);
+        contained_in_songs(
+            root,
+            candidates
+                .iter()
+                .chain(fallback.iter())
+                .map(|candidate| candidate.as_path()),
+        )
+    });
 
     let Some(path) = path else {
         tracing::debug!("beatmap background is not readable on disk");
@@ -296,7 +308,16 @@ async fn handle_overlay_shim() -> Response {
 }
 
 async fn handle_overlay_redirect(Path(slug): Path<String>) -> Response {
-    Redirect::permanent(&format!("{}/{}/", overlays::OVERLAYS_BASE, slug)).into_response()
+    // Axum hands over the already-decoded segment, so it is re-encoded on the
+    // way out: a folder named `Team Bar` can only be pointed at by a `Location`
+    // of `/overlays/Team%20Bar/`, because a raw space is not a legal
+    // `Location` value and a bare `%` in a folder name would be misread.
+    let target = format!(
+        "{}/{}/",
+        overlays::OVERLAYS_BASE,
+        overlays::percent_encode(&slug)
+    );
+    Redirect::permanent(&target).into_response()
 }
 
 async fn handle_overlay_entry(
@@ -442,6 +463,42 @@ async fn handle_favicon() -> Response {
     StatusCode::NO_CONTENT.into_response()
 }
 
+/// Resolve the songs folder into the canonical root that background files must
+/// stay inside.
+///
+/// Both sessions always publish `folders.songs`, so an empty value means the
+/// packet is not populated yet. This deliberately fails closed in that case:
+/// containment needs a root to be contained by, and guessing one would turn a
+/// missing field into an unconstrained file server.
+fn canonical_songs_root(songs: &str) -> Option<std::path::PathBuf> {
+    let trimmed = songs.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    std::fs::canonicalize(trimmed)
+        .ok()
+        .filter(|root| root.is_dir())
+}
+
+/// Pick the first candidate that resolves to a real file inside `songs`.
+///
+/// Canonicalization is the rule, not string matching: it collapses `..` and
+/// symlinks, so a candidate that walks out of the songs folder and back in is
+/// accepted while one that ends outside is rejected. A candidate that does not
+/// exist fails to canonicalize and is skipped, which is also how the old
+/// `is_file()` check is expressed. The canonical path is what gets returned, so
+/// whatever is served is the path that was actually validated.
+fn contained_in_songs<'a>(
+    songs_root: &std::path::Path,
+    candidates: impl IntoIterator<Item = &'a std::path::Path>,
+) -> Option<std::path::PathBuf> {
+    candidates.into_iter().find_map(|candidate| {
+        let canonical = std::fs::canonicalize(candidate).ok()?;
+        (canonical.starts_with(songs_root) && canonical.is_file()).then_some(canonical)
+    })
+}
+
 /// Locate a beatmap background image inside its songs folder.
 ///
 /// `files.background` comes from a memory read that does not always yield a
@@ -449,7 +506,8 @@ async fn handle_favicon() -> Response {
 /// rather than an image. A beatmap folder normally holds exactly one image, so
 /// fall back to osu!'s conventional names and then to a single image in the
 /// folder. Only the immediate folder is inspected, and only when it sits inside
-/// the songs folder.
+/// the songs folder. Containment is not decided here: the caller re-checks the
+/// returned path against the canonical songs root.
 fn find_beatmap_background(
     songs: &std::path::Path,
     beatmap_folder: &str,
@@ -855,8 +913,10 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(body.contains("Team Bar"));
         assert!(body.contains("400x90"));
-        // The served URL keeps the directory name verbatim, as tosu does.
-        assert!(body.contains("/overlays/Team Bar/"));
+        // The served URL carries the directory name percent-encoded, because a
+        // raw space is not legal in a URL and an unencoded `%` would be read
+        // back as an escape.
+        assert!(body.contains("/overlays/Team%20Bar/"));
 
         std::fs::remove_dir_all(&root).unwrap();
     }
@@ -1093,11 +1153,16 @@ mod tests {
     #[tokio::test]
     async fn test_beatmap_background_serves_the_loaded_file() {
         let root = temp_overlay_root("background");
-        let image = root.join("bg.jpg");
+        // The served file has to live inside the songs folder: containment is
+        // measured against it, so an image outside the root is now a 404.
+        let songs = root.join("songs");
+        std::fs::create_dir_all(&songs).unwrap();
+        let image = songs.join("bg.jpg");
         std::fs::write(&image, [0xFF, 0xD8, 0xFF, 0xD9]).expect("write image");
 
         let mut sample = TosuV2Packet::default();
         sample.beatmap.set = 77;
+        sample.folders.songs = songs.to_string_lossy().into_owned();
         sample.files.background = image.to_string_lossy().into_owned();
 
         let (_tx, rx) = watch::channel(PublishedPacket::new(sample).expect("serialize"));
@@ -1178,6 +1243,147 @@ mod tests {
         assert!(find_beatmap_background(songs, "../secret", 1).is_none());
         assert!(find_beatmap_background(songs, "a/b", 1).is_none());
         assert!(find_beatmap_background(songs, "C:evil", 1).is_none());
+    }
+
+    /// Build a router whose packet points at `songs` with the given memory-read
+    /// values, so the containment tests differ only in what osu! claimed.
+    fn background_app(songs: &std::path::Path, background: &str, relative: &str) -> Router {
+        let mut sample = TosuV2Packet::default();
+        sample.beatmap.set = 1;
+        sample.folders.songs = songs.to_string_lossy().into_owned();
+        sample.files.background = background.to_string();
+        sample.direct_path.beatmap_background = relative.to_string();
+
+        let (_tx, rx) = watch::channel(PublishedPacket::new(sample).expect("serialize"));
+        create_router(AppState::new(rx), true, false, true)
+    }
+
+    #[tokio::test]
+    async fn test_beatmap_background_outside_the_songs_folder_is_not_found() {
+        let root = temp_overlay_root("background-outside");
+        let songs = root.join("songs");
+        std::fs::create_dir_all(&songs).unwrap();
+        // A real file, but nowhere near the songs folder.
+        let outside = root.join("private.txt");
+        std::fs::write(&outside, b"top secret").unwrap();
+
+        let app = background_app(&songs, outside.to_str().unwrap(), "");
+        let (status, body) = get_text(app, "/files/beatmap/background").await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(!body.contains("top secret"), "file outside songs leaked");
+    }
+
+    #[tokio::test]
+    async fn test_beatmap_background_traversal_out_of_songs_is_not_found() {
+        let root = temp_overlay_root("background-traversal");
+        let songs = root.join("songs");
+        std::fs::create_dir_all(&songs).unwrap();
+        std::fs::write(root.join("private.txt"), b"top secret").unwrap();
+
+        // `direct_path.beatmap_background` is a raw memory read joined with `\`,
+        // so `..` in either component used to escape the songs folder.
+        let app = background_app(&songs, "", "..\\..\\private.txt");
+        let (status, body) = get_text(app, "/files/beatmap/background").await;
+
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert!(!body.contains("top secret"), "traversal leaked a file");
+    }
+
+    #[tokio::test]
+    async fn test_beatmap_background_traversal_back_into_songs_is_served() {
+        let root = temp_overlay_root("background-reenter");
+        let songs = root.join("songs");
+        let dir = songs.join("123 Artist - Song");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("bg.jpg"), [7, 8, 9]).unwrap();
+
+        // The `..` climbs out and comes back, ending inside the songs folder.
+        // Canonicalization is the rule, so this is a normal file and is served.
+        let app = background_app(&songs, "", "outside\\..\\123 Artist - Song\\bg.jpg");
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/files/beatmap/background")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(bytes.as_ref(), &[7, 8, 9]);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_beatmap_background_without_a_songs_folder_is_not_found() {
+        let root = temp_overlay_root("background-no-songs");
+        let image = root.join("bg.jpg");
+        std::fs::write(&image, [1, 2, 3]).unwrap();
+
+        let mut sample = TosuV2Packet::default();
+        sample.beatmap.set = 77;
+        // Deliberate fail-closed behaviour: without a songs root there is
+        // nothing to be contained by, so an otherwise valid file is refused.
+        sample.folders.songs = String::new();
+        sample.files.background = image.to_string_lossy().into_owned();
+
+        let (_tx, rx) = watch::channel(PublishedPacket::new(sample).expect("serialize"));
+        let app = create_router(AppState::new(rx), true, false, true);
+
+        let (status, _) = get_text(app, "/files/beatmap/background").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_overlay_folder_url_redirects_with_an_encoded_slug() {
+        let root = temp_overlay_root("redirect-encoded");
+        write_overlay_file(&root, "Team Bar/index.html", "<html></html>");
+
+        let response = overlay_app(root.clone())
+            .oneshot(
+                Request::builder()
+                    .uri("/overlays/Team%20Bar")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+        assert_eq!(
+            response.headers().get(header::LOCATION).unwrap(),
+            "/overlays/Team%20Bar/"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_overlay_folder_with_a_percent_sign_resolves_when_encoded() {
+        let root = temp_overlay_root("percent-slug");
+        write_overlay_file(&root, "100% Pure/index.html", "<html>pure</html>");
+
+        // The dashboard advertises the encoded form, and that is the form that
+        // has to resolve back to the directory named `100% Pure`, for the entry
+        // document and for an asset inside it.
+        let app = overlay_app(root.clone());
+        let (status, body) = get_text(app.clone(), "/overlays/100%25%20Pure/").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("pure"));
+
+        let (status, body) = get_text(app, "/overlays/100%25%20Pure/index.html").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.contains("pure"));
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[tokio::test]
