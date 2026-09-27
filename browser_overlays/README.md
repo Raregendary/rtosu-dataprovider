@@ -209,8 +209,12 @@ point at a folder next to the executable. `enable_overlays` requires
   reloading, or refreshing an OBS source, always picks up the change instead of
   silently running a stale copy. HTML additionally sends `Vary: Host`, since the
   injected shim URL embeds the host the page was loaded from.
-- Only the current beatmap background is exposed. The arbitrary osu! songs
-  folder is not browsable.
+- **What the file routes expose.** The songs folder is served read-only at both
+  `/files/beatmap/{*path}` and `/Songs/{*path}`, and the skin folder at
+  `/files/skin/{*path}` — that is what an overlay that loads a map's audio or its
+  skin by filename needs, and it is the same set tosu serves. The routes are
+  read-only, confined to those two roots by canonicalised path comparison, and
+  the background route is a single named file rather than the whole tree.
 - If the provider reports no background filename (its memory read is not always
   reliable), the beatmap folder is searched for a conventional
   `background.jpg`/`.png` or a single image in it.

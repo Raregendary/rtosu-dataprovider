@@ -356,8 +356,14 @@ pub struct ScLeaderboardMainPlayer {
 /// `ModsXor1` and `ModsXor2` are tosu's own hardcoded `-1` constants
 /// (`buildResultSC.ts:211-212` for the main player, `:231-232` for the list
 /// entries) -- they are not computed from anything, and `Value` carries the real
-/// mod bitfield. So the constants are the `Default` and `new` only ever varies
-/// `Value`.
+/// mod bitfield. So the constants are the `Default`, and `value` is the only field
+/// a builder would vary.
+///
+/// The struct was originally built through a `new(value)` constructor. Nothing
+/// called it: the leaderboard types are never populated (see the type docs above),
+/// so the only construction sites were the two `Default`s, and the constructor was
+/// dead by construction. The fields are public and the struct derives `Default`,
+/// so populating it later needs no constructor.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ScLeaderboardMods {
     #[serde(rename = "ModsXor1")]
@@ -374,16 +380,6 @@ impl Default for ScLeaderboardMods {
             mods_xor_1: -1,
             mods_xor_2: -1,
             value: 0,
-        }
-    }
-}
-
-impl ScLeaderboardMods {
-    /// Only `Value` varies, so this is the default with the bitfield set.
-    pub fn new(value: u32) -> Self {
-        Self {
-            value,
-            ..Self::default()
         }
     }
 }
@@ -881,8 +877,7 @@ impl ScPayload {
         // non-osu!std map rtosu emits no series, so this is empty rather than
         // wrong -- see the BLOCKED note on per-mode strains in
         // `audit-1.0.5.md` `G-03` and `L-02`.
-        let graph: crate::v2::PerformanceGraph =
-            serde_json::from_str(packet.performance.graph.raw.get()).unwrap_or_default();
+        let graph = packet.performance.graph.decoded();
         let strain_values = graph
             .series
             .first()

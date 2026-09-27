@@ -107,16 +107,32 @@ impl Filtered {
         }
     }
 
-    /// Look a leaf up by path, for assertions. Returns `None` for a missing key
-    /// and for a node that is not a leaf, which is the same thing the wire would
-    /// show.
-    pub fn get(&self, key: &str) -> Option<&Value> {
+    /// A child by key, for assertions. `None` for a key that is not present.
+    ///
+    /// Returns the child **node** rather than its value, because a child reached
+    /// by a filter may be either a leaf or a further object -- `session` above,
+    /// `client` below -- and collapsing the two would make a nested path
+    /// unassertable. Narrow with [`Filtered::leaf`].
+    ///
+    /// The tests use this rather than reaching into the tree, because a
+    /// `Filtered` has no public indexing and a test that rebuilt the lookup itself
+    /// would be asserting against its own copy of the logic.
+    #[cfg(test)]
+    pub fn get(&self, key: &str) -> Option<&Filtered> {
         match self {
-            Filtered::Object(entries) => entries
-                .iter()
-                .find(|(k, _)| k == key)
-                .and_then(|(_, v)| v.get(key)),
-            Filtered::Leaf(value) => value.get(key),
+            Filtered::Object(entries) => entries.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+            // A leaf is not a container, so it has no child -- which is also what
+            // the wire shows: narrowing into a leaf is a dead end.
+            Filtered::Leaf(_) => None,
+        }
+    }
+
+    /// The value, if this node is a leaf.
+    #[cfg(test)]
+    pub fn leaf(&self) -> Option<&Value> {
+        match self {
+            Filtered::Leaf(value) => Some(value),
+            Filtered::Object(_) => None,
         }
     }
 }
@@ -373,6 +389,30 @@ mod tests {
         let filters = parse_filters(r#"["session","client"]"#).unwrap();
         let out = apply_filters(&filters, &packet()).unwrap();
         assert_eq!(out.keys(), ["session", "client"]);
+
+        // And `get` reads a child off the tree, so the accessor is exercised by
+        // the test that needs it rather than sitting unused.
+        assert_eq!(
+            out.get("client")
+                .and_then(Filtered::leaf)
+                .and_then(Value::as_str),
+            Some("stable")
+        );
+        assert_eq!(
+            out.get("session")
+                .and_then(Filtered::leaf)
+                .and_then(|value| value.get("playTime")),
+            Some(&Value::from(5105)),
+            "a nested path narrows into the child's value"
+        );
+        assert_eq!(out.get("nope"), None, "an absent key is None, not a null");
+        assert_eq!(
+            out.get("client")
+                .and_then(|node| node.get("x"))
+                .and_then(Filtered::leaf),
+            None,
+            "narrowing into a leaf is a dead end, as on the wire"
+        );
     }
 
     /// A filter for a key that does not exist produces **nothing**, not a null.

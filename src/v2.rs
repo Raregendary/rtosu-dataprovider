@@ -353,9 +353,34 @@ const EMPTY_GRAPH_JSON: &str = "{\"series\":[],\"xaxis\":[]}";
 
 /// A `PerformanceGraph` that is already serialized, so the hot path does not
 /// re-encode it on every poll.
+///
+/// Not serialised itself: it appears inside the packet through
+/// `#[serde(serialize_with = ...)]` on the field, so `raw` is what goes on the
+/// wire and `decoded` is a cache of that same value.
 #[derive(Debug, Clone)]
 pub struct PrecomputedGraph {
     pub raw: Arc<serde_json::value::RawValue>,
+    /// The same graph, decoded once, for the three consumers that need the parsed
+    /// series (`v1`'s `strainsAll`, SC's `mapStrains`, and anything else that
+    /// wants a series rather than bytes).
+    ///
+    /// **Why this exists:** the graph is held as raw JSON precisely so that the v2
+    /// hot path does not re-encode it every poll, and the two reshapers had been
+    /// undoing that on the way out -- each one did
+    /// `serde_json::from_str(raw.get())` per **request** or per **socket frame**,
+    /// parsing roughly 250 KB and allocating five `Vec<f64>` each time, and v1
+    /// then deep-copied the whole thing again because it needed two of the fields.
+    /// With several clients connected, that is the parse repeated once per client
+    /// per tick on a route nobody asked to be cheap.
+    ///
+    /// So the decode happens once, at construction, and the reshapers borrow it.
+    /// The cost of a poll that produces no consumer is one parse of a graph the
+    /// poll just built anyway, and the cost of the tenth consumer is a refcount
+    /// bump.
+    ///
+    /// Never on the wire, and never part of equality: it is a cache of `raw`, so
+    /// two graphs with the same bytes are equal whether or not either is decoded.
+    decoded: Option<Arc<PerformanceGraph>>,
 }
 
 impl PrecomputedGraph {
@@ -369,15 +394,39 @@ impl PrecomputedGraph {
         {
             Some(raw) => Self {
                 raw: Arc::from(raw),
+                // Decoded from the same bytes the payload carries, so the two
+                // can never disagree about the graph's contents.
+                decoded: Some(Arc::new(graph.clone())),
             },
             None => Self::default(),
         }
     }
 
+    /// The decoded graph, or an empty one.
+    ///
+    /// Never fails: a payload built by [`Self::from_raw_json`] has no decoded
+    /// form cached, and a consumer that cannot have one must still get the empty
+    /// graph rather than an error -- that is the same fallback the re-shapers
+    /// already had with `unwrap_or_default()`, and a missing `Arc` is the only new
+    /// way to reach it.
+    pub fn decoded(&self) -> Arc<PerformanceGraph> {
+        self.decoded
+            .clone()
+            .unwrap_or_else(|| Arc::new(PerformanceGraph::default()))
+    }
+
     pub fn from_raw_json(json: String) -> Result<Self, serde_json::Error> {
-        let raw = serde_json::value::RawValue::from_string(json)?;
+        let raw: Arc<serde_json::value::RawValue> =
+            Arc::from(serde_json::value::RawValue::from_string(json)?);
         Ok(Self {
-            raw: Arc::from(raw),
+            // Decoded here for the same reason `new` does it. This constructor is
+            // the deserialisation path, so without it a packet rebuilt from the
+            // wire would silently lose the cache and every consumer would fall
+            // back to the empty graph.
+            decoded: Some(Arc::new(
+                serde_json::from_str(raw.get()).unwrap_or_default(),
+            )),
+            raw,
         })
     }
 }
@@ -394,6 +443,11 @@ impl Default for PrecomputedGraph {
         });
         Self {
             raw: Arc::clone(raw),
+            // No decoded cache: the default is a shared static, and handing every
+            // consumer a fresh empty `Arc` would defeat the point of the cache.
+            // `decoded()` materialises one per caller, which is only reached when
+            // nothing built a real graph.
+            decoded: None,
         }
     }
 }
@@ -419,8 +473,16 @@ impl<'de> Deserialize<'de> for PrecomputedGraph {
         D: serde::Deserializer<'de>,
     {
         let raw_box = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+        let raw: Arc<serde_json::value::RawValue> = Arc::from(raw_box);
         Ok(PrecomputedGraph {
-            raw: Arc::from(raw_box),
+            // Decoded here as well as in `from_raw_json`, because this is the path
+            // a packet rebuilt from the wire takes, and a consumer asking for the
+            // parsed series must get the graph that was actually sent rather than
+            // the empty fallback.
+            decoded: Some(Arc::new(
+                serde_json::from_str(raw.get()).unwrap_or_default(),
+            )),
+            raw,
         })
     }
 }
@@ -605,6 +667,17 @@ impl TosuPrecisePacket {
     /// rather than from any one tourney client, and tosu reads the same two
     /// values off `instanceManager.focusedClient`'s gameplay
     /// (`buildResultV2Precise.ts:61-66`).
+    ///
+    /// **In tournament mode that top level is the neutral default, and that is a
+    /// real limitation rather than a bug to be papered over.**
+    /// `format_tourney_packet` never fills `packet.play`, because rtosu's manager
+    /// process is not itself one of `tourney.clients` -- `is_attached` counts the
+    /// other clients, and only they are read for gameplay. So there is no focused
+    /// client in the sense tosu means, and inventing one (taking the lowest
+    /// `ipcId`, say) would be a guess about which of several players a consumer
+    /// meant. A tournament consumer that wants key state must read it per client
+    /// out of `tourney[]`, which is what that array is for and where the values
+    /// are real.
     ///
     /// The array is every known tourney client, ordered by `ipcId`, because tosu
     /// sorts the same way (`buildResultV2Precise.ts:22` -- `a.ipcId - b.ipcId`)
@@ -934,6 +1007,61 @@ mod tests {
         // beatmap fields.
         let back: TosuV2Packet = serde_json::from_str(&json).expect("deserialize v2");
         assert_eq!(back.play.key_overlay, crate::v2::KeyOverlay::default());
+    }
+
+    /// The decoded graph is built once per poll and **shared** by every consumer.
+    ///
+    /// Both reshapers used to do `serde_json::from_str(raw.get())` themselves --
+    /// v1 per `/json` request, SC per `/json/sc` request *and* per `/tokens` frame
+    /// -- which parses roughly 250 KB and allocates five `Vec<f64>` each time. The
+    /// cache exists to make the tenth consumer a refcount bump, so the sharing is
+    /// the property worth pinning, not merely the contents.
+    ///
+    /// It is also pinned through the deserialisation path, because a packet
+    /// rebuilt from the wire must not silently lose the cache and fall back to an
+    /// empty graph.
+    #[test]
+    fn the_strain_graph_is_decoded_once_and_shared() {
+        let graph = PerformanceGraph {
+            series: vec![
+                GraphSeries {
+                    name: "aim".to_string(),
+                    data: vec![1.0, 2.0, 3.0],
+                },
+                GraphSeries {
+                    name: "reading".to_string(),
+                    data: Vec::new(),
+                },
+            ],
+            xaxis: vec![0.0, 400.0, 800.0],
+        };
+        let precomputed = PrecomputedGraph::new(&graph);
+
+        let first = precomputed.decoded();
+        let second = precomputed.decoded();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "two consumers must share one decode"
+        );
+        // And it is the graph that was asked for, not an empty one.
+        assert_eq!(first.series.len(), 2);
+        assert_eq!(first.series[0].name, "aim");
+        assert_eq!(first.series[1].data, Vec::<f64>::new());
+        assert_eq!(first.xaxis, vec![0.0, 400.0, 800.0]);
+
+        // Through the wire and back: still shared, and still the same graph.
+        let text = serde_json::to_string(&precomputed).expect("serialize");
+        let parsed: PrecomputedGraph = serde_json::from_str(&text).expect("deserialize");
+        let third = parsed.decoded();
+        let fourth = parsed.decoded();
+        assert!(Arc::ptr_eq(&third, &fourth), "the wire path caches too");
+        assert_eq!(third.series.len(), 2);
+        assert_eq!(third.series[0].data, vec![1.0, 2.0, 3.0]);
+
+        // The default has no cache, and answering with the empty graph is the
+        // documented fallback rather than a panic.
+        let empty = PrecomputedGraph::default();
+        assert!(empty.decoded().series.is_empty());
     }
 
     #[test]

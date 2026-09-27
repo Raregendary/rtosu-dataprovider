@@ -650,6 +650,7 @@ async fn run_serve_loop(
                 cors_allow_all,
                 server_overlays_dir,
                 rx,
+                rtosu_dataprovider::server::JsonPayload::from_config(&config.server.json_payload),
             )
             .await
             {

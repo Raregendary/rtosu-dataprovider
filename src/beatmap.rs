@@ -209,6 +209,24 @@ pub struct BeatmapSnapshot {
     /// [`apply_beatmap_ruleset`].
     #[serde(skip)]
     pub file_mode: Option<i32>,
+    /// The **game's current** ruleset, read from `base_addr - 0x33` and never
+    /// overwritten.
+    ///
+    /// [`Self::mode`] holds the file's ruleset after [`apply_beatmap_ruleset`]
+    /// has run, which is what tosu's `beatmap.mode` is -- but it is *not* what
+    /// `beatmap.mode` held before, and two other fields want that other value:
+    ///
+    /// * `isConvert`, which is defined against the current ruleset and has to be
+    ///   recomputed on every restore from cache, long after the read that set it.
+    /// * v1's `menu.gameMode`, which tosu sources from `menu.gamemode` =
+    ///   `readPointer(baseAddr - 0x33)` (`memory/stable.ts:905`) rather than from
+    ///   the beatmap. Reading it back out of `Self::mode` on the restore paths
+    ///   worked only because nothing had overwritten it yet; keeping it
+    ///   separately means the restore does not have to know that.
+    ///
+    /// Per client in tournament mode, since `base_addr` is per client.
+    #[serde(skip)]
+    pub current_ruleset: i32,
 }
 
 /// The name for a stable beatmap ranked status.
@@ -420,6 +438,7 @@ pub fn read_beatmap_from_ptr(
             number: mode,
             name: beatmap_mode_name(mode).to_string(),
         },
+        current_ruleset: mode,
         artist,
         artist_unicode,
         title,

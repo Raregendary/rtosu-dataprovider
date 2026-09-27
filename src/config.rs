@@ -25,8 +25,23 @@ pub struct ServerConfig {
     pub cors_allow_all: bool,
     /// Enable WebSocket broadcasting stream on /websocket/v2
     pub enable_websocket: bool,
-    /// Enable HTTP REST endpoints on /json/v2, /json, and /health
+    /// Enable HTTP REST endpoints on /json, /json/v1, /json/v2, /json/v2/precise, /json/sc and /health
     pub enable_http: bool,
+    /// Which payload `GET /json` serves.
+    ///
+    /// **This was a breaking change and this is the escape hatch.** tosu serves
+    /// the gosumemory-compatible v1 payload at `/json`
+    /// (`packages/server/router/index.ts:43-53`) and the v2 payload at
+    /// `/json/v2`, so rtosu matches it -- which means an existing rtosu consumer
+    /// reading v2 from `/json` now receives a different shape on the same URL,
+    /// with no error signal. Set this to `"v2"` to put `/json` back where it was
+    /// before; `/json/v2` serves the v2 payload either way, so nothing else
+    /// changes.
+    ///
+    /// Accepted values are `"v1"` (the default, matching tosu) and `"v2"`. Anything
+    /// else logs a warning and falls back to `"v1"`, because a typo must not
+    /// silently serve the shape the operator was trying to avoid.
+    pub json_payload: String,
     /// Serve user-supplied, tosu v2 API compatible browser overlays from a
     /// directory of overlay folders and render a dashboard to browse them
     pub enable_overlays: bool,
@@ -92,6 +107,7 @@ impl Default for ServerConfig {
             cors_allow_all: true,
             enable_websocket: true,
             enable_http: true,
+            json_payload: "v1".to_string(),
             enable_overlays: true,
             overlays_dir: "browser_overlays".to_string(),
         }

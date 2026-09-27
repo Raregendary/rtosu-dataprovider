@@ -468,6 +468,12 @@ pub fn gameplay_to_play(gameplay: Option<&GameplayState>) -> PlayState {
             max_this_play: g.grade_max.clone(),
         },
         unstable_rate: g.unstable_rate,
+        // Carried here as well as on the solo path. The precise payload reads
+        // `tourney[].keys` off each client's `play`, and without this the whole
+        // per-client key state was the neutral overlay in tournament mode while
+        // the same read was honoured one path over -- so a precise frame
+        // reported a client's live `hitErrors` beside an all-zero `keys`.
+        key_overlay: g.key_overlay,
         ..Default::default()
     }
 }
@@ -639,6 +645,48 @@ pub fn country_name(value: i32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `gameplay_to_play` must carry the key overlay, not just the counters.
+    ///
+    /// The precise payload reads `tourney[].keys` off each client's `play`, and
+    /// this reshape ended in `..Default::default()` without assigning it. So in
+    /// tournament mode every precise frame reported a client's live `hitErrors`
+    /// next to an all-zero `keys` -- the same read honoured on the solo path and
+    /// dropped here, which is exactly the shape a "the read exists" test cannot
+    /// see.
+    #[test]
+    fn the_tournament_reshape_carries_the_key_overlay() {
+        let mut gameplay = crate::client::GameplayState::default();
+        gameplay.key_overlay = crate::v2::KeyOverlay {
+            k1: crate::v2::KeyOverlayButton {
+                is_pressed: true,
+                count: 11,
+            },
+            k2: crate::v2::KeyOverlayButton {
+                is_pressed: false,
+                count: 9,
+            },
+            m1: crate::v2::KeyOverlayButton::default(),
+            m2: crate::v2::KeyOverlayButton::default(),
+        };
+
+        let play = gameplay_to_play(Some(&gameplay));
+
+        assert_eq!(play.key_overlay, gameplay.key_overlay);
+        assert_eq!(
+            play.key_overlay.k1.count, 11,
+            "the count reaches the client"
+        );
+        assert!(play.key_overlay.k1.is_pressed);
+
+        // And the neutral case still round-trips, rather than the field being
+        // left in a state that serialises as something other than four buttons.
+        assert_eq!(
+            gameplay_to_play(None).key_overlay,
+            crate::v2::KeyOverlay::default(),
+            "no gameplay means the neutral overlay"
+        );
+    }
 
     /// The poll loop does synchronous memory scans, disk reads and thread
     /// spawning, so keeping it off the async worker is only possible if the

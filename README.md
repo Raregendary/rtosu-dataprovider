@@ -24,12 +24,27 @@ A lightweight native Rust data provider emitting **[tosu](https://github.com/Kot
 
 ## ✨ Features
 
-- **tosu v2 REST & WebSocket Server**:
+- **tosu-compatible REST & WebSocket Server**, on tosu's own paths
+  (`packages/server/router/index.ts`):
+  - `GET /json` — Gosumemory-compatible **v1** payload, which is what tosu serves here. Set `server.json_payload = "v2"` to put rtosu's older v2 payload back on this path.
+  - `GET /json/v1` — The same v1 payload, as an explicit alias.
   - `GET /json/v2` — Standard tosu v2 JSON state snapshot.
-  - `GET /json/v2/precise` — High-precision JSON endpoint.
-  - `WS /websocket/v2` — 60 Hz real-time WebSocket state stream.
+  - `GET /json/v2/precise` — `{keys, hitErrors, tourney}` and nothing else: the high-frequency feed, without the strain graph.
+  - `GET /json/sc` — StreamCompanion-compatible payload (136 flat keys).
+  - `WS /websocket/v2` — 60 Hz real-time v2 state stream.
+  - `WS /websocket/v2/precise` — The precise payload, streamed.
+  - `WS /ws` — The v1 payload, streamed (tosu's `WS_V1`).
+  - `WS /tokens` — StreamCompanion payloads over a socket, with filter support (tosu's `WS_SC`).
+  - `WS /websocket/commands` — Inbound-only command channel (tosu's `WS_COMMANDS`).
   - `GET /health` — Service health check.
   - `GET /files/beatmap/background` — Current beatmap background, for overlays.
+  - `GET /files/beatmap/{*path}`, `GET /Songs/{*path}` — The osu! songs folder, under either path, for overlays that load audio or images by file.
+  - `GET /files/skin/{*path}` — The skin folder.
+  - `GET /backgroundImage` — Alias of the background route, for older overlays.
+
+  With no osu! attached, all four `/json*` routes answer `500
+  {"error":"osu is not ready/running"}` and the sockets send nothing, which is
+  what tosu does (`packages/server/utils/http.ts`).
 - **Browser Overlays**:
   - `GET /overlays` — Dashboard listing every overlay found in `browser_overlays/`.
   - `GET /overlays/<folder>/` — The overlay itself; paste this URL into an OBS **Browser** source.

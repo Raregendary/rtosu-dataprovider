@@ -552,8 +552,23 @@ pub struct V1IpcHits {
     pub hit_error_array: Arc<[i16]>,
 }
 
-impl From<&crate::v2::HitsState> for V1IpcHits {
-    fn from(h: &crate::v2::HitsState) -> Self {
+/// Build the per-ipc-client hit block from that client's `PlayState`.
+///
+/// tosu fills all four non-counter fields from the client's own gameplay
+/// (`buildResult.ts:484-497`): `grade: {current: gameplay.gradeCurrent,
+/// maxThisPlay: gameplay.gradeExpected}`, `unstableRate:
+/// gameplay.unstableRate` and `hitErrorArray: gameplay.hitErrors`. Every one of
+/// those is already on `TourneyIpcClient.play` -- `rank.current`,
+/// `rank.max_this_play`, `unstable_rate` and `hit_error_array` -- one level up.
+///
+/// This used to convert from `&HitsState`, which structurally cannot carry any
+/// of them, so all four were emitted as `""`, `0.0` and `[]` for every client
+/// while the same values sat unread in the packet. Converting from the
+/// `PlayState` is also what keeps the two paths honest: a field added to
+/// `PlayState` now reaches v1 without a second edit here.
+impl From<&crate::v2::PlayState> for V1IpcHits {
+    fn from(play: &crate::v2::PlayState) -> Self {
+        let h = &play.hits;
         Self {
             n0: h.n0,
             n50: h.n50,
@@ -566,11 +581,11 @@ impl From<&crate::v2::HitsState> for V1IpcHits {
             large_tick_hits: h.large_tick_hits,
             slider_breaks: h.slider_breaks,
             grade: V1Grade {
-                current: String::new(),
-                max_this_play: String::new(),
+                current: play.rank.current.clone(),
+                max_this_play: play.rank.max_this_play.clone(),
             },
-            unstable_rate: 0.0,
-            hit_error_array: Arc::default(),
+            unstable_rate: play.unstable_rate,
+            hit_error_array: Arc::clone(&play.hit_error_array),
         }
     }
 }
@@ -588,19 +603,28 @@ impl GosuCompatibleApi {
         let results = &packet.results_screen;
 
         // The graph is held pre-serialised (`PrecomputedGraph` wraps a
-        // `RawValue`) so v2 does not re-encode it every poll. v1 needs the parsed
-        // series, so it is decoded here -- per *request*, not per poll, which is
-        // what keeps this off the reader's hot path. `strains_all` is the whole
-        // graph object, and `strains` is its first series, so one decode serves
-        // both.
-        let graph: crate::v2::PerformanceGraph =
-            serde_json::from_str(packet.performance.graph.raw.get()).unwrap_or_default();
-
+        // `RawValue`) so v2 does not re-encode it every poll, and **decoded
+        // alongside it** so the two reshapers do not re-parse it per request
+        // either. `strains_all` is the whole graph object and `strains` is its
+        // first series, so one shared decode serves both.
+        //
+        // The clone here is of the `Arc`, not of the graph: this used to be
+        // `graph.series.clone()` and `graph.xaxis.clone()` on an owned local that
+        // was never used again, which is two full deep copies of a ~250 KB
+        // structure per `/json` request and per `/ws` frame.
+        let graph = packet.performance.graph.decoded();
+        let strains_all = V1StrainsAll {
+            series: graph.series.to_vec(),
+            xaxis: graph.xaxis.to_vec(),
+        };
         // tosu's `beatmapPP.strains` is the mode's primary skill, zero padded. For
         // osu!std that is the aim series, which is what `series[0]` holds; for any
         // other mode rtosu emits no series at all, so this is empty rather than
         // wrong. See the BLOCKED note on the reading strain in audit-1.0.5.md G-03.
-        let strains = graph
+        //
+        // Out of the same `Vec` the `strains_all` copy came from, so this is a
+        // slice copy rather than a second descent into the graph.
+        let strains = strains_all
             .series
             .first()
             .map(|s| s.data.clone())
@@ -632,7 +656,14 @@ impl GosuCompatibleApi {
                     bass_density: 0.0,
                 },
                 state: packet.state.number,
-                game_mode: b.mode.number,
+                // tosu's v1 `menu.gameMode` is `menu.gamemode`
+                // (`buildResult.ts:93`), which is the game's **current** ruleset
+                // read at `baseAddr - 0x33` (`memory/stable.ts:905`) -- not the
+                // beatmap's own ruleset, which is what `beatmap.mode` below
+                // carries. Using `b.mode.number` here made the two agree and so
+                // stopped reporting a converted map, or any ruleset selection
+                // that differed from the file.
+                game_mode: b.current_ruleset,
                 // `Number(Boolean(global.chatStatus))` (`buildResult.ts:88`).
                 // rtosu does not read the chat-visibility flag; 0 is what tosu
                 // serves when the field is false.
@@ -685,17 +716,17 @@ impl GosuCompatibleApi {
                         memory_hp: stats.hp.original,
                     },
                     path: V1MenuPath {
-                        // folder + background filename, joined with a separator. Not
-                        // the .osu file, despite `full` suggesting otherwise.
-                        full: if b.folder.is_empty() && b.background_filename.is_empty() {
-                            String::new()
-                        } else {
-                            format!(
-                                "{}\\{}",
-                                b.folder.trim_end_matches('\\'),
-                                b.background_filename
-                            )
-                        },
+                        // folder + background filename. Not the `.osu` file,
+                        // despite `full` suggesting otherwise.
+                        //
+                        // Through the shared `join_path`, which every other
+                        // consumer of this same pair uses. The inline version here
+                        // answered `""` only when **both** sides were empty, and
+                        // otherwise emitted a leading `\` for an empty folder and a
+                        // trailing `\` for an empty filename -- so the same map could
+                        // serialise two different strings here and in
+                        // `sc.backgroundImageLocation`.
+                        full: crate::reader::join_path(&b.folder, &b.background_filename),
                         folder: b.folder.clone(),
                         file: b.filename.clone(),
                         bg: b.background_filename.clone(),
@@ -719,10 +750,7 @@ impl GosuCompatibleApi {
                     n99: packet.performance.accuracy.n99,
                     n100: packet.performance.accuracy.n100,
                     strains,
-                    strains_all: V1StrainsAll {
-                        series: graph.series.clone(),
-                        xaxis: graph.xaxis.clone(),
-                    },
+                    strains_all,
                 },
             },
 
@@ -879,7 +907,7 @@ impl GosuCompatibleApi {
                             accuracy: c.play.accuracy,
                             combo: c.play.combo.clone(),
                             hp: c.play.health_bar.clone(),
-                            hits: V1IpcHits::from(&c.play.hits),
+                            hits: V1IpcHits::from(&c.play),
                             mods: V1Mods {
                                 num: c.play.mods.number,
                                 str: c.play.mods.name.clone(),
@@ -1028,6 +1056,66 @@ mod tests {
     fn replay_ui_hidden_is_the_constant_tosu_serves() {
         let v1 = GosuCompatibleApi::from_v2(&TosuV2Packet::default());
         assert!(!v1.gameplay.is_replay_ui_hidden);
+    }
+
+    /// `menu.gameMode` is the **game's current** ruleset, not the beatmap's own.
+    ///
+    /// tosu's v1 `menu.gameMode` is `menu.gamemode` (`buildResult.ts:93`), read
+    /// at `baseAddr - 0x33` (`memory/stable.ts:905`) -- the value that
+    /// `beatmap.mode.number` held before the file's `Mode:` was applied to it.
+    /// Taking it from the beatmap made the two agree, so a converted map, or any
+    /// ruleset selection differing from the file, reported the wrong gamemode on
+    /// `/json` and `/ws`.
+    #[test]
+    fn menu_game_mode_is_the_current_ruleset_not_the_beatmaps_own() {
+        // The two fields hold different values on purpose, so a builder that read
+        // the beatmap again fails here.
+        let mut packet = TosuV2Packet::default();
+        // A converted osu!standard map being played in mania.
+        packet.beatmap.current_ruleset = 3;
+        packet.beatmap.mode = crate::beatmap::BeatmapMode {
+            number: 0,
+            name: "osu".to_string(),
+        };
+        packet.beatmap.is_convert = true;
+
+        let v1 = GosuCompatibleApi::from_v2(&packet);
+
+        assert_eq!(v1.menu.game_mode, 3, "the game's current ruleset");
+        assert_eq!(packet.beatmap.mode.number, 0, "the map's own ruleset");
+        assert!(packet.beatmap.is_convert);
+    }
+
+    /// The per-ipc-client hit block carries that client's grade, unstable rate
+    /// and hit errors.
+    ///
+    /// tosu fills all four per client from that client's gameplay
+    /// (`buildResult.ts:484-497`). rtosu converted from `&HitsState`, which
+    /// structurally cannot carry any of them, so every client reported `""` /
+    /// `0.0` / `[]` while the same values sat unread in `TourneyIpcClient.play`
+    /// one level up.
+    #[test]
+    fn the_ipc_hit_block_carries_each_clients_grade_ur_and_hit_errors() {
+        let mut packet = TosuV2Packet::default();
+        let mut client = crate::v2::TourneyIpcClient {
+            ipc_id: 1,
+            ..Default::default()
+        };
+        client.play.rank.current = "XH".to_string();
+        client.play.rank.max_this_play = "S".to_string();
+        client.play.unstable_rate = 3.25;
+        client.play.hit_error_array = Arc::from(vec![-4i16, 0, 9]);
+        client.play.hits.n300 = 412;
+        packet.tourney.clients = vec![client];
+
+        let v1 = GosuCompatibleApi::from_v2(&packet);
+        let hits = &v1.tourney.ipc_clients[0].gameplay.hits;
+
+        assert_eq!(hits.grade.current, "XH");
+        assert_eq!(hits.grade.max_this_play, "S");
+        assert_eq!(hits.unstable_rate, 3.25);
+        assert_eq!(hits.hit_error_array.as_ref(), &[-4i16, 0, 9]);
+        assert_eq!(hits.n300, 412, "the counters still come across");
     }
 
     /// The key overlay is **four buttons, always**, and the values come from the

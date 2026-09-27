@@ -73,7 +73,6 @@ pub struct CachedClientState {
     pub current_checksum: String,
     #[cfg(feature = "pp")]
     pub cached_beatmap: Option<rosu_pp::Beatmap>,
-    pub cached_metadata: Option<crate::beatmap::BeatmapSnapshot>,
     pub cached_total_hits: u32,
     pub cached_hit_errors: Arc<[i16]>,
     pub cached_unstable_rate: f64,
@@ -103,6 +102,13 @@ pub struct TournamentSession {
     pub current_checksum: String,
     #[cfg(feature = "pp")]
     pub cached_beatmap: Option<rosu_pp::Beatmap>,
+    /// The file-metadata snapshot behind `current_checksum`: everything the
+    /// `.osu` file pass resolved, which later ticks restore from instead of
+    /// re-reading the file.
+    ///
+    /// This is the **session's** cache, not a per-client one, and it used to have
+    /// a byte-identical twin on `CachedClientState` that nothing ever wrote --
+    /// so a lookup on the client copy silently answered `None` forever.
     pub cached_metadata: Option<crate::beatmap::BeatmapSnapshot>,
     pub cached_stats: crate::beatmap::BeatmapStats,
     pub cached_stats_by_mods: HashMap<u32, crate::beatmap::BeatmapStats>,
@@ -412,6 +418,7 @@ impl TournamentSession {
                         beatmap_mut.time.mp3_length = meta.time.mp3_length;
                     }
                     beatmap_mut.stats.bpm = meta.stats.bpm.clone();
+                    restore_beatmap_ruleset(beatmap_mut, meta);
                 }
                 #[cfg(feature = "pp")]
                 if let (Some(beatmap_mut), Some(map)) =
@@ -573,13 +580,20 @@ impl TournamentSession {
                         &client.cached_hit_errors,
                         client.cached_unstable_rate,
                     ));
-                    // `grade_max` needs `menu.objectCount`; the tournament
-                    // client's cached metadata carries the same value the solo
-                    // path uses.
-                    let object_count = client
-                        .cached_metadata
-                        .as_ref()
-                        .map_or(0, |b| b.stats.objects.total);
+                    // `grade_max` needs `menu.objectCount`, which
+                    // `read_beatmap_from_ptr` already stores as
+                    // `beatmap.stats.objects.total` from `beatmap_addr + 0xF8`
+                    // (`memory/stable.ts:959`) -- the same read the solo path
+                    // uses. Taking it from the beatmap this tick already read
+                    // removes a cache lookup that was reading the wrong field
+                    // entirely: it asked `client.cached_metadata`, a
+                    // per-client field that nothing ever writes, so
+                    // `object_count` was always `0`, `remaining` was always
+                    // `<= 0`, and the projection collapsed to the current grade
+                    // for every client in a tournament. With no beatmap read
+                    // this tick there is no object count, and `0` is the
+                    // conservative answer the projection documents.
+                    let object_count = beatmap.as_ref().map_or(0, |b| b.stats.objects.total);
                     crate::client::read_gameplay_state_cached(
                         &client.memory,
                         ruleset,
@@ -977,7 +991,6 @@ impl TournamentSession {
             current_checksum: String::new(),
             #[cfg(feature = "pp")]
             cached_beatmap: None,
-            cached_metadata: None,
             cached_total_hits: 0,
             cached_hit_errors: Arc::default(),
             cached_unstable_rate: 0.0,
@@ -1307,6 +1320,69 @@ pub struct SoloSession {
     /// === 0) { sleep; continue; }`). The flag travels out of the reader on
     /// `PublishedPacket::attached` so the server can reproduce that.
     attached: bool,
+    /// `(beatmap pointer, when the next file attempt is allowed, the current
+    /// backoff)`.
+    ///
+    /// Set when a `.osu` file could not be read or parsed, so that the poll loop
+    /// does not re-read and re-parse the same missing file on every tick. See
+    /// [`SoloSession::file_attempt_due`].
+    file_load_failed: Option<(u64, Instant, Duration)>,
+}
+
+/// The first retry interval for a `.osu` file that would not load. Short enough
+/// that a map appearing mid-download is picked up promptly.
+const FILE_RETRY_INITIAL: Duration = Duration::from_millis(500);
+
+/// The ceiling on that backoff. A map that is genuinely absent then costs one
+/// attempt every five seconds for the rest of the match, rather than sixty a
+/// second.
+const FILE_RETRY_MAX: Duration = Duration::from_secs(5);
+
+/// Whether the `.osu` file behind `beatmap_addr` may be read on this tick.
+///
+/// A map that is not on disk -- not downloaded, or held by another process --
+/// fails the file pass, and the `caches_may_advance` guard then refuses to latch
+/// it so the next tick tries again. That is the right behaviour and it is what
+/// the 30-tick-freeze bug was about, but it meant the *disk* work ran on every
+/// tick too: `populate_beatmap_file_metadata` does a `read_to_string` plus a
+/// line-by-line parse, and the pp block does `fs::read` plus
+/// `Beatmap::from_bytes` on the same path. At the 60 Hz poll rate that is a full
+/// read and two parses of a missing file, sixty times a second, for as long as
+/// the map is selected -- and a tournament client selecting a map it has not
+/// downloaded is an ordinary situation, not an edge case.
+///
+/// So the retry stays **unbounded in time and bounded in rate**: a different map
+/// is always tried at once, and the same map is re-tried on a backoff that starts
+/// at [`FILE_RETRY_INITIAL`] and doubles to [`FILE_RETRY_MAX`]. A map that
+/// appears mid-match is picked up within the interval; one that never appears
+/// costs a handful of attempts over a map instead of thousands.
+///
+/// Takes the field by reference rather than `&self`: the poll body already holds
+/// an immutable borrow of `self.memory` for the whole function, so a `&self`
+/// method would not borrow-check there.
+fn file_attempt_due(state: &Option<(u64, Instant, Duration)>, beatmap_addr: u64) -> bool {
+    match state {
+        Some((failed_addr, retry_at, _)) if *failed_addr == beatmap_addr => {
+            Instant::now() >= *retry_at
+        }
+        // A different beatmap, or no recorded failure at all.
+        _ => true,
+    }
+}
+
+/// Record a failed file attempt for `beatmap_addr` and schedule the next one.
+///
+/// The delay doubles per consecutive failure on the same map and resets when a
+/// different map fails, so selecting a fresh map is never delayed by an earlier
+/// map's backoff.
+fn note_file_load_failure(state: &mut Option<(u64, Instant, Duration)>, beatmap_addr: u64) {
+    let delay = match state {
+        Some((failed_addr, _, previous_delay)) if *failed_addr == beatmap_addr => {
+            previous_delay.saturating_mul(2).min(FILE_RETRY_MAX)
+        }
+        _ => FILE_RETRY_INITIAL,
+    };
+    *state = Some((beatmap_addr, Instant::now() + delay, delay));
 }
 
 impl SoloSession {
@@ -1380,6 +1456,7 @@ impl SoloSession {
             cached_unstable_rate: 0.0,
             play_state_dirty: false,
             attached: false,
+            file_load_failed: None,
         })
     }
 
@@ -1796,25 +1873,47 @@ impl SoloSession {
                                     let osu_path = std::path::Path::new(&self.songs_folder)
                                         .join(&bm.folder)
                                         .join(&bm.filename);
+                                    // Whether the two disk operations below may run
+                                    // on this tick. A map that is not on disk -- not
+                                    // downloaded, or locked -- fails both, and the
+                                    // `else` arm below then forces a full re-read on
+                                    // the *next* tick too, so the pair used to run 60
+                                    // times a second for as long as the map was
+                                    // selected. Memory reads are cheap; a
+                                    // `read_to_string` plus a line-by-line parse
+                                    // plus `fs::read` plus `Beatmap::from_bytes` on
+                                    // the same file is not. Bounded by a backoff
+                                    // while still retrying forever, so a map that
+                                    // appears mid-match is picked up within the
+                                    // interval rather than never.
+                                    let file_attempt_due =
+                                        file_attempt_due(&self.file_load_failed, beatmap_addr);
                                     // The game's current ruleset, which
                                     // `read_beatmap_from_ptr` has just put in
                                     // `mode.number`. Captured before the file
                                     // pass overwrites it with the map's own.
-                                    let current_ruleset = bm.mode.number;
-                                    let metadata_ok =
-                                        crate::beatmap::populate_beatmap_file_metadata(
+                                    let current_ruleset = bm.current_ruleset;
+                                    let metadata_ok = if file_attempt_due {
+                                        let ok = crate::beatmap::populate_beatmap_file_metadata(
                                             &mut bm, &osu_path,
                                         );
-                                    if metadata_ok {
-                                        crate::beatmap::apply_beatmap_ruleset(
-                                            &mut bm,
-                                            current_ruleset,
-                                        );
-                                    }
+                                        if ok {
+                                            crate::beatmap::apply_beatmap_ruleset(
+                                                &mut bm,
+                                                current_ruleset,
+                                            );
+                                        }
+                                        ok
+                                    } else {
+                                        // Skipped, not attempted: report it as
+                                        // unloadable so the caches keep their
+                                        // "do not latch this" behaviour.
+                                        false
+                                    };
                                     self.cached_beatmap_metadata = bm.clone();
 
                                     #[cfg(feature = "pp")]
-                                    let file_ok = {
+                                    let file_ok = if file_attempt_due {
                                         crate::instr_scope!(BeatmapFileRead);
                                         match std::fs::read(&osu_path) {
                                             Ok(bytes) => {
@@ -1835,9 +1934,21 @@ impl SoloSession {
                                                 false
                                             }
                                         }
+                                    } else {
+                                        self.cached_beatmap = None;
+                                        false
                                     };
                                     #[cfg(not(feature = "pp"))]
                                     let file_ok = true;
+
+                                    if metadata_ok && file_ok {
+                                        self.file_load_failed = None;
+                                    } else {
+                                        note_file_load_failure(
+                                            &mut self.file_load_failed,
+                                            beatmap_addr,
+                                        );
+                                    }
 
                                     #[cfg(feature = "pp")]
                                     {
@@ -1869,6 +1980,7 @@ impl SoloSession {
                                             self.cached_beatmap_metadata.time.mp3_length;
                                     }
                                     bm.stats.bpm = self.cached_beatmap_metadata.stats.bpm.clone();
+                                    restore_beatmap_ruleset(&mut bm, &self.cached_beatmap_metadata);
                                 }
 
                                 // An unresolved read publishes nothing, which is what
@@ -2418,6 +2530,39 @@ fn caches_may_advance(read: BeatmapReadAction, metadata_ok: bool, file_ok: bool)
     }
 }
 
+/// Re-apply the beatmap file's own ruleset from a cached file-metadata snapshot.
+///
+/// The file pass (`populate_beatmap_file_metadata` then
+/// `apply_beatmap_ruleset`) runs on exactly one tick, because the checksum gate
+/// in front of it only opens when the map changes. Every later tick restores the
+/// file's metadata from a cache instead, and that restore originally copied
+/// source, tags, objects, times and bpm -- **not** `mode`, `is_convert` or
+/// `file_mode`. So `beatmap.mode` was the file's ruleset for one tick and the
+/// game's current ruleset for the rest, and `isConvert` was permanently
+/// `false` again from the second frame onward. In tournament mode the
+/// snapshot being restored is itself the pre-file-pass clone, so the wrong value
+/// is not transient there: it is the steady state.
+///
+/// `target.current_ruleset` is the game's current ruleset -- the value read from
+/// `base_addr - 0x33` and never overwritten, so it is available here however
+/// many restores have run. Reading it out of `target.mode.number` would work
+/// only on the first pass, since the file pass is what overwrites `mode`.
+///
+/// Guarded on `file_mode.is_some()` on purpose: an absent `Mode:` line means
+/// osu!standard *to the parser*, but reaching here with no file read at all
+/// means there is nothing to restore, and `apply_beatmap_ruleset` would resolve
+/// `None` to `0` and replace a real current ruleset with a guess.
+fn restore_beatmap_ruleset(
+    target: &mut crate::beatmap::BeatmapSnapshot,
+    metadata: &crate::beatmap::BeatmapSnapshot,
+) {
+    let Some(file_mode) = metadata.file_mode else {
+        return;
+    };
+    target.file_mode = Some(file_mode);
+    crate::beatmap::apply_beatmap_ruleset(target, target.current_ruleset);
+}
+
 fn should_clear_play_state(play_state_dirty: bool, next_state: i32) -> bool {
     // 0 menu, 2 play and 7 resultScreen are excluded, and so are 11 lobby,
     // 12 matchSetup and 15 onlineSelection: tosu breaks on those three with the
@@ -2470,8 +2615,12 @@ fn clear_play_state_for_new_map(packet: &mut crate::v2::TosuV2Packet) {
 mod tests {
     #[cfg(feature = "pp")]
     use super::performance_graph;
-    use super::{clear_play_state_for_new_map, should_clear_play_state};
+    use super::{
+        FILE_RETRY_INITIAL, FILE_RETRY_MAX, clear_play_state_for_new_map, file_attempt_due,
+        note_file_load_failure, restore_beatmap_ruleset, should_clear_play_state,
+    };
     use crate::v2::TosuV2Packet;
+    use std::time::{Duration, Instant};
 
     /// A finished attempt, as the provider would hold it between plays.
     fn played_packet() -> TosuV2Packet {
@@ -2794,6 +2943,143 @@ mod tests {
                 "state {state} should clear"
             );
         }
+    }
+
+    /// A `.osu` file that will not load is retried, but not sixty times a second.
+    ///
+    /// The correctness requirement is unchanged and comes first: a map whose file
+    /// could not be read must never be latched, or a previous map's tags and
+    /// object counts would sit on top of it. What changed is only the *rate* at
+    /// which the attempt is made, because both disk operations on that path --
+    /// `read_to_string` plus a line-by-line parse, and `fs::read` plus
+    /// `Beatmap::from_bytes` -- used to run on every tick for the whole time the
+    /// map was selected, and a tournament client selecting a map it has not
+    /// downloaded is an ordinary situation rather than an edge case.
+    #[test]
+    fn a_file_that_will_not_load_is_retried_on_a_backoff_not_every_tick() {
+        // Nothing has failed yet, so any map may be read.
+        assert!(file_attempt_due(&None, 0x1000));
+
+        let mut state: Option<(u64, Instant, Duration)> = None;
+        note_file_load_failure(&mut state, 0x1000);
+        assert!(
+            !file_attempt_due(&state, 0x1000),
+            "the map that just failed is not re-read on the same tick"
+        );
+
+        // A *different* map is never delayed by an earlier map's backoff.
+        assert!(
+            file_attempt_due(&state, 0x2000),
+            "a newly selected map is read immediately"
+        );
+
+        // Consecutive failures on the same map back off, and stop at the ceiling.
+        // Reset first, so the sequence below starts from a clean first failure.
+        state = None;
+        let mut delays = Vec::new();
+        for _ in 0..8 {
+            note_file_load_failure(&mut state, 0x1000);
+            delays.push(state.expect("recorded").2);
+        }
+        assert_eq!(delays[0], FILE_RETRY_INITIAL);
+        assert_eq!(delays[1], FILE_RETRY_INITIAL * 2);
+        assert_eq!(*delays.last().expect("non-empty"), FILE_RETRY_MAX);
+        assert!(
+            delays.windows(2).all(|pair| pair[1] >= pair[0]),
+            "the backoff never shrinks while the same map keeps failing"
+        );
+        assert!(!file_attempt_due(&state, 0x1000), "still backing off");
+
+        // Success clears it, so a map that becomes readable is picked up at once
+        // rather than waiting out the backoff.
+        state = None;
+        assert!(file_attempt_due(&state, 0x1000));
+    }
+
+    /// A cached file-metadata snapshot must carry the map's own ruleset and the
+    /// conversion flag forward, not just its tags and timings.
+    ///
+    /// The file pass runs on exactly one tick, so every later tick restores from
+    /// a cache instead. The restore originally copied source, tags, objects,
+    /// times and bpm and stopped there, which meant `beatmap.mode` was the
+    /// file's ruleset for one frame and the game's current ruleset for the rest,
+    /// and `isConvert` was back to `false` from the second frame onward -- so in
+    /// tournament mode, where the cached snapshot is itself the pre-file-pass
+    /// clone, that wrong value was the steady state rather than a blip.
+    #[test]
+    fn restoring_a_cached_map_keeps_its_own_ruleset_and_the_conversion_flag() {
+        // A converted osu!standard map being played in mania: the memory read
+        // gives the current ruleset (3), the file says 0.
+        let mut live = crate::beatmap::BeatmapSnapshot {
+            current_ruleset: 3,
+            ..Default::default()
+        };
+        live.mode = crate::beatmap::BeatmapMode {
+            number: 3,
+            name: "mania".to_string(),
+        };
+
+        // What the file pass cached: the map's own ruleset, already applied.
+        let mut metadata = live.clone();
+        metadata.file_mode = Some(0);
+        crate::beatmap::apply_beatmap_ruleset(&mut metadata, 3);
+
+        // A later tick restores from the cache onto a fresh memory read, which
+        // is back to reporting the current ruleset.
+        let mut restored = live.clone();
+        assert_eq!(
+            restored.mode.number, 3,
+            "precondition: the read's own value"
+        );
+        assert!(!restored.is_convert, "precondition: no file pass yet");
+
+        restore_beatmap_ruleset(&mut restored, &metadata);
+
+        assert_eq!(
+            restored.mode.number, 0,
+            "the map's own ruleset survives the restore"
+        );
+        assert_eq!(restored.mode.name, "osu");
+        assert!(
+            restored.is_convert,
+            "isConvert is recomputed from the current ruleset, not left false"
+        );
+
+        // The current ruleset itself is never clobbered, because `isConvert` and
+        // v1's `menu.gameMode` both need it after the overwrite.
+        assert_eq!(restored.current_ruleset, 3);
+
+        // Restoring twice is stable: the second pass must not read the already
+        // overwritten `mode` as if it were the current ruleset.
+        restore_beatmap_ruleset(&mut restored, &metadata);
+        assert_eq!(restored.mode.number, 0);
+        assert!(restored.is_convert, "still converted on the second pass");
+    }
+
+    /// A restore with no cached `Mode:` must leave the current ruleset alone.
+    ///
+    /// `apply_beatmap_ruleset` resolves an absent `Mode:` to osu!standard, which
+    /// is right for a file that was actually parsed. Reaching here with no file
+    /// read at all is a different thing, and applying it would replace a real
+    /// current ruleset with a guess.
+    #[test]
+    fn restoring_without_a_parsed_mode_does_not_guess_one() {
+        let mut target = crate::beatmap::BeatmapSnapshot {
+            current_ruleset: 2,
+            ..Default::default()
+        };
+        target.mode = crate::beatmap::BeatmapMode {
+            number: 2,
+            name: "fruits".to_string(),
+        };
+
+        let metadata = crate::beatmap::BeatmapSnapshot::default();
+
+        restore_beatmap_ruleset(&mut target, &metadata);
+
+        assert_eq!(target.mode.number, 2, "the current ruleset stands");
+        assert_eq!(target.mode.name, "fruits");
+        assert!(!target.is_convert);
     }
 
     /// The `reading` graph series is **present and empty**, and that is the

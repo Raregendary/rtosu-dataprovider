@@ -124,11 +124,63 @@ impl AppState {
     }
 }
 
+/// Which payload `GET /json` serves. See `config::ServerConfig::json_payload`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum JsonPayload {
+    /// The gosumemory-compatible payload, which is what tosu serves at `/json`.
+    #[default]
+    V1,
+    /// rtosu's v2 payload, which is what `/json` served before the parity work.
+    V2,
+}
+
+impl JsonPayload {
+    /// Parse the config value, warning and falling back to v1 on anything else.
+    ///
+    /// A typo must not silently serve the shape the operator was trying to avoid,
+    /// so an unrecognised value is a warning rather than a silent default.
+    pub fn from_config(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "v1" | "" => Self::V1,
+            "v2" => Self::V2,
+            other => {
+                tracing::warn!(
+                    "server.json_payload = {other:?} is not a known payload; \
+                     expected \"v1\" (tosu's choice for /json) or \"v2\". \
+                     Falling back to v1."
+                );
+                Self::V1
+            }
+        }
+    }
+}
+
 pub fn create_router(
     state: AppState,
     enable_http: bool,
     enable_ws: bool,
     cors_allow_all: bool,
+) -> Router {
+    create_router_with(
+        state,
+        enable_http,
+        enable_ws,
+        cors_allow_all,
+        JsonPayload::V1,
+    )
+}
+
+/// Build the router, with `/json`'s payload shape chosen by the operator.
+///
+/// `json_payload` only affects `/json`. `/json/v2` always serves v2 and `/json/v1`
+/// always serves v1, so a consumer can always reach either shape explicitly no
+/// matter what this is set to.
+pub fn create_router_with(
+    state: AppState,
+    enable_http: bool,
+    enable_ws: bool,
+    cors_allow_all: bool,
+    json_payload: JsonPayload,
 ) -> Router {
     let mut router = Router::new();
 
@@ -136,18 +188,6 @@ pub fn create_router(
         router = router
             .route("/json/v2", get(handle_json_v2))
             .route("/json/v2/precise", get(handle_json_v2_precise))
-            // tosu serves the gosumemory-compatible payload at `/json`
-            // (`packages/server/router/index.ts:43-53`), so `/json` serves it
-            // here too. rtosu had `/json` on the v2 payload; v2 keeps its own
-            // canonical path at `/json/v2`, which is what an existing v2
-            // consumer has to be pointed at.
-            //
-            // This is a breaking change for anything already reading v2 from
-            // `/json`, and it was a deliberate call: the point of the reader is
-            // to be a drop-in for tosu, and a gosumemory overlay pointed at
-            // `/json` cannot read v2 at all. `/json/v1` stays as an explicit
-            // alias for the same payload. See `audit-1.0.5.md` `C-01`/`L-07`.
-            .route("/json", get(handle_json_v1))
             .route("/json/v1", get(handle_json_v1))
             // The StreamCompanion payload, for overlays written against
             // StreamCompanion rather than against tosu. Flat and 136 keys, so
@@ -189,6 +229,25 @@ pub fn create_router(
             // it only delivers `applyFilters` and answers commands. Serving v2
             // here would be a superset no client asked for.
             .route("/websocket/commands", get(handle_ws_upgrade_commands));
+
+        // `/json` is the one route whose payload the operator can choose.
+        //
+        // tosu serves the gosumemory-compatible payload at `/json`
+        // (`packages/server/router/index.ts:43-53`) and the v2 payload at
+        // `/json/v2`, so v1 is the default here -- but rtosu served v2 on this
+        // path until the parity work, and a drop-in that answers a different
+        // shape on the same URL with no error signal breaks an existing consumer
+        // silently. `server.json_payload = "v2"` puts it back; `/json/v1` and
+        // `/json/v2` are unaffected either way.
+        //
+        // The choice is made on the `Router` rather than inside a single
+        // `get(...)` because the two handlers have distinct `impl Future` return
+        // types, which cannot be unified behind one call.
+        router = if json_payload == JsonPayload::V2 {
+            router.route("/json", get(handle_json_v2))
+        } else {
+            router.route("/json", get(handle_json_v1))
+        };
     }
 
     if state.overlays.is_some() {
@@ -256,11 +315,16 @@ async fn handle_json_v2(State(state): State<AppState>) -> Response {
 /// most consumers never open. The `hitErrors` array is an `Arc` clone, so the
 /// frame does not copy the list.
 async fn handle_json_v2_precise(State(state): State<AppState>) -> Response {
-    let published = state.packet_rx.borrow();
-    if !published.attached {
+    // The `Arc` is cloned out and the guard dropped before the build, for the
+    // reason given on `handle_json_v1`.
+    let (attached, packet) = {
+        let published = state.packet_rx.borrow();
+        (published.attached, Arc::clone(&published.packet))
+    };
+    if !attached {
         return not_ready();
     }
-    let precise = crate::v2::TosuPrecisePacket::from_v2(&published.packet);
+    let precise = crate::v2::TosuPrecisePacket::from_v2(&packet);
     match serde_json::to_vec(&precise) {
         Ok(json) => json_response(Bytes::from(json)),
         Err(error) => {
@@ -281,11 +345,22 @@ async fn handle_json_v2_precise(State(state): State<AppState>) -> Response {
 /// serialisation to every tick for a route almost nothing calls. See
 /// `audit-1.0.5.md` `L-07`.
 async fn handle_json_v1(State(state): State<AppState>) -> Response {
-    let published = state.packet_rx.borrow();
-    if !published.attached {
+    // Clone the `Arc` out from under the guard and drop it before building. A
+    // `watch::Ref` holds the read lock for its whole lifetime, so holding one
+    // across `from_v2` **and** `to_vec` blocks the poll loop's `tx.send` -- and
+    // `tx.send` is what every WebSocket client is waiting on. One slow `/json`
+    // request would stall the whole broadcast.
+    //
+    // `handle_json_v2` never had this problem, because the payload arrives
+    // pre-encoded and the handler only bumps a refcount.
+    let (attached, packet) = {
+        let published = state.packet_rx.borrow();
+        (published.attached, Arc::clone(&published.packet))
+    };
+    if !attached {
         return not_ready();
     }
-    let v1 = crate::v1::GosuCompatibleApi::from_v2(&published.packet);
+    let v1 = crate::v1::GosuCompatibleApi::from_v2(&packet);
     match serde_json::to_vec(&v1) {
         Ok(json) => json_response(Bytes::from(json)),
         Err(error) => {
@@ -307,11 +382,16 @@ async fn handle_json_v1(State(state): State<AppState>) -> Response {
 /// stale `200` would have been worse than leaving the choice open. See
 /// `audit-1.0.5.md` `M-08`.
 async fn handle_json_sc(State(state): State<AppState>) -> Response {
-    let published = state.packet_rx.borrow();
-    if !published.attached {
+    // The `Arc` is cloned out and the guard dropped before the build, for the
+    // reason given on `handle_json_v1`.
+    let (attached, packet) = {
+        let published = state.packet_rx.borrow();
+        (published.attached, Arc::clone(&published.packet))
+    };
+    if !attached {
         return not_ready();
     }
-    let sc = crate::sc::ScPayload::from_v2(&published.packet);
+    let sc = crate::sc::ScPayload::from_v2(&packet);
     match serde_json::to_vec(&sc) {
         Ok(json) => json_response(Bytes::from(json)),
         Err(error) => {
@@ -394,11 +474,15 @@ async fn handle_ws_stream_v1(
 /// rather than an error value is what reproduces that, and it also means a
 /// consumer never has to distinguish "no game" from a payload.
 fn v1_frame(packet_rx: &mut watch::Receiver<PublishedPacket>) -> Option<Message> {
-    let published = packet_rx.borrow_and_update();
-    if !published.attached {
+    // `borrow_and_update` marks the change as seen, and the `Ref` it returns must
+    // not outlive the refcount bump: holding it across the build and the encode
+    // blocks the poll loop's `tx.send`, so a slow frame would stall every other
+    // WebSocket client. `split_packets` does the bump and returns owned data.
+    let (attached, packet) = split_packets(packet_rx);
+    if !attached {
         return None;
     }
-    let v1 = crate::v1::GosuCompatibleApi::from_v2(&published.packet);
+    let v1 = crate::v1::GosuCompatibleApi::from_v2(&packet);
     let json = match serde_json::to_vec(&v1) {
         Ok(json) => json,
         Err(error) => {
@@ -407,6 +491,19 @@ fn v1_frame(packet_rx: &mut watch::Receiver<PublishedPacket>) -> Option<Message>
         }
     };
     ws_text(Bytes::from(json))
+}
+
+/// Mark the current value as seen and hand back owned copies, so no `watch` guard
+/// is alive while a caller builds or encodes anything.
+///
+/// This is the one rule every payload frame builder follows. `watch::Ref` holds
+/// the read lock, and the poll loop's `tx.send` needs the write lock, so a guard
+/// that spans a serialisation turns one slow consumer into a stall for every
+/// consumer. The clone is of an `Arc`, so the guard's lifetime is over as soon as
+/// this returns.
+fn split_packets(packet_rx: &mut watch::Receiver<PublishedPacket>) -> (bool, Arc<TosuV2Packet>) {
+    let published = packet_rx.borrow_and_update();
+    (published.attached, Arc::clone(&published.packet))
 }
 
 async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
@@ -1018,13 +1115,14 @@ fn drain_inbound_frame(message: Option<Result<Message, axum::Error>>, pathname: 
 
 /// Build, encode and wrap the precise payload for the current published state.
 fn precise_frame(packet_rx: &mut watch::Receiver<PublishedPacket>) -> Option<Message> {
-    let published = packet_rx.borrow_and_update();
     // Silent while detached, like the other three streams and like tosu's own
-    // loop; see `v1_frame`.
-    if !published.attached {
+    // loop; see `v1_frame`. The guard is also dropped before the build; see
+    // `split_packets`.
+    let (attached, packet) = split_packets(packet_rx);
+    if !attached {
         return None;
     }
-    let precise = crate::v2::TosuPrecisePacket::from_v2(&published.packet);
+    let precise = crate::v2::TosuPrecisePacket::from_v2(&packet);
     match serde_json::to_vec(&precise) {
         Ok(json) => ws_text(Bytes::from(json)),
         Err(error) => {
@@ -1152,8 +1250,13 @@ async fn handle_ws_tokens(
                 // bytes first; the filter path cannot, because the bytes only
                 // exist after the parse.
                 let frame = {
-                    let published = packet_rx.borrow_and_update();
-                    if !published.attached {
+                    // The `Arc` is cloned out and the guard dropped before the
+                    // build. This stream is the worst case: the SC payload is
+                    // built, filtered and re-encoded per frame **per client**, so
+                    // a guard held across it would let one connected client stall
+                    // the poll loop for every other client. See `split_packets`.
+                    let (attached, packet) = split_packets(&mut packet_rx);
+                    if !attached {
                         // Silent while no game is attached, as on every other
                         // stream; see `v1_frame`.
                         None
@@ -1163,7 +1266,7 @@ async fn handle_ws_tokens(
                         let frame = if filters.is_empty() {
                             None
                         } else {
-                            let json = sc_bytes(&published.packet);
+                            let json = sc_bytes(&packet);
                             match filter_frame(&filters, &json) {
                                 Some(frame) => Some(frame),
                                 // A payload that will not parse or will not encode must
@@ -1171,14 +1274,14 @@ async fn handle_ws_tokens(
                                 // payload for this tick and keep the connection.
                                 None => {
                                     tracing::warn!("filtering failed; sending the full payload");
-                                    ws_text(sc_bytes(&published.packet))
+                                    ws_text(sc_bytes(&packet))
                                 }
                             }
                         };
                         match frame {
                             Some(frame) => Some(frame),
                             // Unfiltered: the whole SC payload, freshly built.
-                            None => ws_text(sc_bytes(&published.packet)),
+                            None => ws_text(sc_bytes(&packet)),
                         }
                     }
                 };
@@ -1289,23 +1392,15 @@ async fn handle_ws_stream(mut socket: WebSocket, mut packet_rx: watch::Receiver<
 
     // Send immediate initial state, unless there is no game: tosu's socket loop
     // skips its send entirely with no instance, so it never opens with a frame
-    // either. See `v1_frame`.
-    let initial_json = if packet_rx.borrow().attached {
-        packet_rx.borrow_and_update().json.clone()
-    } else {
-        packet_rx.borrow_and_update();
-        Bytes::new()
-    };
-    if !initial_json.is_empty() {
-        match ws_text(initial_json) {
-            Some(frame) => {
-                if socket.send(frame).await.is_err() {
-                    tracing::debug!("WebSocket client disconnected during initial handshake");
-                    return;
-                }
+    // either. See `v2_frame`.
+    match v2_frame(&mut packet_rx) {
+        Some(frame) => {
+            if socket.send(frame).await.is_err() {
+                tracing::debug!("WebSocket client disconnected during initial handshake");
+                return;
             }
-            None => tracing::warn!("WebSocket client received no initial packet"),
         }
+        None => tracing::debug!("no initial packet: osu! is not attached"),
     }
 
     // Stream updates on each tick. The payload was encoded once by the poll
@@ -1325,13 +1420,7 @@ async fn handle_ws_stream(mut socket: WebSocket, mut packet_rx: watch::Receiver<
                 if changed.is_err() {
                     break;
                 }
-                let json_str = if packet_rx.borrow().attached {
-                    packet_rx.borrow_and_update().json.clone()
-                } else {
-                    packet_rx.borrow_and_update();
-                    Bytes::new()
-                };
-                let Some(frame) = ws_text(json_str) else {
+                let Some(frame) = v2_frame(&mut packet_rx) else {
                     continue;
                 };
                 if socket.send(frame).await.is_err() {
@@ -1342,6 +1431,29 @@ async fn handle_ws_stream(mut socket: WebSocket, mut packet_rx: watch::Receiver<
     }
 
     tracing::debug!("WebSocket client disconnected");
+}
+
+/// The pre-encoded v2 bytes for the current published state, or `None` while no
+/// osu! is attached.
+///
+/// This has to be an `Option` and the caller has to skip on `None`, the way the
+/// other three streams already do. Substituting an empty `Bytes` instead is not
+/// equivalent: empty bytes are valid UTF-8, so `ws_text` turns them into a
+/// zero-length `Message::Text("")` and sends it. Every consumer of this socket --
+/// both bundled overlays included -- calls `JSON.parse(event.data)` on the frame,
+/// so that takes a `SyntaxError` at exactly the moment the game exits, which is
+/// the between-maps restart in a tournament. tosu sends nothing in that state
+/// (`utils/socket.ts`, `if (!osuInstance || clients.size === 0)`), so silence is
+/// also the faithful answer.
+fn v2_frame(packet_rx: &mut watch::Receiver<PublishedPacket>) -> Option<Message> {
+    // This one is cheap enough that the guard could stay: it only clones
+    // pre-encoded bytes and never builds anything. `borrow_and_update` still has
+    // to happen, so the read lock is taken and released immediately.
+    let published = packet_rx.borrow_and_update();
+    if !published.attached || published.json.is_empty() {
+        return None;
+    }
+    ws_text(published.json.clone())
 }
 
 /// Start the tosu-compatible HTTP and WebSocket server.
@@ -1358,6 +1470,7 @@ pub async fn start_server(
     cors_allow_all: bool,
     overlays_dir: Option<std::path::PathBuf>,
     packet_rx: watch::Receiver<PublishedPacket>,
+    json_payload: JsonPayload,
 ) -> Result<()> {
     if !enable_http && !enable_ws {
         tracing::info!(
@@ -1374,6 +1487,7 @@ pub async fn start_server(
         cors_allow_all,
         overlays_dir,
         packet_rx,
+        json_payload,
     )
     .await
 }
@@ -1397,12 +1511,13 @@ pub async fn serve_with_listener(
     cors_allow_all: bool,
     overlays_dir: Option<std::path::PathBuf>,
     packet_rx: watch::Receiver<PublishedPacket>,
+    json_payload: JsonPayload,
 ) -> Result<()> {
     let state = match overlays_dir {
         Some(root) => AppState::with_overlays(packet_rx, root),
         None => AppState::new(packet_rx),
     };
-    let app = create_router(state, enable_http, enable_ws, cors_allow_all);
+    let app = create_router_with(state, enable_http, enable_ws, cors_allow_all, json_payload);
 
     if let Ok(addr) = listener.local_addr() {
         tracing::info!("Listening on TCP socket {}", addr);
@@ -1551,8 +1666,122 @@ mod tests {
         }
     }
 
-    /// With no osu! attached, **all four** `/json*` routes answer
-    /// `500 {"error":"osu is not ready/running"}` -- and none of them serves a
+    /// `server.json_payload` chooses what `/json` serves, and `/json/v1` and
+    /// `/json/v2` are unaffected by it.
+    ///
+    /// Repointing `/json` to v1 was a breaking change, so the escape hatch has to
+    /// be real: an operator whose overlay reads v2 from that path sets
+    /// `json_payload = "v2"` and is back where they were, without waiting for
+    /// every consumer to move to `/json/v2`.
+    #[tokio::test]
+    async fn the_json_payload_option_puts_the_old_shape_back_on_json() {
+        // The config value parses to the enum, and an unknown value falls back to
+        // v1 rather than to whatever the operator was trying to avoid.
+        assert_eq!(JsonPayload::from_config("v1"), JsonPayload::V1);
+        assert_eq!(JsonPayload::from_config("V2"), JsonPayload::V2);
+        assert_eq!(JsonPayload::from_config(" v1 "), JsonPayload::V1);
+        assert_eq!(JsonPayload::from_config(""), JsonPayload::V1);
+        assert_eq!(JsonPayload::from_config("v3"), JsonPayload::V1);
+        assert_eq!(JsonPayload::from_config("yes"), JsonPayload::V1);
+
+        let shape_of = |router: Router, uri: &'static str| async move {
+            let body = axum::body::to_bytes(
+                router
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap()
+                    .into_body(),
+                usize::MAX,
+            )
+            .await
+            .unwrap();
+            serde_json::from_slice::<serde_json::Value>(&body).expect("json body")
+        };
+
+        for (payload, expect_v1) in [(JsonPayload::V1, true), (JsonPayload::V2, false)] {
+            let mut sample = TosuV2Packet::default();
+            sample.client = "stable".to_string();
+            let (_tx, rx) = watch::channel(PublishedPacket::new(sample).expect("serialize"));
+
+            let app = create_router_with(AppState::new(rx.clone()), true, true, true, payload);
+            let root = shape_of(app, "/json").await;
+            // `settings` is the v1-only marker, and `profile` the v2-only one.
+            assert_eq!(
+                root.get("settings").is_some(),
+                expect_v1,
+                "/json with {payload:?}"
+            );
+            assert_eq!(
+                root.get("profile").is_some(),
+                !expect_v1,
+                "/json with {payload:?}"
+            );
+
+            // The explicit paths never move, whatever the option says.
+            let app = create_router_with(AppState::new(rx.clone()), true, true, true, payload);
+            assert!(
+                shape_of(app, "/json/v1").await.get("settings").is_some(),
+                "/json/v1 is v1 under {payload:?}"
+            );
+            let app = create_router_with(AppState::new(rx), true, true, true, payload);
+            assert!(
+                shape_of(app, "/json/v2").await.get("profile").is_some(),
+                "/json/v2 is v2 under {payload:?}"
+            );
+        }
+    }
+
+    /// The three data sockets send **no frame at all** while no osu! is
+    /// attached, and that includes `/websocket/v2`.
+    ///
+    /// This one stream used to substitute an empty `Bytes` for the detached case
+    /// instead of skipping the send. Empty bytes are valid UTF-8, so `ws_text`
+    /// turned them into a zero-length `Message::Text("")` and transmitted it --
+    /// which is not silence, it is a frame that every consumer of this socket
+    /// feeds to `JSON.parse`. Both bundled overlays do exactly that, so the
+    /// game's exit produced a `SyntaxError` in each of them at the
+    /// between-maps restart.
+    ///
+    /// The assertion is on the *shape* of the frame, not just its absence: a zero
+    /// length text frame is a distinct value from `None`, and only `None` means
+    /// nothing was sent.
+    #[tokio::test]
+    async fn the_data_sockets_send_nothing_while_nothing_is_attached() {
+        let mut sample = TosuV2Packet::default();
+        sample.client = "stable".to_string();
+
+        let (_tx, rx) = watch::channel(PublishedPacket::new(sample).expect("serialize").detached());
+        let mut rx = rx;
+
+        // None, and specifically not a text frame of length 0.
+        assert!(
+            v2_frame(&mut rx).is_none(),
+            "/websocket/v2 must send nothing, not an empty frame"
+        );
+        assert!(v1_frame(&mut rx).is_none(), "/ws");
+        assert!(precise_frame(&mut rx).is_none(), "/websocket/v2/precise");
+
+        // Once something is attached, all three produce a frame again -- the
+        // guard is not "never send".
+        let attached = PublishedPacket::new(TosuV2Packet::default()).expect("serialize");
+        let (_tx2, mut rx2) = watch::channel(attached);
+        for (name, frame) in [
+            ("/websocket/v2", v2_frame(&mut rx2)),
+            ("/ws", v1_frame(&mut rx2)),
+            ("/websocket/v2/precise", precise_frame(&mut rx2)),
+        ] {
+            let frame = frame.unwrap_or_else(|| panic!("{name} must send when attached"));
+            let Message::Text(text) = frame else {
+                panic!("{name} must send a text frame");
+            };
+            assert!(
+                !text.is_empty(),
+                "{name} sent a zero-length frame even while attached"
+            );
+        }
+    }
+
+    /// With no osu! attached, **all four** `/json*` routes answer    /// `500 {"error":"osu is not ready/running"}` -- and none of them serves a
     /// payload.
     ///
     /// tosu's guard is identical on all four (`router/index.ts:44-46`,
@@ -2138,7 +2367,17 @@ mod tests {
         let (_tx, rx) = watch::channel(PublishedPacket::new(sample).expect("serialize"));
 
         // Even with an invalid or bound port, if both are false, it should succeed immediately
-        let res = start_server("127.0.0.1", 0, false, false, true, None, rx).await;
+        let res = start_server(
+            "127.0.0.1",
+            0,
+            false,
+            false,
+            true,
+            None,
+            rx,
+            JsonPayload::V1,
+        )
+        .await;
         assert!(res.is_ok());
     }
 

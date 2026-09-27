@@ -40,7 +40,10 @@ pub struct LocalProfile {
     pub background_colour: u32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+/// `Default` is derived so the reshape in `reader::gameplay_to_play` can be
+/// tested without a live process handle -- every field here has a meaningful
+/// zero, and the struct is a plain read of one.
+#[derive(Debug, Clone, Serialize, Default)]
 pub struct GameplayState {
     pub player_name: String,
     pub mode: i32,
@@ -1071,8 +1074,16 @@ pub fn calculate_tosu_grade(
 /// `object_count` at or below the number already judged makes the projection
 /// collapse to the current grade, which is what a caller with no beatmap
 /// context should report.
+///
+/// The parameter list is kept flat and parallel with
+/// [`calculate_tosu_grade`] on purpose: the two are the same expression with one
+/// substituted, and a struct to carry the four hit counters would obscure exactly
+/// the difference that matters. That is the same trade `pp::calc_detailed_live_and_fc_pp`
+/// makes.
+#[allow(clippy::too_many_arguments)]
 pub fn calculate_tosu_grade_projected(
     mode: i32,
+    accuracy: f64,
     hit_300: i16,
     hit_100: i16,
     hit_50: i16,
@@ -1086,14 +1097,29 @@ pub fn calculate_tosu_grade_projected(
         // Nothing left to judge: tosu's own expression collapses to
         // `great - ok - meh - miss`, which is nonsense, so the current grade is
         // the only defensible value.
-        return calculate_tosu_grade(mode, 0.0, hit_300, hit_100, hit_50, hit_miss, mods);
+        return calculate_tosu_grade(mode, accuracy, hit_300, hit_100, hit_50, hit_miss, mods);
     }
     let projected_300 = (hit_300 as i64 + remaining).clamp(0, i16::MAX as i64) as i16;
-    // On stable, `calculateGrade` ignores `accuracy` entirely and works from the
-    // statistics alone (`utils/calculators.ts:400-407` vs the lazer branch at
-    // `:31-99`), so the accuracy argument here is inert. It is passed as `0.0`
-    // rather than a real value so that nobody later reads it as meaningful.
-    calculate_tosu_grade(mode, 0.0, projected_300, hit_100, hit_50, hit_miss, mods)
+    // The accuracy argument is passed through for **catch and mania only**.
+    //
+    // On stable, `calculateGrade` branches on the mode
+    // (`utils/calculators.ts:198-224`): `case 0` and `case 1` grade from the
+    // statistics alone (`r300`/`r50`), while `case 2` and `case 3` grade purely
+    // from accuracy thresholds. Passing a placeholder `0.0` here -- which is what
+    // this used to do, on the stated ground that stable "ignores `accuracy`
+    // entirely" -- matches no arm of the catch or mania scale, so every
+    // osu!catch and osu!mania play reported `maxThisPlay: "D"` while the current
+    // grade beside it was correct. For osu!std and taiko the argument is
+    // genuinely inert.
+    calculate_tosu_grade(
+        mode,
+        accuracy,
+        projected_300,
+        hit_100,
+        hit_50,
+        hit_miss,
+        mods,
+    )
 }
 
 fn net_date_to_iso(memory: &ProcessMemory, base: u64) -> Result<String> {
@@ -1298,6 +1324,7 @@ pub fn read_gameplay_state_cached(
     // grade had not yet fallen.
     let grade_max = calculate_tosu_grade_projected(
         mode,
+        accuracy,
         hit_300,
         hit_100,
         hit_50,
@@ -2108,7 +2135,7 @@ mod tests {
     fn the_projected_grade_is_not_the_current_grade() {
         assert_eq!(calculate_tosu_grade(0, 68.75, 9, 6, 0, 1, 0), "D");
         assert_eq!(
-            calculate_tosu_grade_projected(0, 9, 6, 0, 1, 0, 604),
+            calculate_tosu_grade_projected(0, 68.75, 9, 6, 0, 1, 0, 604),
             "A",
             "the value tosu served for maxThisPlay"
         );
@@ -2116,7 +2143,7 @@ mod tests {
         // An untouched 604-300 play projects to itself.
         assert_eq!(calculate_tosu_grade(0, 100.0, 604, 0, 0, 0, 0), "X");
         assert_eq!(
-            calculate_tosu_grade_projected(0, 604, 0, 0, 0, 0, 604),
+            calculate_tosu_grade_projected(0, 100.0, 604, 0, 0, 0, 0, 604),
             "X",
             "nothing left to judge: the projection is the current grade"
         );
@@ -2124,8 +2151,14 @@ mod tests {
         // Nothing judged at all: tosu's own expression subtracts more 300s than
         // exist, so the guard returns the current grade rather than a nonsense
         // ratio. This is also what a caller with no beatmap context gets.
-        assert_eq!(calculate_tosu_grade_projected(0, 0, 0, 0, 0, 0, 604), "X");
-        assert_eq!(calculate_tosu_grade_projected(0, 0, 0, 0, 0, 0, 0), "X");
+        assert_eq!(
+            calculate_tosu_grade_projected(0, 100.0, 0, 0, 0, 0, 0, 604),
+            "X"
+        );
+        assert_eq!(
+            calculate_tosu_grade_projected(0, 100.0, 0, 0, 0, 0, 0, 0),
+            "X"
+        );
     }
 
     /// A miss cannot be projected away, so the projection can never outrank what
@@ -2136,16 +2169,28 @@ mod tests {
         // 1 miss in 604: the S arm needs `miss == 0`, so the best it can reach
         // is A via the `r300 > 0.9` fallback. `great` projects to 603, so
         // `r300 = 603/604`.
-        assert_eq!(calculate_tosu_grade_projected(0, 1, 0, 0, 1, 0, 604), "A");
+        assert_eq!(
+            calculate_tosu_grade_projected(0, 99.0, 1, 0, 0, 1, 0, 604),
+            "A"
+        );
         // The same play with no miss projects to 604/604, which is the `r300 == 1`
         // arm, so it reaches X rather than S.
-        assert_eq!(calculate_tosu_grade_projected(0, 1, 0, 0, 0, 0, 604), "X");
+        assert_eq!(
+            calculate_tosu_grade_projected(0, 100.0, 1, 0, 0, 0, 0, 604),
+            "X"
+        );
         // Leaving one 100 unprojected keeps `r300` below 1, which is what makes
         // the S arm reachable: 599/604, no miss, no 50s.
-        assert_eq!(calculate_tosu_grade_projected(0, 1, 5, 0, 0, 0, 604), "S");
+        assert_eq!(
+            calculate_tosu_grade_projected(0, 99.0, 1, 5, 0, 0, 0, 604),
+            "S"
+        );
         // 50s are not projected away either, so enough of them cap the grade at A
         // even with no miss at all: 584/604 with `r50 = 20/604`.
-        assert_eq!(calculate_tosu_grade_projected(0, 0, 0, 20, 0, 0, 604), "A");
+        assert_eq!(
+            calculate_tosu_grade_projected(0, 97.0, 0, 0, 20, 0, 0, 604),
+            "A"
+        );
     }
 
     /// HD and FL turn X into XH and S into SH, on the projection as well as on
@@ -2154,31 +2199,68 @@ mod tests {
     #[test]
     fn the_projection_honours_the_silver_mods() {
         let hd = mod_bits::HD;
-        assert_eq!(calculate_tosu_grade_projected(0, 1, 5, 0, 0, 0, 604), "S");
-        assert_eq!(calculate_tosu_grade_projected(0, 1, 5, 0, 0, hd, 604), "SH");
-        assert_eq!(calculate_tosu_grade_projected(0, 1, 0, 0, 0, 0, 604), "X");
-        assert_eq!(calculate_tosu_grade_projected(0, 1, 0, 0, 0, hd, 604), "XH");
+        assert_eq!(
+            calculate_tosu_grade_projected(0, 99.0, 1, 5, 0, 0, 0, 604),
+            "S"
+        );
+        assert_eq!(
+            calculate_tosu_grade_projected(0, 99.0, 1, 5, 0, 0, hd, 604),
+            "SH"
+        );
+        assert_eq!(
+            calculate_tosu_grade_projected(0, 100.0, 1, 0, 0, 0, 0, 604),
+            "X"
+        );
+        assert_eq!(
+            calculate_tosu_grade_projected(0, 100.0, 1, 0, 0, 0, hd, 604),
+            "XH"
+        );
     }
 
-    /// osu!catch and osu!mania grade on **accuracy**, and tosu's projection never
-    /// touches it -- it swaps only the statistics. On stable `calculateGrade`
-    /// reads `params.accuracy` for those two modes
-    /// (`utils/calculators.ts:51-99`), so the projection cannot be reproduced
-    /// for them without also passing the accuracy through.
+    /// osu!catch and osu!mania grade on **accuracy**, so the projection has to
+    /// carry it.
     ///
-    /// `0.0` is passed deliberately: it makes the divergence visible as the
-    /// accuracy floor rather than hiding it, and it is what osu!mania/catch
-    /// report before any object is judged. Recorded rather than papered over.
+    /// On stable `calculateGrade` branches on the mode
+    /// (`utils/calculators.ts:198-224`): `case 0` and `case 1` grade from the
+    /// statistics, `case 2` and `case 3` from accuracy alone. The projection
+    /// used to pass a placeholder `0.0`, on the stated ground that stable
+    /// "ignores accuracy entirely" -- true for osu!std and taiko, false for the
+    /// other two. With `0.0` no catch or mania arm matched, so every osu!catch
+    /// and osu!mania play reported `maxThisPlay: "D"` while the current grade
+    /// beside it was correct. These assertions fail against that.
     #[test]
-    fn the_projection_is_inert_for_the_accuracy_driven_modes() {
+    fn the_projection_carries_the_accuracy_for_the_accuracy_driven_modes() {
         // Catch needs accuracy > 98 for S and > 94 for A.
         assert_eq!(calculate_tosu_grade(2, 99.0, 10, 5, 1, 0, 0), "S");
         assert_eq!(calculate_tosu_grade(2, 97.0, 10, 5, 1, 0, 0), "A");
         // Mania needs >= 95 for S.
         assert_eq!(calculate_tosu_grade(3, 97.0, 10, 5, 1, 0, 0), "S");
-        // tosu returns the current grade here, because its accuracy is passed
-        // through unchanged. rtosu returns the floor. Known divergence.
-        assert_eq!(calculate_tosu_grade_projected(2, 10, 5, 1, 0, 0, 604), "D");
-        assert_eq!(calculate_tosu_grade_projected(3, 10, 5, 1, 0, 0, 604), "D");
+
+        // The accuracy passes through unchanged, and those two modes never look
+        // at the statistics, so the projection **is** the current grade.
+        assert_eq!(
+            calculate_tosu_grade_projected(2, 99.0, 10, 5, 1, 0, 0, 604),
+            "S"
+        );
+        assert_eq!(
+            calculate_tosu_grade_projected(2, 97.0, 10, 5, 1, 0, 0, 604),
+            "A"
+        );
+        assert_eq!(
+            calculate_tosu_grade_projected(3, 97.0, 10, 5, 1, 0, 0, 604),
+            "S"
+        );
+
+        // And it is not a constant: the grade still tracks the accuracy, so a
+        // player who is losing accuracy sees the projection fall with it. Catch's
+        // arms are `> 0.98 S`, `> 0.94 A`, `> 0.90 B`, `> 0.85 C`, else D.
+        assert_eq!(
+            calculate_tosu_grade_projected(2, 88.0, 10, 5, 1, 0, 0, 604),
+            "C"
+        );
+        assert_eq!(
+            calculate_tosu_grade_projected(2, 83.0, 10, 5, 1, 0, 0, 604),
+            "D"
+        );
     }
 }
