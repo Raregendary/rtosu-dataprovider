@@ -95,6 +95,11 @@ pub fn create_router(
             // tosu file endpoints that overlays use to display the current
             // beatmap background, so drop-in overlays render unchanged.
             .route("/files/beatmap/background", get(handle_beatmap_background))
+            // The shim rewrites /Songs/ onto /files/beatmap/ and passes
+            // /files/skin/ through, so both destinations have to exist. See K-01.
+            .route("/files/beatmap/{*path}", get(handle_songs_file))
+            .route("/Songs/{*path}", get(handle_songs_file))
+            .route("/files/skin/{*path}", get(handle_skin_file))
             .route("/backgroundImage", get(handle_beatmap_background))
             // Overlay pages trigger this automatically; answer it so the
             // browser console stays free of spurious 404s.
@@ -278,6 +283,81 @@ async fn handle_beatmap_background(State(state): State<AppState>, raw_query: Raw
     }
 }
 
+/// Serve a file from inside the songs folder, at the path the overlay asked for.
+///
+/// tosu exposes the whole Songs tree at `/Songs/*` (`router/v1.ts:5`) and again at
+/// `/files/beatmap/*` (`router/v2.ts:39-59`), and the overlay shim rewrites
+/// `/Songs/` onto `/files/beatmap/`. rtosu registered neither destination, so
+/// every overlay asking for a beatmap preview, the `.osu` file or any other song
+/// asset got a 404 with an empty body. See `K-01` in audit-1.0.5.md.
+///
+/// Range requests are not handled yet. tosu streams 206/416 for these paths
+/// (`utils/directories.ts:129-152`), which is what lets an overlay's `<audio>`
+/// element seek; that is a separate change from serving the file at all.
+async fn handle_songs_file(State(state): State<AppState>, Path(rel): Path<String>) -> Response {
+    // Copy out of the watch guard before awaiting: the guard is not `Send` and
+    // handler futures must be.
+    let songs = {
+        let published = state.packet_rx.borrow();
+        published.packet.folders.songs.clone()
+    };
+    serve_contained_file(canonical_songs_root(&songs), &rel, "song file").await
+}
+
+/// Serve a file from inside the skin folder.
+///
+/// tosu serves this at `/files/skin/*` for stable clients and throws for lazer
+/// (`router/v2.ts:61-96`, `:82-86`); rtosu reads stable only, so the stable
+/// behaviour is the whole of it.
+async fn handle_skin_file(State(state): State<AppState>, Path(rel): Path<String>) -> Response {
+    let skin = {
+        let published = state.packet_rx.borrow();
+        published.packet.folders.skin.clone()
+    };
+    serve_contained_file(canonical_songs_root(&skin), &rel, "skin file").await
+}
+
+/// Resolve `relative` under `root` and serve it, or 404 with a body.
+///
+/// The body matters: an empty 404 is axum's unmatched-path fallback, which is how
+/// `every_file_route_the_shim_advertises_is_registered` tells "this route exists but
+/// the file is not there" from "this route does not exist at all".
+async fn serve_contained_file(
+    root: Option<std::path::PathBuf>,
+    relative: &str,
+    missing: &'static str,
+) -> Response {
+    let requested = relative.trim();
+    let Some(root) = root.filter(|_| !requested.is_empty()) else {
+        return not_found(missing);
+    };
+
+    let joined = root.join(requested);
+    let Some(path) = contained_in_songs(&root, [joined.as_path()]) else {
+        tracing::debug!("requested file is not inside the served folder: {requested}");
+        return not_found(missing);
+    };
+
+    let content_type = overlays::content_type_for(&path);
+    match overlays::read_file(&path).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, content_type),
+                // Song and skin assets are addressed by a path that is reused
+                // across maps, so a cached copy would outlive the map it came from.
+                (header::CACHE_CONTROL, "no-store"),
+            ],
+            Body::from(bytes),
+        )
+            .into_response(),
+        Err(err) => {
+            tracing::debug!("serving {requested} failed: {err:#}");
+            not_found(missing)
+        }
+    }
+}
+
 /// The overlay store, or `None` when overlays are disabled.
 fn overlay_store(state: &AppState) -> Option<Arc<OverlayStore>> {
     state.overlays.clone()
@@ -294,7 +374,7 @@ async fn handle_overlays_index(State(state): State<AppState>) -> Response {
 }
 
 async fn handle_overlay_shim() -> Response {
-    let body = Body::from(overlays::OVERLAY_SHIM_JS);
+    let body = Body::from(overlays::overlay_shim_js());
     (
         [
             (header::CONTENT_TYPE, "text/javascript; charset=utf-8"),
@@ -1089,9 +1169,184 @@ mod tests {
         )
         .await;
         assert!(body.contains("__rtosuOverlayShim"));
-        assert!(body.contains("'/ws': '/websocket/v2'"));
+        // '/ws' is an identity mapping, not a redirect onto the v2 socket: rtosu
+        // serves the real gosumemory payload there, and a v1 overlay cannot read
+        // v2. This string was pinned in three places -- here, in the shim's own
+        // substring test, and in the route table it duplicated -- which is how the
+        // mapping survived every other change. See `K-02` in audit-1.0.5.md.
+        assert!(body.contains("'/ws': '/ws'"));
+        assert!(!body.contains("'/ws': '/websocket/v2'"));
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The song and skin routes have to serve bytes, not merely exist.
+    ///
+    /// tosu serves the whole Songs tree at `/Songs/*` and `/files/beatmap/*`
+    /// (`router/v1.ts:5`, `router/v2.ts:39-59`) and skins at `/files/skin/*`
+    /// (`router/v2.ts:61-96`), and the overlay shim rewrites an overlay's
+    /// `/Songs/` onto `/files/beatmap/`. Both destinations used to 404, which is
+    /// why a drop-in overlay could show nothing but the current map's metadata.
+    #[tokio::test]
+    async fn the_song_and_skin_routes_serve_the_file_that_was_asked_for() {
+        let root = temp_overlay_root("songfiles");
+        let songs = root.join("songs");
+        let skins = root.join("skins");
+        let mapset = songs.join("123 Artist - Title");
+        std::fs::create_dir_all(&mapset).unwrap();
+        std::fs::create_dir_all(&skins).unwrap();
+
+        // Names chosen to be awkward in a path but legal on disk.
+        let audio = mapset.join("audio.mp3");
+        let beatmap_file = mapset.join("map.osu");
+        let element = skins.join("rank.png");
+        std::fs::write(&audio, b"ID3-bytes").unwrap();
+        std::fs::write(&beatmap_file, b"[Beatmap]\n").unwrap();
+        std::fs::write(&element, b"PNG-bytes").unwrap();
+
+        let mut sample = TosuV2Packet::default();
+        sample.folders.songs = songs.to_string_lossy().into_owned();
+        sample.folders.skin = skins.to_string_lossy().into_owned();
+        let (_tx, rx) = watch::channel(PublishedPacket::new(sample).expect("serialize"));
+        let app = create_router(AppState::new(rx), true, false, true);
+
+        for (uri, expected) in [
+            ("/Songs/123%20Artist%20-%20Title/audio.mp3", "ID3-bytes"),
+            (
+                "/files/beatmap/123%20Artist%20-%20Title/audio.mp3",
+                "ID3-bytes",
+            ),
+            (
+                "/files/beatmap/123%20Artist%20-%20Title/map.osu",
+                "[Beatmap]\n",
+            ),
+            ("/files/skin/rank.png", "PNG-bytes"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri} should be served");
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(bytes.as_ref(), expected.as_bytes(), "{uri} body");
+        }
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Containment is the part that has to hold: these are new file-serving
+    /// endpoints, and tosu's own `directoryWalker` has no traversal protection at
+    /// all (`utils/directories.ts:56` is a bare `path.join` of a post-decode,
+    /// caller-supplied path). rtosu's background route already refuses to serve
+    /// outside the songs folder, and these routes must not be the way around it.
+    #[tokio::test]
+    async fn the_song_and_skin_routes_cannot_escape_their_folders() {
+        let root = temp_overlay_root("songescape");
+        let songs = root.join("songs");
+        let skins = root.join("skins");
+        std::fs::create_dir_all(&songs).unwrap();
+        std::fs::create_dir_all(&skins).unwrap();
+        let secret = root.join("secret.txt");
+        std::fs::write(&secret, b"top secret").unwrap();
+
+        let mut sample = TosuV2Packet::default();
+        sample.folders.songs = songs.to_string_lossy().into_owned();
+        sample.folders.skin = skins.to_string_lossy().into_owned();
+        let (_tx, rx) = watch::channel(PublishedPacket::new(sample).expect("serialize"));
+        let app = create_router(AppState::new(rx), true, false, true);
+
+        // A relative climb, an encoded climb, a backslash climb, an absolute
+        // path, and the same through the skin route.
+        for uri in [
+            "/Songs/../secret.txt",
+            "/Songs/%2e%2e/secret.txt",
+            "/Songs/..%2fsecret.txt",
+            "/Songs/..\\secret.txt",
+            "/files/beatmap/../../secret.txt",
+            "/files/beatmap/..%2f..%2fsecret.txt",
+            "/files/skin/../secret.txt",
+            "/files/skin/%2e%2e/secret.txt",
+        ] {
+            let (status, body) = get_text(app.clone(), uri).await;
+            assert_ne!(
+                body.trim(),
+                "top secret",
+                "{uri} served a file from outside the songs folder"
+            );
+            assert!(
+                status == StatusCode::NOT_FOUND || body.trim().is_empty(),
+                "{uri} should be a 404, got {status} with {body:?}"
+            );
+        }
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Close the loop between the shim and the router.
+    ///
+    /// `overlays::shim_source_rewrites_the_documented_tosu_routes` asserts the shim
+    /// *contains* the right characters, which cannot notice that a route it
+    /// advertises was never registered. Deleting `/files/beatmap/background` from
+    /// `create_router` would leave that test green while every overlay asking for
+    /// the beatmap background got a 404. This test issues real requests instead.
+    ///
+    /// A request cannot simply be required to be non-404, because a *registered*
+    /// route may legitimately 404: `/files/beatmap/background` answers 404 when no
+    /// beatmap is loaded, which is the state this runs in. axum's unmatched-path
+    /// fallback is distinguishable by its shape -- 404 with an empty body -- so the
+    /// discriminator is the same null control `validations/compare_routes.py` uses
+    /// against a live server.
+    ///
+    /// Fails today: the shim advertises `/Songs/` and `/files/skin/`, rewritten onto
+    /// paths with no handler. See `K-01` and `K-02` in audit-1.0.5.md.
+    #[tokio::test]
+    async fn every_file_route_the_shim_advertises_is_registered() {
+        // Straight off the one const the shim itself is generated from, so this
+        // cannot fall out of step with what is actually served.
+        let destinations: Vec<String> = crate::overlays::FILE_ROUTES
+            .iter()
+            .map(|(_, to)| (*to).to_string())
+            .collect();
+        assert!(
+            destinations.len() >= 4,
+            "FILE_ROUTES should advertise at least four routes, got {destinations:?}"
+        );
+
+        // And the generated shim really does contain each of them.
+        let js = crate::overlays::overlay_shim_js();
+        for (from, to) in crate::overlays::FILE_ROUTES {
+            let entry = format!("['{from}', '{to}']");
+            assert!(js.contains(&entry), "shim is missing {entry}");
+        }
+
+        let root = temp_overlay_root("shimroutes");
+        let mut unregistered: Vec<String> = Vec::new();
+        for destination in &destinations {
+            // A destination ending in '/' is a prefix the shim appends the rest of
+            // the overlay's path to, so probe below it. Anything else is an exact
+            // path, and must be probed as-is: appending to '/files/beatmap/background'
+            // would ask for '/files/beatmap/backgroundprobe', which is not the
+            // registered route and would report a false positive.
+            let probe = if destination.ends_with('/') {
+                format!("{destination}probe")
+            } else {
+                destination.clone()
+            };
+            let (status, body) = get_text(overlay_app(root.clone()), &probe).await;
+            if status == StatusCode::NOT_FOUND && body.is_empty() {
+                unregistered.push(destination.clone());
+            }
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(
+            unregistered.is_empty(),
+            "the shim rewrites overlays onto paths the router does not register, so every \
+             overlay using them gets a 404: {unregistered:?}"
+        );
     }
 
     #[tokio::test]

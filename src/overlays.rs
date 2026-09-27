@@ -454,7 +454,40 @@ fn find_doctype(html: &str) -> Option<usize> {
 /// rewrites the tosu socket and file endpoints onto the overlay's own origin so
 /// a folder can be dropped in unmodified, and also exposes `window.__rtosu` for
 /// overlays that prefer to read the provider address explicitly.
-pub const OVERLAY_SHIM_JS: &str = r##"/* rtosu-dataprovider browser overlay compatibility shim.
+/// tosu file endpoints an overlay may reference, and the rtosu path each is
+/// rewritten to.
+///
+/// This is the single source of truth for both the shim's `FILE_ROUTES` array and
+/// the test that checks the router actually serves them. It used to exist twice —
+/// once as a JavaScript array literal inside `OVERLAY_SHIM_JS` and once implicitly
+/// in the route table in `server.rs` — and nothing connected them, so the shim
+/// could advertise a path with no handler and the substring test that "checked" it
+/// would still pass. See `K-01` and `K-02` in audit-1.0.5.md.
+pub const FILE_ROUTES: &[(&str, &str)] = &[
+    ("/backgroundImage", "/files/beatmap/background"),
+    ("/Songs/", "/files/beatmap/"),
+    ("/files/beatmap/", "/files/beatmap/"),
+    ("/files/skin/", "/files/skin/"),
+];
+
+/// The `FILE_ROUTES` array as JavaScript, generated from [`FILE_ROUTES`].
+fn file_routes_js() -> String {
+    FILE_ROUTES
+        .iter()
+        .map(|(from, to)| format!("['{from}', '{to}']"))
+        .collect::<Vec<_>>()
+        .join(",\n    ")
+}
+
+/// The overlay compatibility shim, with the file-route table spliced in.
+pub fn overlay_shim_js() -> String {
+    static JS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        OVERLAY_SHIM_TEMPLATE.replace("__FILE_ROUTES__", &file_routes_js())
+    });
+    JS.clone()
+}
+
+const OVERLAY_SHIM_TEMPLATE: &str = r##"/* rtosu-dataprovider browser overlay compatibility shim.
  * Injected by the server into every overlay page. Rewrites the tosu API
  * endpoints onto the origin the overlay was actually loaded from, so overlays
  * that hardcode ws://127.0.0.1:24050 keep working on a custom port or over LAN.
@@ -469,20 +502,25 @@ pub const OVERLAY_SHIM_JS: &str = r##"/* rtosu-dataprovider browser overlay comp
   var HOST = window.location.host;
   var LOOPBACK = ['127.0.0.1', 'localhost', '0.0.0.0', '[::1]', '::1', '::'];
 
-  // tosu socket endpoints -> rtosu-dataprovider equivalents. rtosu serves the
-  // tosu v2 payload on /websocket/v2, so the tosu v1 /ws path is mapped onto it.
+  // tosu socket endpoints -> rtosu-dataprovider equivalents. Every entry is an
+  // identity mapping: its job is to re-home a hardcoded loopback URL onto the
+  // page's own host and scheme, not to change the path.
+  //
+  // '/ws' used to map to '/websocket/v2', which handed every v1 (gosumemory)
+  // overlay the v2 payload. rtosu now serves the real v1 payload on '/ws', so
+  // the mapping is an identity: a v1 overlay that connects to
+  // ws://127.0.0.1:24050/ws reaches ws://<page-host>/ws and gets v1. Do not
+  // "simplify" this back to the v2 path -- a v1 overlay cannot read v2.
   var SOCKET_ROUTES = {
-    '/ws': '/websocket/v2',
+    '/ws': '/ws',
     '/websocket/v2': '/websocket/v2',
     '/websocket/v2/precise': '/websocket/v2/precise'
   };
 
   // tsu file endpoints used by overlays to show the beatmap background.
+  // Generated from FILE_ROUTES in src/overlays.rs; do not hand-edit.
   var FILE_ROUTES = [
-    ['/backgroundImage', '/files/beatmap/background'],
-    ['/Songs/', '/files/beatmap/'],
-    ['/files/beatmap/', '/files/beatmap/'],
-    ['/files/skin/', '/files/skin/']
+    __FILE_ROUTES__
   ];
 
   function isLoopback(hostname) {
@@ -1131,11 +1169,22 @@ mod tests {
         );
     }
 
+    /// Note what this does *not* prove: it checks that the shim contains the right
+    /// characters, not that the routes it advertises exist. It never builds a
+    /// router, so deleting a route from `create_router` would leave this green
+    /// while every overlay asking for that path got a 404. Two of the file routes
+    /// the shim names are exactly that failure today, which means this assertion
+    /// currently certifies them as correct.
+    ///
+    /// The companion test that does close the loop is
+    /// `server::tests::every_file_route_the_shim_advertises_is_registered`, which
+    /// issues real requests against the router. See `K-02` in audit-1.0.5.md.
     #[test]
     fn shim_source_rewrites_the_documented_tosu_routes() {
-        let js = OVERLAY_SHIM_JS;
+        let js = overlay_shim_js();
         for needle in [
-            "'/ws': '/websocket/v2'",
+            // Identity, not a redirect to v2: a v1 overlay cannot read v2.
+            "'/ws': '/ws'",
             "'/websocket/v2/precise'",
             "'/backgroundImage', '/files/beatmap/background'",
             "'/Songs/', '/files/beatmap/'",
