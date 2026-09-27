@@ -1495,6 +1495,217 @@ pub fn read_key_overlay(
     }
 }
 
+/// The in-play leaderboard: every score osu! has in its score list, in the
+/// order the list holds them.
+///
+/// A port of `leaderboard(mode)` and `leaderboardPlayer(base, mode)` in
+/// `tosu-sourcecode/packages/tosu/src/memory/stable.ts:1200-1321`, against the
+/// same already-resolved `ruleset_address` the key overlay uses, so no new
+/// pattern scan is involved. The walk, in tosu's order:
+///
+/// ```text
+/// base        = u32 (rulesetAddress + 0x78)
+/// address     = u32 (base + 0x24)
+/// playersAddr = u32 (address + 0x4)
+/// itemsBase   = u32 (playersAddr + 0x4)
+/// itemsSize   = i32 (playersAddr + 0xC)
+/// entry_i     = u32 (itemsBase + 0x8 + 4 * i)      // leaderStart = 0x8
+/// ```
+///
+/// `leaderStart` is `0x8` for the whole of tosu -- it is a private field on
+/// `Memory` (`memory/index.ts:36`) that is never reassigned, so it is a constant
+/// rather than something to read.
+///
+/// Two of tosu's early exits are reproduced as-is: a null `base`/`address`, and
+/// `slotsAmount < 1`, both answer an empty list. tosu's third is a `break` the
+/// moment any entry fails to resolve ("break due to un-consistency of
+/// leaderboard"), which is why a partially-readable list is truncated rather
+/// than skipped -- a gap in an array walk means the stride is wrong, and
+/// continuing would emit entries at the wrong offset.
+///
+/// **Scope:** the hit counts are read as osu!std's four judgements and mapped
+/// straight through, which is what `fromLegacyHitResults(mode, ...)` does for
+/// `mode === 0` with its `geki: 0` / `katu: 0` seeds. taiko, catch and mania
+/// remap the same four words differently and are not covered here; rtosu is
+/// scoped to osu!stable, and the accuracy and grade helpers already take the
+/// ruleset so those rulesets are a per-mode mapping away.
+pub fn read_leaderboard(
+    memory: &ProcessMemory,
+    ruleset_address: u64,
+    mode: i32,
+) -> Vec<crate::v2::LeaderboardEntry> {
+    let at = |base: u64, offset: u64| base.saturating_add(offset);
+    fn pointer(value: u32) -> Option<u64> {
+        (value != 0 && value != u32::MAX).then_some(value as u64)
+    }
+
+    let Some(base) = memory
+        .read_u32(at(ruleset_address, 0x78))
+        .ok()
+        .and_then(pointer)
+    else {
+        return Vec::new();
+    };
+    let Some(address) = memory.read_u32(at(base, 0x24)).ok().and_then(pointer) else {
+        return Vec::new();
+    };
+    let Some(players_addr) = memory.read_u32(at(address, 0x4)).ok().and_then(pointer) else {
+        return Vec::new();
+    };
+    let Ok(items_size) = memory.read_i32(at(players_addr, 0xC)) else {
+        return Vec::new();
+    };
+    // tosu reads `slotsAmount` and then re-reads the same word as `itemsSize`;
+    // they are one field, so one read serves both.
+    if items_size < 1 {
+        return Vec::new();
+    }
+    let Some(items_base) = memory
+        .read_u32(at(players_addr, 0x4))
+        .ok()
+        .and_then(pointer)
+    else {
+        return Vec::new();
+    };
+
+    // osu!'s own bound: a list cannot hold more entries than the one it is
+    // walking, and an unbounded `read` loop is exactly the shape that hangs the
+    // poll when the stride is wrong.
+    let items_size = items_size.clamp(0, 512);
+
+    let mut entries = Vec::with_capacity(items_size as usize);
+    for index in 0..items_size as u64 {
+        let Some(slot) = memory
+            .read_u32(at(items_base, 0x8 + 4 * index))
+            .ok()
+            .and_then(pointer)
+        else {
+            break;
+        };
+        match read_leaderboard_player(memory, slot, mode) {
+            Some(entry) => entries.push(entry),
+            None => break,
+        }
+    }
+    entries
+}
+
+/// One row of [`read_leaderboard`], already in the v2 payload's shape.
+///
+/// Field order and every offset are `buildResultV2.ts:46-87` and
+/// `stable.ts:1259-1321`. `None` is tosu's `undefined`, which the caller turns
+/// into the `break`.
+fn read_leaderboard_player(
+    memory: &ProcessMemory,
+    base: u64,
+    mode: i32,
+) -> Option<crate::v2::LeaderboardEntry> {
+    let at = |addr: u64, offset: u64| addr.saturating_add(offset);
+    fn pointer(value: u32) -> Option<u64> {
+        (value != 0 && value != u32::MAX).then_some(value as u64)
+    }
+
+    // tosu reads this once as an int for the statistics and once as a pointer for
+    // the user id. osu! stable is 32-bit, so both are the same four bytes.
+    let entry = memory.read_u32(at(base, 0x20)).ok()?;
+    if entry == 0 {
+        return None;
+    }
+    let entry = entry as u64;
+
+    // Mods come from the same XOR pair the gameplay read uses:
+    // `(scoreBase + 0x1C) + 0xC ^ (scoreBase + 0x1C) + 0x8`, read here off the
+    // per-entry score object.
+    let mods = memory
+        .read_u32(at(entry, 0x1C))
+        .ok()
+        .and_then(pointer)
+        .and_then(|mods_ptr| {
+            let xor2 = memory.read_u32(at(mods_ptr, 0xC)).ok()?;
+            let xor1 = memory.read_u32(at(mods_ptr, 0x8)).ok()?;
+            Some(xor1 ^ xor2)
+        })
+        .unwrap_or(0);
+
+    // `scoreAddr` is `base + 0x20` read as a pointer (`stable.ts:1281`).
+    let user_id = memory
+        .read_u32(at(base, 0x20))
+        .ok()
+        .and_then(pointer)
+        .and_then(|score_addr| {
+            let user_ptr = memory
+                .read_u32(at(score_addr, 0x48))
+                .ok()
+                .and_then(pointer)?;
+            memory.read_i32(at(user_ptr, 0x70)).ok()
+        })
+        .unwrap_or(0);
+
+    let hit_300 = memory.read_u16(at(entry, 0x8A)).unwrap_or(0) as i16;
+    let hit_100 = memory.read_u16(at(entry, 0x88)).unwrap_or(0) as i16;
+    let hit_50 = memory.read_u16(at(entry, 0x8C)).unwrap_or(0) as i16;
+    let hit_miss = memory.read_u16(at(entry, 0x92)).unwrap_or(0) as i16;
+
+    let accuracy = calculate_accuracy(mode, hit_300, hit_100, hit_50, hit_miss, 0, 0, mods);
+    // tosu's `calculateAccuracy` ends `+((numerator / denominator) * 100).toFixed(2)`
+    // (`utils/calculators.ts:86`) -- unconditionally, not gated on needing it.
+    // Measured: tosu `95.66` and `71.6` where the raw ratios are
+    // `95.66003616636529` and `71.60493827160494`.
+    //
+    // `round_value` is the same rule in `f32`; the accuracy is an `f64`, and
+    // narrowing it first would round twice and lose the low digits tosu keeps.
+    let accuracy = (accuracy * 100.0).round() / 100.0;
+    let name = memory
+        .read_u32(at(base, 0x8))
+        .ok()
+        .and_then(pointer)
+        .map(|name_ptr| crate::beatmap::read_sharp_string_ptr(memory, name_ptr))
+        .and_then(Result::ok)
+        .unwrap_or_default();
+
+    Some(crate::v2::LeaderboardEntry {
+        // tosu: `isFailed: memoryPlayer.isPassing === false`, and
+        // `isPassing: Boolean(byte)` -- any non-zero byte is passing.
+        is_failed: memory.read_u8(at(base, 0x4B)).unwrap_or(0) == 0,
+        position: memory.read_i32(at(base, 0x2C)).unwrap_or(0),
+        team: memory.read_i32(at(base, 0x40)).unwrap_or(0),
+        id: user_id,
+        name,
+        score: memory.read_i32(at(base, 0x30)).unwrap_or(0),
+        accuracy,
+        hits: crate::v2::LeaderboardHitsState {
+            n0: hit_miss as i32,
+            n50: hit_50 as i32,
+            n100: hit_100 as i32,
+            n300: hit_300 as i32,
+            // `fromLegacyHitResults` is seeded with `geki: 0, katu: 0` for osu!std
+            // and neither judgement is stored on a stable score entry.
+            geki: 0,
+            katu: 0,
+        },
+        combo: crate::v2::ComboState {
+            current: memory.read_u16(at(entry, 0x94)).unwrap_or(0) as i32,
+            max: memory.read_u16(at(entry, 0x68)).unwrap_or(0) as i32,
+        },
+        mods: crate::v2::create_mods_state(mods, &format_mods(mods)),
+        // Always empty, and that is tosu's behaviour rather than a gap here.
+        // `buildResultV2.ts:369` calls
+        // `convertMemoryPlayerToResult(slot, Rulesets[gameplay.mode], client)` --
+        // it passes the ruleset *name* (`"osu"`, `"taiko"`, ...) where the
+        // signature declares `gameMode: any` and `calculateGrade` switches on
+        // `params.mode` against the numeric cases 0-3
+        // (`utils/calculators.ts:144-172`). A string matches no case, `rank` is
+        // never assigned past its `let rank = ''` initialiser, and every
+        // leaderboard row is emitted with `rank: ""`.
+        //
+        // Verified live against tosu on map 1949715: both rows carried
+        // `"rank":""` where a correctly-computed grade would have been `A` and
+        // `C`. Reproduced, not corrected: see `audit-1.0.5.md`'s ground rule on
+        // tosu quirks.
+        rank: String::new(),
+    })
+}
+
 pub fn find_pattern(
     memory: &ProcessMemory,
     pattern_source: &str,
@@ -2262,5 +2473,26 @@ mod tests {
             calculate_tosu_grade_projected(2, 83.0, 10, 5, 1, 0, 0, 604),
             "D"
         );
+    }
+
+    /// The leaderboard row's `accuracy` is `fixDecimals`-rounded, tosu's
+    /// unconditional `.toFixed(2)`.
+    ///
+    /// The two numbers are the ones tosu served for the live leaderboard of map
+    /// 1949715, and the ratios behind them are the ones rtosu computed:
+    /// 523/22/4/6 and 17/7/0/3 against the same totals.
+    #[test]
+    fn a_leaderboard_row_accuracy_is_rounded_to_two_decimals() {
+        for (n300, n100, n50, miss, expected) in
+            [(521i16, 22i16, 4i16, 6i16, 95.66), (17, 7, 0, 3, 71.6)]
+        {
+            let raw = calculate_accuracy(0, n300, n100, n50, miss, 0, 0, 0);
+            assert_ne!(
+                raw, expected,
+                "the fixture must actually need rounding, or it proves nothing"
+            );
+            // The same rule `round_value` applies, in the accuracy's own `f64`.
+            assert_eq!((raw * 100.0).round() / 100.0, expected);
+        }
     }
 }

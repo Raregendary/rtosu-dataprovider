@@ -539,6 +539,7 @@ pub fn populate_beatmap_file_metadata(snapshot: &mut BeatmapSnapshot, path: &Pat
     let mut timing_points: Vec<(f64, f64)> = Vec::new();
     let mut timing_spans: Vec<TimingPointSpan> = Vec::new();
     let mut breaks: Vec<BreakSpan> = Vec::new();
+    let mut background_filename: Option<String> = None;
     for raw_line in content.lines() {
         let line = raw_line.trim();
         if line.starts_with('[') && line.ends_with(']') {
@@ -598,6 +599,27 @@ pub fn populate_beatmap_file_metadata(snapshot: &mut BeatmapSnapshot, path: &Pat
                 // false. Reading only the modern form silently reported **zero**
                 // breaks for a map tosu reported three for.
                 let values = line.split(',').map(str::trim).collect::<Vec<_>>();
+                // The background filename, in the same two spellings, for the
+                // same reason. See `the_background_event_names_the_file` and
+                // `a_map_whose_memory_read_was_empty_still_names_its_background`.
+                let background_at = match values.first().copied() {
+                    // `Background,"bg.jpg",0,0` -- filename in slot 1.
+                    Some(first) if first.eq_ignore_ascii_case("background") => Some(1),
+                    // `0,0,"bg.jpg",0,0` -- LegacyEventType.Background, filename in
+                    // slot 2. `0` is the background type; `1` is a video and must
+                    // not be mistaken for one.
+                    Some("0") => Some(2),
+                    _ => None,
+                };
+                if let Some(index) = background_at
+                    && background_filename.is_none()
+                    && let Some(name) = values.get(index)
+                {
+                    let name = name.trim().trim_matches('"');
+                    if !name.is_empty() {
+                        background_filename = Some(name.to_string());
+                    }
+                }
                 let (start_index, has_effect) = match values.first().copied() {
                     Some(first) if first.eq_ignore_ascii_case("break") => (1, None),
                     // A leading `2` is the legacy type code. Only that one value
@@ -688,6 +710,22 @@ pub fn populate_beatmap_file_metadata(snapshot: &mut BeatmapSnapshot, path: &Pat
     // to overwrite rather than survive.
     snapshot.breaks = breaks;
     snapshot.timing_points = timing_spans;
+    // The memory read at `beatmap_addr + 0x68` is the primary source, and it is
+    // the same read tosu makes (`stable.ts:945-947`). It is not always
+    // populated: on map 1949715 "HAG - Colorful [Lami's Extreme]" it came back
+    // empty while tosu reported `bg.jpg`, which emptied `files.background`,
+    // `directPath.beatmapBackground`, SC's `backgroundImageFileName` and SC's
+    // `backgroundImageLocation` all at once.
+    //
+    // The `.osu` file is the authority for the filename, and it is already being
+    // parsed for `[Events]` breaks, so the fallback costs one line of that pass.
+    // Only a genuinely empty memory read is overridden -- a non-empty one wins,
+    // so this cannot change a map that already reads correctly.
+    if snapshot.background_filename.is_empty()
+        && let Some(name) = background_filename
+    {
+        snapshot.background_filename = name;
+    }
     if !timing_points.is_empty() {
         let mut min_bpm = f32::MAX;
         let mut max_bpm: f32 = 0.0;
@@ -1919,6 +1957,84 @@ mod tests {
         assert_eq!(snapshot.breaks[0].end_time, 0);
         assert_eq!(snapshot.breaks[1].start_time, 100);
         assert_eq!(snapshot.breaks[1].end_time, 200);
+    }
+
+    /// The background filename, from both `[Events]` spellings, with the video
+    /// event (`1,`) excluded.
+    ///
+    /// The value drives four leaves that were all empty at once when the memory
+    /// read at `beatmap_addr + 0x68` came back empty on map 1949715:
+    /// `files.background`, `directPath.beatmapBackground`, and SC's
+    /// `backgroundImageFileName` / `backgroundImageLocation`. The literals are
+    /// the ones tosu served for that map.
+    #[test]
+    fn the_background_event_names_the_file_in_either_spelling() {
+        for (tag, line, expected) in [
+            ("bg-legacy", "0,0,\"bg.jpg\",0,0", "bg.jpg"),
+            ("bg-modern", "Background,\"bg.jpg\",0,0", "bg.jpg"),
+        ] {
+            let snapshot = file_metadata_snapshot(
+                tag,
+                &format!(
+                    concat!(
+                        "osu file format v14\n\n[Events]\n",
+                        "{line}\n",
+                        "1,512,0,0,0,0,1,0,0,0\n",
+                        "\n[Difficulty]\nCircleSize:4\n\n[TimingPoints]\n0,300,4,1,0\n\n",
+                        "[HitObjects]\n64,192,1134,1,0,0:0:0:0:\n"
+                    ),
+                    line = line
+                ),
+            );
+            assert_eq!(snapshot.background_filename, expected, "{tag}");
+        }
+    }
+
+    /// A video event is not a background, and the first background event wins.
+    #[test]
+    fn a_video_event_is_not_mistaken_for_the_background() {
+        let snapshot = file_metadata_snapshot(
+            "bg-video-only",
+            concat!(
+                "osu file format v14\n\n[Events]\n",
+                "1,512,0,0,0,0,1,0,0,0\n",
+                "0,0,\"first.jpg\",0,0\n",
+                "0,0,\"second.jpg\",0,0\n",
+                "\n[Difficulty]\nCircleSize:4\n\n[TimingPoints]\n0,300,4,1,0\n\n",
+                "[HitObjects]\n64,192,1134,1,0,0:0:0:0:\n"
+            ),
+        );
+        assert_eq!(snapshot.background_filename, "first.jpg");
+    }
+
+    /// The file only fills in a background the memory read left empty; a
+    /// successful read is never overridden.
+    ///
+    /// The point is the direction of the fallback. tosu reads the same field
+    /// from the same address (`stable.ts:945-947`), so on a map where that read
+    /// works the file must not be able to change the answer.
+    #[test]
+    fn the_file_only_fills_in_a_background_the_memory_read_left_empty() {
+        let mut snapshot = BeatmapSnapshot::default();
+        snapshot.background_filename = "from-memory.jpg".to_string();
+        let dir = std::env::temp_dir().join(format!(
+            "rtosu-filemeta-{}-bg-memory-wins",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("fixture.osu");
+        std::fs::write(
+            &path,
+            concat!(
+                "osu file format v14\n\n[Events]\n0,0,\"from-file.jpg\",0,0\n\n",
+                "[Difficulty]\nCircleSize:4\n\n[TimingPoints]\n0,300,4,1,0\n\n",
+                "[HitObjects]\n64,192,1134,1,0,0:0:0:0:\n"
+            ),
+        )
+        .expect("write fixture");
+        assert!(populate_beatmap_file_metadata(&mut snapshot, &path));
+        assert_eq!(snapshot.background_filename, "from-memory.jpg");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

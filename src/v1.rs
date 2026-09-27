@@ -671,7 +671,18 @@ impl GosuCompatibleApi {
                 bm: V1MenuBeatmap {
                     time: V1MenuBeatmapTime {
                         first_obj: b.time.first_object,
-                        current: packet.session.play_time,
+                        // The song position, not `session.playTime`. tosu's v1
+                        // builder reads `current: global.playTime`
+                        // (`buildResult.ts:92`), and `global.playTime` is the
+                        // song clock fed by the 10 ms `globalPrecise` loop --
+                        // the same value v2 publishes as `beatmap.time.live`
+                        // (`buildResultV2.ts:333`).
+                        //
+                        // `session.playTime` is `global.gameTime`
+                        // (`buildResultV2.ts:147`), a session-wide counter that
+                        // runs on past the end of the song. Live on map 1949715
+                        // it reported 1113770 for a map tosu placed at 11575 ms.
+                        current: b.time.live,
                         full: b.time.last_object,
                         mp3: b.time.mp3_length,
                     },

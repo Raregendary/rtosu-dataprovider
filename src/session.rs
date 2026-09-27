@@ -1303,6 +1303,13 @@ pub struct SoloSession {
     /// screen has actually been read, so the exit clear runs once and never
     /// fires for a client that was never in a map.
     play_state_dirty: bool,
+    /// The song position (`beatmap.time.live`) of the previous tick, for tosu's
+    /// `game.paused`. Not `session.playTime` -- see the note at the call site.
+    ///
+    /// `None` until the clock has been read twice: there is no previous sample
+    /// to compare against before then, and claiming "paused" on the strength of
+    /// one reading would report a pause that was never observed.
+    previous_play_time: Option<i32>,
     /// Whether an osu! process is currently attached.
     ///
     /// This is the replacement for the invented `client: "none"` /
@@ -1455,6 +1462,7 @@ impl SoloSession {
             cached_hit_errors: Arc::default(),
             cached_unstable_rate: 0.0,
             play_state_dirty: false,
+            previous_play_time: None,
             attached: false,
             file_load_failed: None,
         })
@@ -1696,7 +1704,6 @@ impl SoloSession {
                 self.cached_packet.state.name = crate::v2::osu_state_name(state).to_string();
             }
             self.cached_packet.game.focused = memory.is_foreground();
-            self.cached_packet.game.paused = state == 7;
         } else {
             self.cached_packet.game.focused = memory.is_foreground();
         }
@@ -1773,6 +1780,31 @@ impl SoloSession {
         // 3. Live audio playback time (updates continuously at 60 Hz)
         let live_time = crate::beatmap::read_live_time(memory, self.play_time_pattern_addr);
         self.cached_packet.beatmap.time.live = live_time;
+
+        // `game.paused` is not a flag anywhere in osu!. tosu derives it from two
+        // consecutive samples of the song clock
+        // (`tosu-sourcecode/packages/tosu/src/states/global.ts:68-69`):
+        //
+        //     this.paused = this.previousPlayTime === this.playTime;
+        //     this.previousPlayTime = this.playTime;
+        //
+        // **The clock is the song position, not `session.playTime`.** Those are
+        // two different reads in tosu: `session.playTime` is `global.gameTime`
+        // (`buildResultV2.ts:147`) and `beatmap.time.live` is `global.playTime`
+        // (`:333`), and it is the *precise* one that `paused` compares.
+        // `gameTime` is a session-wide counter that keeps advancing while the song
+        // is frozen -- measured live: `gameTime` ran 688170 -> 692970 across six
+        // samples while the song position sat still at 11575, and tosu reported
+        // `paused: true` throughout. Comparing `session.playTime` therefore reads
+        // "not paused" for a paused map, and also disagrees with itself, because
+        // that counter is coarse enough to repeat between two 16 ms polls.
+        //
+        // The first tick has no previous sample to compare against. tosu starts
+        // both at 0, so its first tick reports `paused: true`; seeding with
+        // `None` reports `false` instead, which is the honest answer for a clock
+        // that has only been read once.
+        self.cached_packet.game.paused = is_paused(self.previous_play_time, live_time);
+        self.previous_play_time = Some(live_time);
 
         // 4. Hierarchical beatmap reading (pointer-gated)
         if let Some(base_addr) = self.base_pattern_addr {
@@ -2178,6 +2210,13 @@ impl SoloSession {
                     // precise payload and v1's `gameplay.keyOverlay` -- are
                     // reshapes of this packet rather than separate reads.
                     self.cached_packet.play.key_overlay = g.key_overlay;
+                    // The leaderboard is read from the same ruleset base as the
+                    // key overlay, and osu! only populates its score list during
+                    // a play, so the play-state read is the one place it is live.
+                    // tosu reads it under the same gate: `updateLeaderboard()` is
+                    // called from `gameplay.ts:253`, inside the play branch.
+                    self.cached_packet.leaderboard =
+                        crate::client::read_leaderboard(memory, ruleset_addr, g.mode);
                     if self.cached_packet.play.mods.number != g.mods {
                         self.cached_packet.play.mods =
                             crate::v2::create_mods_state(g.mods, &g.mods_str);
@@ -2563,6 +2602,33 @@ fn restore_beatmap_ruleset(
     crate::beatmap::apply_beatmap_ruleset(target, target.current_ruleset);
 }
 
+/// tosu's `game.paused`, as a rule over two samples of the song clock.
+///
+/// `states/global.ts:68-69` is the whole of it upstream:
+///
+/// ```ts
+/// this.paused = this.previousPlayTime === this.playTime;
+/// this.previousPlayTime = this.playTime;
+/// ```
+///
+/// So the value is a *comparison across ticks*, not a read, and it is not
+/// derived from the game state at all. The previous code compared the osu!
+/// **game state** against 7, which is `resultScreen` -- so it reported `paused`
+/// on the results screen and `not paused` for a paused map, which is the exact
+/// inverse of what it means.
+///
+/// The clock is the song position (`beatmap.time.live`, tosu's `global.playTime`
+/// fed by the 10 ms `globalPrecise` loop), *not* `session.playTime`, which is
+/// `global.gameTime`: a session-wide counter that keeps advancing while the song
+/// is frozen.
+///
+/// `previous` is `None` on the first tick. tosu seeds both counters at 0, so its
+/// first tick reports `paused: true`; reporting `false` is the honest answer for
+/// a clock that has only been read once, and the state lasts a single tick.
+fn is_paused(previous: Option<i32>, live: i32) -> bool {
+    previous == Some(live)
+}
+
 fn should_clear_play_state(play_state_dirty: bool, next_state: i32) -> bool {
     // 0 menu, 2 play and 7 resultScreen are excluded, and so are 11 lobby,
     // 12 matchSetup and 15 onlineSelection: tosu breaks on those three with the
@@ -2617,7 +2683,7 @@ mod tests {
     use super::performance_graph;
     use super::{
         FILE_RETRY_INITIAL, FILE_RETRY_MAX, clear_play_state_for_new_map, file_attempt_due,
-        note_file_load_failure, restore_beatmap_ruleset, should_clear_play_state,
+        is_paused, note_file_load_failure, restore_beatmap_ruleset, should_clear_play_state,
     };
     use crate::v2::TosuV2Packet;
     use std::time::{Duration, Instant};
@@ -2703,6 +2769,24 @@ mod tests {
     #[test]
     fn main_menu_freezes_the_last_play_instead_of_clearing_it() {
         assert!(!should_clear_play_state(true, 0));
+    }
+
+    /// `game.paused` is a comparison across ticks, not a game-state test.
+    ///
+    /// The bug it replaces read the osu! state and compared it to 7, which is
+    /// `resultScreen` -- so a paused map reported `paused: false` and a results
+    /// screen reported `paused: true`. Both arms are pinned here, plus the
+    /// first-tick case, where there is no previous sample yet.
+    #[test]
+    fn paused_is_two_equal_song_clock_samples() {
+        // The map is paused: the song position is not moving.
+        assert!(is_paused(Some(11_575), 11_575));
+        assert!(is_paused(Some(11_575), 11_575));
+        // The map is playing: the song position advanced.
+        assert!(!is_paused(Some(11_575), 11_592));
+        // Only one sample so far. tosu would say `true` here (both of its
+        // counters start at 0); a single reading has not observed a pause.
+        assert!(!is_paused(None, 11_575));
     }
 
     #[test]
