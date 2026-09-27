@@ -423,13 +423,6 @@ pub fn populate_beatmap_file_metadata(snapshot: &mut BeatmapSnapshot, path: &Pat
                     }
                 }
             }
-            "General" => {
-                if let Some((key, value)) = line.split_once(':')
-                    && key.trim() == "AudioLength"
-                {
-                    snapshot.time.mp3_length = value.trim().parse().unwrap_or(0);
-                }
-            }
             "TimingPoints" => {
                 let values = line.split(',').map(str::trim).collect::<Vec<_>>();
                 if values.len() >= 2 {
@@ -453,10 +446,18 @@ pub fn populate_beatmap_file_metadata(snapshot: &mut BeatmapSnapshot, path: &Pat
                 let Ok(time) = values[2].parse::<f64>() else {
                     continue;
                 };
+                // The type has to parse before the object is allowed to widen
+                // the map's time range. Reading it afterwards with a fallback of
+                // 0 let a malformed line contribute to first_object and
+                // last_object while counting towards no object type, so the
+                // reported length was set by a line the reader could not
+                // actually identify.
+                let Ok(kind) = values[3].parse::<u32>() else {
+                    continue;
+                };
                 let time = time.round() as i32;
                 first_object = first_object.min(time);
                 last_object = last_object.max(time);
-                let kind = values[3].parse::<u32>().unwrap_or(0);
                 if kind & 128 != 0 {
                     holds += 1;
                 } else if kind & 8 != 0 {
@@ -1290,5 +1291,99 @@ mod tests {
                 great: 37.5,
             }
         );
+    }
+
+    /// The `[General]` table of an `.osu` file has no `AudioLength` option, so
+    /// this arm could never fire. The song length comes from the game instead,
+    /// read off the audio object at `get_audio_length_ptr` in both sessions.
+    /// The assertion is on the *behaviour* rather than the removal: a fixture
+    /// carrying a bogus `AudioLength` must not reach the payload.
+    #[test]
+    fn a_file_supplied_audio_length_is_ignored() {
+        let snapshot = file_metadata_snapshot(
+            "audio-length",
+            "osu file format v14\n\n[General]\nAudioLength:12345\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\nSliderMultiplier:1.4\nSliderTickRate:1\n\n[TimingPoints]\n0,500,4,1,0\n\n[HitObjects]\n64,192,0,1,0,0:0:0:0:\n",
+        );
+        assert_eq!(snapshot.time.mp3_length, 0);
+    }
+
+    /// Nothing in `[General]` is read any more, so the section has to be inert
+    /// rather than break the scan that follows it. Several of these lines carry
+    /// colons inside their values and one is a duplicate `Mode`, so this is also
+    /// the check that ignoring the section does not disturb the object and
+    /// timing parsing further down the file.
+    #[test]
+    fn a_general_section_is_inert_and_the_scan_continues() {
+        let snapshot = file_metadata_snapshot(
+            "general",
+            "osu file format v14\n\n[General]\nMode:0\nAudioFilename:audio.mp3\nAudioLeadIn:0\nPreviewTime:-1\nCountdown:0\nSampleSet:Normal\nStackLeniency:0.7\nMode:3\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\nSliderMultiplier:1.4\nSliderTickRate:1\n\n[TimingPoints]\n0,500,4,1,0\n\n[HitObjects]\n64,192,1000,1,0,0:0:0:0:\n64,192,2500,1,0,0:0:0:0:\n",
+        );
+        assert_eq!(snapshot.time.mp3_length, 0);
+        assert_eq!(snapshot.time.first_object, 1000);
+        assert_eq!(snapshot.time.last_object, 2500);
+        assert_eq!(snapshot.stats.objects.circles, 2);
+        assert_eq!(snapshot.stats.objects.total, 2);
+        // 60_000 / 500, so the timing points were parsed too.
+        assert_eq!(snapshot.stats.bpm.min, 120.0);
+    }
+
+    /// A hit object whose type does not parse must not be able to widen the
+    /// map's reported time range. The trailing object below sits at 9000 ms
+    /// with a non-numeric type, so a reader that counted it would report
+    /// `last_object = 9000` and stretch the map by 6 seconds.
+    #[test]
+    fn a_hit_object_with_an_unparseable_type_does_not_widen_the_map() {
+        let snapshot = file_metadata_snapshot(
+            "bad-type",
+            "osu file format v14\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\nSliderMultiplier:1.4\nSliderTickRate:1\n\n[TimingPoints]\n0,500,4,1,0\n\n[HitObjects]\n64,192,1000,1,0,0:0:0:0:\n64,192,2000,1,0,0:0:0:0:\n64,192,9000,not-a-type,0,0:0:0:0:\n",
+        );
+        assert_eq!(snapshot.time.first_object, 1000);
+        assert_eq!(snapshot.time.last_object, 2000);
+        assert_eq!(snapshot.stats.objects.circles, 2);
+        assert_eq!(snapshot.stats.objects.total, 2);
+    }
+
+    /// The companion to the test above: a well-formed trailing object still
+    /// extends the range. Without this, a fix that simply stopped reading
+    /// `last_object` would pass the regression test.
+    #[test]
+    fn a_well_formed_trailing_object_still_extends_the_map() {
+        let snapshot = file_metadata_snapshot(
+            "good-type",
+            "osu file format v14\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\nSliderMultiplier:1.4\nSliderTickRate:1\n\n[TimingPoints]\n0,500,4,1,0\n\n[HitObjects]\n64,192,1000,1,0,0:0:0:0:\n64,192,9000,1,0,0:0:0:0:\n",
+        );
+        assert_eq!(snapshot.time.first_object, 1000);
+        assert_eq!(snapshot.time.last_object, 9000);
+        assert_eq!(snapshot.stats.objects.circles, 2);
+    }
+
+    /// Every object type is classified before the range widens, so a spinner or
+    /// hold note after a malformed line must still be counted.
+    #[test]
+    fn object_types_after_a_malformed_line_are_still_counted() {
+        let snapshot = file_metadata_snapshot(
+            "mixed-types",
+            "osu file format v14\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\nSliderMultiplier:1.4\nSliderTickRate:1\n\n[TimingPoints]\n0,500,4,1,0\n\n[HitObjects]\n64,192,1000,2,0,L|400:200,1,140\n64,192,2000,12,0,9000\n64,192,9000,bogus,0,0:0:0:0:\n64,192,3000,128,0,3500:3000:0:0:0:\n",
+        );
+        let objects = &snapshot.stats.objects;
+        assert_eq!(objects.sliders, 1);
+        assert_eq!(objects.spinners, 1);
+        assert_eq!(objects.holds, 1);
+        assert_eq!(objects.circles, 0);
+        assert_eq!(objects.total, 3);
+        assert_eq!(snapshot.time.first_object, 1000);
+        assert_eq!(snapshot.time.last_object, 3000);
+    }
+
+    /// Run `populate_beatmap_file_metadata` over a fixture written to a temporary
+    /// path. The tag keeps the parallel test threads off each other's file.
+    fn file_metadata_snapshot(tag: &str, contents: &str) -> BeatmapSnapshot {
+        let dir = std::env::temp_dir().join(format!("rtosu-filemeta-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("fixture.osu");
+        std::fs::write(&path, contents).expect("write fixture");
+        let mut snapshot = BeatmapSnapshot::default();
+        assert!(populate_beatmap_file_metadata(&mut snapshot, &path));
+        snapshot
     }
 }
