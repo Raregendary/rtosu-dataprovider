@@ -18,7 +18,7 @@ own "do not fix these" list. None of its items were reopened here.
 | FIX-004 | Fixed; first claim rejected | `698fdc2` |
 | FIX-005 | Rejected — `beatmap.stats` has no `pp` | — |
 | FIX-007 | Fixed, but the stated mechanism does not apply | `9e62408` |
-| FIX-008 | Deferred — architectural, blocked | — |
+| FIX-008 | **Open** — not implemented, and not blocked either | — |
 | FIX-010 | Rejected | — |
 | FIX-011 | Fixed | `8f3d1ae` |
 | FIX-014 | Fixed | `8deca70` |
@@ -220,6 +220,29 @@ message (object address, content string address, that string's length, and its
 index). That is correct under either reading, and a cache hit now costs five
 small reads instead of a 500-slot walk. See the follow-up on `+0xC` below.
 
+### FIX-008 — not done, and not blocked either
+
+The only item in `fix.md` still outstanding.
+
+It was recorded as blocked, on the grounds that `run_serve_loop` selects over an
+`Arc<Mutex<TosuReader>>` and that moving the reader to a thread would require
+making it `Send`. **That premise is wrong.** `run_serve_loop` owns a plain local
+`mut reader: OsuReader` (`main.rs:750`, polled at `:790`) — there is no `Arc`,
+no `Mutex`, and the type is `OsuReader`, not `TosuReader`. `ProcessMemory`
+already declares `unsafe impl Send + Sync` at `process.rs:576-577`, and
+`reader_can_be_moved_to_another_thread` now asserts `OsuReader: Send` at compile
+time, so a future non-`Send` field fails there rather than mid-refactor.
+
+The rest is already in place too: `AppState` already carries a
+`watch::Receiver<PublishedPacket>`, so the channel the fix proposes to use
+exists. What remains is moving the reader into a dedicated `std::thread` driving
+the ticker from `std::time::Instant` instead of `tokio::time::sleep`, publishing
+into that channel.
+
+Not implemented here because it restructures the serve loop's threading model
+rather than fixing a defect, and it is the kind of change that wants its own
+before-and-after measurement. The mechanism is not in the way.
+
 ## Follow-ups found but not fixed
 
 1. **`play.rank` in song select — confirmed to already match.** A previous
@@ -285,8 +308,8 @@ should be made once, deliberately, and then pinned by a test either way.
 
 ### Static gates
 
-- `cargo test` — 156 passed, 0 failed
-- `cargo test --no-default-features` — 141 passed, 0 failed
+- `cargo test` — 157 passed, 0 failed
+- `cargo test --no-default-features` — 142 passed, 0 failed
 - `cargo clippy --all-targets --all-features` — 86 findings before, 86 after
 - `cargo clippy --no-default-features --all-targets` — 68 findings before, 68 after
 - `cargo build --release` — clean

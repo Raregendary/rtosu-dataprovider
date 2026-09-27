@@ -555,6 +555,18 @@ pub fn country_name(value: i32) -> &'static str {
 mod tests {
     use super::*;
 
+    /// The poll loop does synchronous memory scans, disk reads and thread
+    /// spawning, so keeping it off the async worker is only possible if the
+    /// reader can be moved to a thread of its own. `ProcessMemory` declares
+    /// `unsafe impl Send + Sync` explicitly; this asserts the property actually
+    /// holds for the whole reader, so a future field that is not `Send` fails
+    /// here rather than in the middle of a refactor.
+    #[test]
+    fn the_reader_can_be_moved_to_another_thread() {
+        fn assert_send<T: Send>() {}
+        assert_send::<OsuReader>();
+    }
+
     #[test]
     fn test_builder_defaults() {
         let builder = OsuReaderBuilder::new();
