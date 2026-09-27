@@ -80,7 +80,7 @@ pub struct CachedClientState {
     pub cached_beatmap_snapshot: Option<BeatmapSnapshot>,
     pub cached_user_ptr: u64,
     pub cached_user: Option<TournamentUser>,
-    pub cached_chat_size: usize,
+    pub cached_chat_key: Option<crate::tournament::ChatCacheKey>,
     pub cached_chat: Vec<crate::tournament::TournamentChatMessage>,
     pub last_pattern_retry: Instant,
 }
@@ -450,10 +450,10 @@ impl TournamentSession {
                     client.is_manager = true;
                     if self.enable_chat {
                         if let Some(chat_pat) = client.chat_engine_pattern_addr {
-                            let cached = if client.cached_chat_size > 0 {
-                                Some((client.cached_chat_size, client.cached_chat.as_slice()))
-                            } else {
-                                None
+                            let cached_chat = client.cached_chat.as_slice();
+                            let cached = match client.cached_chat_key.as_ref() {
+                                Some(key) if !cached_chat.is_empty() => Some((key, cached_chat)),
+                                _ => None,
                             };
                             if let Ok(chat) = read_tournament_chat(
                                 &client.memory,
@@ -461,9 +461,9 @@ impl TournamentSession {
                                 &spectator_teams,
                                 cached,
                             ) {
-                                client.cached_chat_size = chat.len();
-                                client.cached_chat = chat.clone();
-                                tourney.chat = chat;
+                                client.cached_chat_key = Some(chat.key);
+                                client.cached_chat = chat.messages.clone();
+                                tourney.chat = chat.messages;
                             }
                         }
                     }
@@ -936,7 +936,7 @@ impl TournamentSession {
             cached_beatmap_snapshot: None,
             cached_user_ptr: 0,
             cached_user: None,
-            cached_chat_size: 0,
+            cached_chat_key: None,
             cached_chat: Vec::new(),
             last_pattern_retry: Instant::now(),
         })
