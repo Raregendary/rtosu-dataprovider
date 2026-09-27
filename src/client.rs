@@ -200,7 +200,10 @@ const TOURNAMENT_MANAGER_FLAGS: [&str; 4] = ["-tourney", "/tourney", "-tournamen
 /// empty packet forever while reporting no error.
 pub fn is_tournament_manager_cmd(cmd: &str) -> bool {
     CommandLineTokens::new(cmd).any(|token| {
-        let token = token.strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(token);
+        let token = token
+            .strip_prefix('"')
+            .and_then(|t| t.strip_suffix('"'))
+            .unwrap_or(token);
         let flag = token.split('=').next().unwrap_or(token);
         TOURNAMENT_MANAGER_FLAGS
             .iter()
@@ -213,39 +216,85 @@ pub struct ModEntry {
     pub acronym: String,
 }
 
+/// Bit positions of osu!'s `Mods` bitfield, as the `u32` this crate reads out
+/// of process memory (the `x ^ y` of osu!'s two mirrored mod fields).
+///
+/// Every constant is a single bit. A value that combines several mods is left as
+/// a literal at the site that needs it, because naming only the individual bits
+/// is what makes a combination readable. The bit order here is osu!'s, not a
+/// sorted one: the key-count mods are scattered (`K4`..`K8` at 15..19, then
+/// `FI`..`CN` at 20..22, then `K9`, `K10`, `K1`, `K3`, `K2` at 24..28), so the
+/// grouping below follows [`compute_format_mods`]'s table rather than
+/// alphabetising it.
+pub mod mod_bits {
+    pub const NF: u32 = 1 << 0;
+    pub const EZ: u32 = 1 << 1;
+    pub const TD: u32 = 1 << 2;
+    pub const HD: u32 = 1 << 3;
+    pub const HR: u32 = 1 << 4;
+    pub const SD: u32 = 1 << 5;
+    pub const DT: u32 = 1 << 6;
+    pub const RX: u32 = 1 << 7;
+    pub const HT: u32 = 1 << 8;
+    pub const NC: u32 = 1 << 9;
+    pub const FL: u32 = 1 << 10;
+    pub const AT: u32 = 1 << 11;
+    pub const SO: u32 = 1 << 12;
+    pub const AP: u32 = 1 << 13;
+    pub const PF: u32 = 1 << 14;
+    /// osu!mania 4K.
+    pub const K4: u32 = 1 << 15;
+    pub const K5: u32 = 1 << 16;
+    pub const K6: u32 = 1 << 17;
+    pub const K7: u32 = 1 << 18;
+    pub const K8: u32 = 1 << 19;
+    pub const FI: u32 = 1 << 20;
+    pub const RD: u32 = 1 << 21;
+    pub const CN: u32 = 1 << 22;
+    pub const TG: u32 = 1 << 23;
+    pub const K9: u32 = 1 << 24;
+    pub const K10: u32 = 1 << 25;
+    pub const K1: u32 = 1 << 26;
+    pub const K3: u32 = 1 << 27;
+    pub const K2: u32 = 1 << 28;
+    /// ScoreV2, set by osu! on a live score processor and not a gameplay mod.
+    pub const SCORE_V2: u32 = 1 << 29;
+    pub const MR: u32 = 1 << 30;
+}
+
 fn compute_format_mods(mods: u32) -> String {
     const VALUES: [(u32, &str, u8); 31] = [
-        (1, "NF", 99), // Replicate tosu quirk: ModsOrder['nf'] is 0 which is falsy in JS, defaulting order to 99
-        (2, "EZ", 1),
-        (4, "TD", 7),
-        (8, "HD", 2),
-        (16, "HR", 4),
-        (32, "SD", 5),
-        (64, "DT", 3),
-        (128, "RX", 99),
-        (256, "HT", 3),
-        (512, "NC", 3),
-        (1024, "FL", 6),
-        (2048, "AT", 99),
-        (4096, "SO", 5),
-        (8192, "AP", 99),
-        (16384, "PF", 5),
-        (1 << 15, "4K", 99),
-        (1 << 16, "5K", 99),
-        (1 << 17, "6K", 99),
-        (1 << 18, "7K", 99),
-        (1 << 19, "8K", 99),
-        (1 << 20, "FI", 99),
-        (1 << 21, "RD", 99),
-        (1 << 22, "CN", 99),
-        (1 << 23, "TG", 99),
-        (1 << 24, "9K", 99),
-        (1 << 25, "10K", 99),
-        (1 << 26, "1K", 99),
-        (1 << 27, "3K", 99),
-        (1 << 28, "2K", 99),
-        (1 << 29, "v2", 99),
-        (1 << 30, "MR", 99),
+        (mod_bits::NF, "NF", 99), // Replicate tosu quirk: ModsOrder['nf'] is 0 which is falsy in JS, defaulting order to 99
+        (mod_bits::EZ, "EZ", 1),
+        (mod_bits::TD, "TD", 7),
+        (mod_bits::HD, "HD", 2),
+        (mod_bits::HR, "HR", 4),
+        (mod_bits::SD, "SD", 5),
+        (mod_bits::DT, "DT", 3),
+        (mod_bits::RX, "RX", 99),
+        (mod_bits::HT, "HT", 3),
+        (mod_bits::NC, "NC", 3),
+        (mod_bits::FL, "FL", 6),
+        (mod_bits::AT, "AT", 99),
+        (mod_bits::SO, "SO", 5),
+        (mod_bits::AP, "AP", 99),
+        (mod_bits::PF, "PF", 5),
+        (mod_bits::K4, "4K", 99),
+        (mod_bits::K5, "5K", 99),
+        (mod_bits::K6, "6K", 99),
+        (mod_bits::K7, "7K", 99),
+        (mod_bits::K8, "8K", 99),
+        (mod_bits::FI, "FI", 99),
+        (mod_bits::RD, "RD", 99),
+        (mod_bits::CN, "CN", 99),
+        (mod_bits::TG, "TG", 99),
+        (mod_bits::K9, "9K", 99),
+        (mod_bits::K10, "10K", 99),
+        (mod_bits::K1, "1K", 99),
+        (mod_bits::K3, "3K", 99),
+        (mod_bits::K2, "2K", 99),
+        (mod_bits::SCORE_V2, "v2", 99),
+        (mod_bits::MR, "MR", 99),
     ];
     let mut parts: Vec<(u8, usize, &str)> = VALUES
         .iter()
@@ -600,7 +649,7 @@ const MANIA_MAX_SCORE_V2: f64 = 305.0;
 ///
 /// osu!mania weights MAX/rainbow 300s (`hit_geki`) as the primary judgement,
 /// which is why this takes the whole mod mask: the MAX weight is
-/// [`MANIA_MAX_SCORE_V1`] unless the ScoreV2 bit (`1 << 29`) is set.
+/// [`MANIA_MAX_SCORE_V1`] unless the ScoreV2 bit (`mod_bits::SCORE_V2`) is set.
 #[allow(clippy::too_many_arguments)]
 pub fn calculate_accuracy(
     mode: i32,
@@ -640,7 +689,7 @@ pub fn calculate_accuracy(
             }
         }
         3 => {
-            let max_score = if mods & (1 << 29) != 0 {
+            let max_score = if (mods & mod_bits::SCORE_V2) != 0 {
                 MANIA_MAX_SCORE_V2
             } else {
                 MANIA_MAX_SCORE_V1
@@ -922,6 +971,15 @@ pub fn read_hit_errors(memory: &ProcessMemory, score_base: u64) -> Result<Vec<i1
     read_hit_errors_arc(memory, score_base).map(|arc| arc.to_vec())
 }
 
+/// Unstable rate from the live hit-error array, in osu!'s own units (the
+/// hit-error standard deviation x 10, as a percentage).
+///
+/// A rate mod shortens the same hit errors in real time, so the raw spread has
+/// to be divided by the clock rate to describe the play, not the wall clock.
+/// Nightcore shares Double Time's branch: it is the same 1.5x clock, and osu!
+/// stable normally sets the DT bit *alongside* NC — the `DTNC` -> `NC` collapse
+/// in [`compute_format_mods`] only makes sense if both arrive — so testing NC on
+/// its own is hardening rather than a user-visible fix.
 pub fn calculate_unstable_rate(hit_errors: &[i16], mods: u32) -> f64 {
     if hit_errors.is_empty() {
         return 0.0;
@@ -937,9 +995,9 @@ pub fn calculate_unstable_rate(hit_errors: &[i16], mods: u32) -> f64 {
         .sum::<f64>()
         / count;
     let rate = variance.sqrt() * 10.0;
-    if mods & 64 != 0 {
+    if (mods & mod_bits::DT) != 0 || (mods & mod_bits::NC) != 0 {
         rate / 1.5
-    } else if mods & 256 != 0 {
+    } else if (mods & mod_bits::HT) != 0 {
         rate / 0.75
     } else {
         rate
@@ -955,7 +1013,7 @@ pub fn calculate_tosu_grade(
     hit_miss: i16,
     mods: u32,
 ) -> String {
-    let silver = mods & 8 != 0 || mods & 1024 != 0;
+    let silver = (mods & mod_bits::HD) != 0 || (mods & mod_bits::FL) != 0;
     let perfect = if silver { "XH" } else { "X" };
     let s_hit = if silver { "SH" } else { "S" };
     match mode {
@@ -1141,7 +1199,7 @@ pub fn read_gameplay_state_cached(
         0
     };
     if score_processor != 0 {
-        mods |= 536870912; // ScoreV2 (1 << 29)
+        mods |= mod_bits::SCORE_V2;
     }
     let mods_str = format_mods(mods);
 
@@ -1253,9 +1311,9 @@ pub fn find_pattern(
 mod tests {
     use super::{
         CommandLineTokens, GameplayState, MAX_HIT_ERRORS, ProcessSnapshotResult,
-        calculate_accuracy, calculate_grade, calculate_unstable_rate, format_mods,
-        hit_error_items_address, hit_error_window, is_tournament_manager_cmd, parse_hit_errors,
-        parse_spectate_client_arg,
+        calculate_accuracy, calculate_grade, calculate_unstable_rate, compute_format_mods,
+        format_mods, hit_error_items_address, hit_error_window, is_tournament_manager_cmd,
+        mod_bits, parse_hit_errors, parse_spectate_client_arg,
     };
 
     /// `List<int>._items` as it looks in the game's address space: the 8-byte
@@ -1325,7 +1383,7 @@ mod tests {
         assert_eq!(format_mods(24), "HDHR");
         assert_eq!(format_mods(64), "DT");
         assert_eq!(format_mods(512), "NC");
-        assert_eq!(format_mods(536870912), "v2");
+        assert_eq!(format_mods(mod_bits::SCORE_V2), "v2");
     }
 
     #[test]
@@ -1416,7 +1474,9 @@ mod tests {
             CommandLineTokens::new("").collect::<Vec<_>>(),
             Vec::<&str>::new()
         );
-        assert!(!is_tournament_manager_cmd("osu!.exe \"C:\\Songs\\a\\\" -tourney\""));
+        assert!(!is_tournament_manager_cmd(
+            "osu!.exe \"C:\\Songs\\a\\\" -tourney\""
+        ));
     }
 
     /// A flag still counts when it arrives wrapped in quotes, which is not how
@@ -1426,8 +1486,12 @@ mod tests {
     #[test]
     fn a_quoted_flag_still_counts_as_a_manager() {
         assert!(is_tournament_manager_cmd("osu!.exe \"-tourney\""));
-        assert!(is_tournament_manager_cmd("osu!.exe \"-tourney=127.0.0.1:24050\""));
-        assert!(!is_tournament_manager_cmd("osu!.exe \"C:\\Songs\\-tourney\\map.osu\""));
+        assert!(is_tournament_manager_cmd(
+            "osu!.exe \"-tourney=127.0.0.1:24050\""
+        ));
+        assert!(!is_tournament_manager_cmd(
+            "osu!.exe \"C:\\Songs\\-tourney\\map.osu\""
+        ));
     }
 
     #[test]
@@ -1578,6 +1642,189 @@ mod tests {
         assert!(nomod > dt);
     }
 
+    /// FIX-027: Nightcore is the same 1.5x clock as Double Time, so `512` on
+    /// its own has to divide the variance by 1.5 exactly as `64` does. The hits
+    /// are picked so the arithmetic is checkable by hand instead of by
+    /// comparing two calls to the same function -- mean 0, sum of squares 250
+    /// over 5 hits, variance 50, `sqrt(50) * 10` = 70.71067811865476.
+    #[test]
+    fn nightcore_alone_scales_the_unstable_rate_like_double_time() {
+        let hits = vec![-10i16, 10, 0, 5, -5];
+        let raw = 50.0_f64.sqrt() * 10.0;
+        assert!((raw - 70.71067811865476).abs() < 1e-9);
+
+        assert!((calculate_unstable_rate(&hits, 0) - raw).abs() < 1e-9);
+        assert!((calculate_unstable_rate(&hits, mod_bits::DT) - raw / 1.5).abs() < 1e-9);
+        assert!((calculate_unstable_rate(&hits, mod_bits::NC) - raw / 1.5).abs() < 1e-9);
+        assert!((calculate_unstable_rate(&hits, mod_bits::NC) - 47.14045207910317).abs() < 1e-9);
+    }
+
+    /// Adding Nightcore must not move anything else: nomod stays the raw rate,
+    /// Half Time keeps its own 0.75x branch (so it *grows* the rate), and the
+    /// `DTNC` pair osu! stable actually sets is still a single 1.5x -- not 2.25x
+    /// from two independent halves.
+    #[test]
+    fn nightcore_leaves_nomod_half_time_and_the_dtnc_pair_alone() {
+        let hits = vec![-10i16, 10, 0, 5, -5];
+        let raw = 50.0_f64.sqrt() * 10.0;
+
+        assert!((calculate_unstable_rate(&hits, mod_bits::HT) - raw / 0.75).abs() < 1e-9);
+        assert!((calculate_unstable_rate(&hits, mod_bits::HT) - 94.28090415820635).abs() < 1e-9);
+        assert!((calculate_unstable_rate(&hits, mod_bits::HT) - raw).abs() > 1e-9);
+
+        let dtnc = mod_bits::DT | mod_bits::NC;
+        assert!((calculate_unstable_rate(&hits, dtnc) - raw / 1.5).abs() < 1e-9);
+        // Nightcore is checked first, so it wins over Half Time the same way
+        // Double Time does.
+        assert!(
+            (calculate_unstable_rate(&hits, mod_bits::NC | mod_bits::HT) - raw / 1.5).abs() < 1e-9
+        );
+    }
+
+    /// The value-preservation guard for the `mod_bits` swap: every bit osu!
+    /// names must still format to exactly its own acronym, and the one bit it
+    /// does not name (31) must still format to nothing. The masks here are
+    /// written as raw integers on purpose -- reading them from the constants
+    /// under test would make the assertion agree with any mis-numbering.
+    #[test]
+    fn every_named_mod_bit_still_formats_to_its_own_acronym() {
+        let cases: &[(u32, &str)] = &[
+            (0, ""),
+            (1, "NF"),
+            (2, "EZ"),
+            (4, "TD"),
+            (8, "HD"),
+            (16, "HR"),
+            (32, "SD"),
+            (64, "DT"),
+            (128, "RX"),
+            (256, "HT"),
+            (512, "NC"),
+            (1024, "FL"),
+            (2048, "AT"),
+            (4096, "SO"),
+            (8192, "AP"),
+            (16384, "PF"),
+            (1 << 15, "4K"),
+            (1 << 16, "5K"),
+            (1 << 17, "6K"),
+            (1 << 18, "7K"),
+            (1 << 19, "8K"),
+            (1 << 20, "FI"),
+            (1 << 21, "RD"),
+            (1 << 22, "CN"),
+            (1 << 23, "TG"),
+            (1 << 24, "9K"),
+            (1 << 25, "10K"),
+            (1 << 26, "1K"),
+            (1 << 27, "3K"),
+            (1 << 28, "2K"),
+            (1 << 29, "v2"),
+            (1 << 30, "MR"),
+            (1 << 31, ""),
+        ];
+
+        for &(mods, expected) in cases {
+            assert_eq!(compute_format_mods(mods), expected, "mods {mods}");
+            assert_eq!(format_mods(mods), expected, "mods {mods}");
+        }
+    }
+
+    /// The `mod_bits` names have to point at osu!'s bit positions, not at a
+    /// tidier re-numbering: the key-count mods are scattered around the mask
+    /// (4K..8K at 15..19, then 9K/10K/1K/3K/2K at 24..28) and `1 << 20` is FI.
+    #[test]
+    fn mod_bits_hold_osus_bit_positions() {
+        assert_eq!(mod_bits::NF, 1);
+        assert_eq!(mod_bits::EZ, 2);
+        assert_eq!(mod_bits::TD, 4);
+        assert_eq!(mod_bits::HD, 8);
+        assert_eq!(mod_bits::HR, 16);
+        assert_eq!(mod_bits::SD, 32);
+        assert_eq!(mod_bits::DT, 64);
+        assert_eq!(mod_bits::RX, 128);
+        assert_eq!(mod_bits::HT, 256);
+        assert_eq!(mod_bits::NC, 512);
+        assert_eq!(mod_bits::FL, 1024);
+        assert_eq!(mod_bits::AT, 2048);
+        assert_eq!(mod_bits::SO, 4096);
+        assert_eq!(mod_bits::AP, 8192);
+        assert_eq!(mod_bits::PF, 16384);
+        assert_eq!(mod_bits::K4, 1 << 15);
+        assert_eq!(mod_bits::K5, 1 << 16);
+        assert_eq!(mod_bits::K6, 1 << 17);
+        assert_eq!(mod_bits::K7, 1 << 18);
+        assert_eq!(mod_bits::K8, 1 << 19);
+        assert_eq!(mod_bits::FI, 1 << 20);
+        assert_eq!(mod_bits::RD, 1 << 21);
+        assert_eq!(mod_bits::CN, 1 << 22);
+        assert_eq!(mod_bits::TG, 1 << 23);
+        assert_eq!(mod_bits::K9, 1 << 24);
+        assert_eq!(mod_bits::K10, 1 << 25);
+        assert_eq!(mod_bits::K1, 1 << 26);
+        assert_eq!(mod_bits::K3, 1 << 27);
+        assert_eq!(mod_bits::K2, 1 << 28);
+        assert_eq!(mod_bits::SCORE_V2, 1 << 29);
+        assert_eq!(mod_bits::MR, 1 << 30);
+    }
+
+    /// The emitted string is a *concatenation* in a fixed order, so combinations
+    /// are where a renamed bit or a re-sorted table would show up. Each case here
+    /// is checked against the table by hand:
+    ///
+    /// - `DTNC` -> `NC` and `SDPF` -> `PF` are tosu's collapses of two mods that
+    ///   osu! sets together; the tables give them the same sort order, so they
+    ///   land adjacent.
+    /// - `DTHTNC` is the *un*-collapsed form: HT sits between DT and NC, so the
+    ///   `DTNC` substring is not there to replace. Pinned so a future
+    ///   "simplification" of the collapse cannot change what is emitted.
+    /// - The key-count groups follow the bit order, which is deliberately not
+    ///   numerical: `1K3K2K` for bits 26/27/28 and `9K10K` for 24/25.
+    /// - `PF4KFI` puts PF first because its sort order is 5 against the other
+    ///   two mods' 99, and `4KMR` shows that a mask written high bit first still
+    ///   emits in bit order.
+    #[test]
+    fn mod_combinations_still_collapse_and_order_the_same_way() {
+        let cases: &[(u32, &str)] = &[
+            (mod_bits::DT | mod_bits::NC, "NC"),
+            (mod_bits::SD | mod_bits::PF, "PF"),
+            (mod_bits::AT | mod_bits::CN, "CN"),
+            (mod_bits::DT | mod_bits::HT | mod_bits::NC, "DTHTNC"),
+            (mod_bits::NC | mod_bits::DT, "NC"),
+            (
+                mod_bits::K4 | mod_bits::K5 | mod_bits::K6 | mod_bits::K7 | mod_bits::K8,
+                "4K5K6K7K8K",
+            ),
+            (mod_bits::K1 | mod_bits::K3 | mod_bits::K2, "1K3K2K"),
+            (mod_bits::K9 | mod_bits::K10, "9K10K"),
+            (
+                mod_bits::FI | mod_bits::RD | mod_bits::CN | mod_bits::TG,
+                "FIRDCNTG",
+            ),
+            (mod_bits::FI | mod_bits::PF | mod_bits::K4, "PF4KFI"),
+            (mod_bits::MR | mod_bits::K4, "4KMR"),
+            (
+                mod_bits::HR | mod_bits::DT | mod_bits::FL | mod_bits::EZ,
+                "EZDTHRFL",
+            ),
+            (mod_bits::SCORE_V2 | mod_bits::HD, "HDv2"),
+            (mod_bits::MR | mod_bits::NF, "NFMR"),
+        ];
+
+        for &(mods, expected) in cases {
+            assert_eq!(compute_format_mods(mods), expected, "mods {mods}");
+            assert_eq!(format_mods(mods), expected, "mods {mods}");
+        }
+    }
+
+    /// The one combined value with a live osu! reproduction behind it. It is a
+    /// fixture, not a single mod bit, so it stays a literal -- but the name it
+    /// emits must not move when its constituent bits gain names.
+    #[test]
+    fn the_live_validated_mod_mask_still_formats_identically() {
+        assert_eq!(format_mods(536873225), "HDHTNFATv2");
+    }
+
     #[test]
     fn test_i16_hit_error_json_serialization() {
         let hits: Vec<i16> = vec![-15, 0, 12, 35, -4];
@@ -1624,7 +1871,7 @@ mod tests {
     /// would make this read 101.66666666666667%.
     #[test]
     fn mania_accuracy_of_an_all_max_play_is_one_hundred_percent_under_score_v2() {
-        let accuracy = calculate_accuracy(3, 0, 0, 0, 0, 1000, 0, 1 << 29);
+        let accuracy = calculate_accuracy(3, 0, 0, 0, 0, 1000, 0, mod_bits::SCORE_V2);
         assert_eq!(accuracy, 100.0);
     }
 
@@ -1636,7 +1883,7 @@ mod tests {
     #[test]
     fn mania_accuracy_matches_both_score_versions() {
         let v1 = calculate_accuracy(3, 500, 100, 50, 20, 1000, 200, 0);
-        let v2 = calculate_accuracy(3, 500, 100, 50, 20, 1000, 200, 1 << 29);
+        let v2 = calculate_accuracy(3, 500, 100, 50, 20, 1000, 200, mod_bits::SCORE_V2);
 
         assert_eq!(v1, 502_500.0 / 561_000.0 * 100.0);
         assert_eq!(v2, 507_500.0 / 570_350.0 * 100.0);
@@ -1666,7 +1913,10 @@ mod tests {
     fn empty_hit_counts_read_as_one_hundred_percent_for_every_ruleset() {
         for mode in 0..4 {
             assert_eq!(calculate_accuracy(mode, 0, 0, 0, 0, 0, 0, 0), 100.0);
-            assert_eq!(calculate_accuracy(mode, 0, 0, 0, 0, 0, 0, 1 << 29), 100.0);
+            assert_eq!(
+                calculate_accuracy(mode, 0, 0, 0, 0, 0, 0, mod_bits::SCORE_V2),
+                100.0
+            );
         }
         assert_eq!(calculate_accuracy(4, 0, 0, 0, 0, 0, 0, 0), 0.0);
     }

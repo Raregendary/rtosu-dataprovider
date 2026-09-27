@@ -1,4 +1,5 @@
 use crate::address::checked_add_signed;
+use crate::client::mod_bits;
 use crate::process::ProcessMemory;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -63,6 +64,22 @@ pub struct BpmStats {
     pub max: f32,
 }
 
+/// The unclocked BPM values parsed out of the `.osu` timing points.
+///
+/// [`BpmStats`] holds the *played* values, which the clock rate scales, so
+/// scaling one of its fields in place would be a double scale on the next call.
+/// Keeping the parsed values here makes the conversion a pure function of
+/// (base, clock rate). Only [`populate_beatmap_file_metadata`] writes this, and
+/// only the three fields it parses: `common` is taken from the rosu beatmap
+/// instead, so a base for it would never be read.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BpmBase {
+    pub realtime: f32,
+    pub min: f32,
+    pub max: f32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ObjectCounts {
@@ -98,6 +115,8 @@ pub struct BeatmapStats {
     pub od: StatValue,
     pub hp: StatValue,
     pub bpm: BpmStats,
+    #[serde(skip)]
+    pub bpm_base: BpmBase,
     pub objects: ObjectCounts,
     pub hit_window: HitWindowState,
     pub max_combo: i32,
@@ -340,6 +359,7 @@ pub fn read_beatmap_from_ptr(
                 min: 0.0,
                 max: 0.0,
             },
+            bpm_base: BpmBase::default(),
             objects: ObjectCounts {
                 circles: 0,
                 sliders: 0,
@@ -485,20 +505,24 @@ pub fn populate_beatmap_file_metadata(snapshot: &mut BeatmapSnapshot, path: &Pat
         }
         if min_bpm != f32::MAX && snapshot.stats.bpm.min == 0.0 {
             snapshot.stats.bpm.min = min_bpm;
+            snapshot.stats.bpm_base.min = min_bpm;
         }
         if max_bpm != 0.0 && snapshot.stats.bpm.max == 0.0 {
             snapshot.stats.bpm.max = max_bpm;
+            snapshot.stats.bpm_base.max = max_bpm;
         }
         if snapshot.stats.bpm.common == 0.0 {
             snapshot.stats.bpm.common = (weighted_bpm / total_weight.max(1.0)) as f32;
         }
         if snapshot.stats.bpm.realtime == 0.0 {
-            snapshot.stats.bpm.realtime = timing_points
+            let realtime = timing_points
                 .iter()
                 .rev()
                 .find(|(time, bpm)| *time <= snapshot.time.live as f64 && *bpm > 0.0)
                 .map(|(_, bpm)| *bpm as f32)
                 .unwrap_or(snapshot.stats.bpm.common);
+            snapshot.stats.bpm.realtime = realtime;
+            snapshot.stats.bpm_base.realtime = realtime;
         }
     }
     true
@@ -522,6 +546,14 @@ pub fn populate_beatmap_statistics(
     populate_beatmap_statistics_with_diff(snapshot, map, &diff, mods);
 }
 
+/// Fill the difficulty-derived statistics onto an already-read snapshot.
+///
+/// Safe to call repeatedly on the same snapshot, which both sessions do on every
+/// mod change: every clock-rate-scaled value is derived from the unscaled
+/// [`BpmBase`] (falling back to the rosu beatmap's own BPM when the `.osu` was
+/// never parsed) rather than from whatever the previous call left behind. A
+/// DT then nomod round trip therefore returns the BPM to its base instead of
+/// stranding it at the 1.5x it was last scaled to.
 #[cfg(feature = "pp")]
 pub fn populate_beatmap_statistics_with_diff(
     snapshot: &mut BeatmapSnapshot,
@@ -586,30 +618,19 @@ pub fn populate_beatmap_statistics_with_diff(
         snapshot.time.last_object = end_time;
     }
     snapshot.stats.max_combo = diff.max_combo() as i32;
-    let clock_rate: f32 = if (mods & 64) != 0 || (mods & 512) != 0 {
+    let clock_rate: f32 = if (mods & mod_bits::DT) != 0 || (mods & mod_bits::NC) != 0 {
         1.5
-    } else if (mods & 256) != 0 {
+    } else if (mods & mod_bits::HT) != 0 {
         0.75
     } else {
         1.0
     };
-    let bpm = (map.bpm() as f32) * clock_rate;
-    snapshot.stats.bpm.common = round_value(bpm, 2);
-    if snapshot.stats.bpm.realtime == 0.0 {
-        snapshot.stats.bpm.realtime = round_value(bpm, 2);
-    } else {
-        snapshot.stats.bpm.realtime = round_value(snapshot.stats.bpm.realtime * clock_rate, 2);
-    }
-    if snapshot.stats.bpm.min == 0.0 {
-        snapshot.stats.bpm.min = round_value(bpm, 2);
-    } else {
-        snapshot.stats.bpm.min = round_value(snapshot.stats.bpm.min * clock_rate, 2);
-    }
-    if snapshot.stats.bpm.max == 0.0 {
-        snapshot.stats.bpm.max = round_value(bpm, 2);
-    } else {
-        snapshot.stats.bpm.max = round_value(snapshot.stats.bpm.max * clock_rate, 2);
-    }
+    let map_bpm = map.bpm() as f32;
+    snapshot.stats.bpm.common = round_value(map_bpm * clock_rate, 2);
+    let base = &snapshot.stats.bpm_base;
+    snapshot.stats.bpm.realtime = scaled_bpm(base.realtime, map_bpm, clock_rate);
+    snapshot.stats.bpm.min = scaled_bpm(base.min, map_bpm, clock_rate);
+    snapshot.stats.bpm.max = scaled_bpm(base.max, map_bpm, clock_rate);
     snapshot.stats.stars.total = round_value(diff.stars() as f32, 2);
     snapshot.stats.stars.live = snapshot.stats.stars.total;
     snapshot.stats.ar.original = map.ar;
@@ -642,11 +663,22 @@ pub fn populate_beatmap_statistics_with_diff(
     snapshot.stats.pp.fc = snapshot.stats.pp.ss;
 }
 
+/// Scale a BPM parsed out of the `.osu` by the clock rate.
+///
+/// A zero `base` means the `.osu` was never parsed, so the beatmap's own BPM
+/// stands in. The fallback keys off the base rather than the last written value,
+/// which is what keeps a repeat call idempotent.
+#[cfg(feature = "pp")]
+fn scaled_bpm(base: f32, map_bpm: f32, clock_rate: f32) -> f32 {
+    let base = if base == 0.0 { map_bpm } else { base };
+    round_value(base * clock_rate, 2)
+}
+
 pub fn calculate_converted_ar(base_ar: f32, mods: u32, clock_rate: f32) -> f32 {
     let mut ar = base_ar;
-    if (mods & 16) != 0 {
+    if (mods & mod_bits::HR) != 0 {
         ar = (ar * 1.4).min(10.0);
-    } else if (mods & 2) != 0 {
+    } else if (mods & mod_bits::EZ) != 0 {
         ar *= 0.5;
     }
     let ms = if ar <= 5.0 {
@@ -664,9 +696,9 @@ pub fn calculate_converted_ar(base_ar: f32, mods: u32, clock_rate: f32) -> f32 {
 
 pub fn calculate_converted_od(base_od: f32, mods: u32, clock_rate: f32, mode: u8) -> f32 {
     let mut od = base_od;
-    if (mods & 16) != 0 {
+    if (mods & mod_bits::HR) != 0 {
         od = (od * 1.4).min(10.0);
-    } else if (mods & 2) != 0 {
+    } else if (mods & mod_bits::EZ) != 0 {
         od *= 0.5;
     }
     if (clock_rate - 1.0).abs() < 1e-5 {
@@ -689,9 +721,9 @@ pub fn calculate_converted_od(base_od: f32, mods: u32, clock_rate: f32, mode: u8
 
 pub fn calculate_converted_cs(base_cs: f32, mods: u32) -> f32 {
     let mut cs = base_cs;
-    if (mods & 16) != 0 {
+    if (mods & mod_bits::HR) != 0 {
         cs = (cs * 1.3).min(10.0);
-    } else if (mods & 2) != 0 {
+    } else if (mods & mod_bits::EZ) != 0 {
         cs *= 0.5;
     }
     cs
@@ -699,9 +731,9 @@ pub fn calculate_converted_cs(base_cs: f32, mods: u32) -> f32 {
 
 pub fn calculate_converted_hp(base_hp: f32, mods: u32) -> f32 {
     let mut hp = base_hp;
-    if (mods & 16) != 0 {
+    if (mods & mod_bits::HR) != 0 {
         hp = (hp * 1.4).min(10.0);
-    } else if (mods & 2) != 0 {
+    } else if (mods & mod_bits::EZ) != 0 {
         hp *= 0.5;
     }
     hp
@@ -823,5 +855,164 @@ mod tests {
     #[test]
     fn refresh_needed_on_first_resolution() {
         assert!(beatmap_refresh_needed(0x1000, 0x1000, 7, 0));
+    }
+
+    /// Two timing points -- 120 BPM from 0 ms, 240 BPM from 2000 ms -- with the
+    /// last object at 3000 ms.
+    ///
+    /// The uneven halves are the point. The rosu beatmap's `bpm()` is the most
+    /// *common* beat length, so it reports 120, while the `.osu` parser reports
+    /// min 120, max 240 and a 160 weighted average. A fixture with one constant
+    /// BPM cannot tell the min/max/realtime bases apart from each other, and
+    /// therefore cannot catch a base that is being scaled twice.
+    #[cfg(feature = "pp")]
+    const BPM_FIXTURE: &[u8] = b"osu file format v14\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\nSliderMultiplier:1.4\nSliderTickRate:1\n\n[TimingPoints]\n0,500,4,1,0\n2000,250,4,1,0\n\n[HitObjects]\n0,0,0,1,0,0:0:0:0:\n250,0,1000,1,0,0:0:0:0:\n250,0,2000,1,0,0:0:0:0:\n250,0,3000,1,0,0:0:0:0:\n";
+
+    #[cfg(feature = "pp")]
+    fn bpm_fixture_diff(map: &rosu_pp::Beatmap, mods: u32) -> rosu_pp::any::DifficultyAttributes {
+        rosu_pp::Difficulty::new()
+            .mods(crate::pp::calculator::parse_mods_bits(mods))
+            .calculate(map)
+    }
+
+    /// A snapshot that has been through [`populate_beatmap_file_metadata`], which
+    /// is the state both sessions hand to
+    /// [`populate_beatmap_statistics_with_diff`] once a map is resolved. The tag
+    /// keeps the parallel test threads off each other's fixture file.
+    #[cfg(feature = "pp")]
+    fn bpm_fixture_snapshot(tag: &str) -> BeatmapSnapshot {
+        let dir = std::env::temp_dir().join(format!("rtosu-bpm-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("fixture.osu");
+        std::fs::write(&path, BPM_FIXTURE).expect("write bpm fixture");
+        let mut snapshot = BeatmapSnapshot::default();
+        assert!(populate_beatmap_file_metadata(&mut snapshot, &path));
+        assert_eq!(snapshot.stats.bpm_base.min, 120.0);
+        assert_eq!(snapshot.stats.bpm_base.realtime, 120.0);
+        assert_eq!(snapshot.stats.bpm_base.max, 240.0);
+        snapshot
+    }
+
+    /// The FIX-002 regression. Both sessions re-run the statistics on every mod
+    /// change, and the old code scaled `realtime`/`min`/`max` in place, so a
+    /// second DT call turned 180 into 270 (2.25x overall) instead of leaving it
+    /// at 1.5x. `common` comes from the rosu beatmap's 120 BPM, so DT reads 180.
+    #[test]
+    #[cfg(feature = "pp")]
+    fn double_time_scales_the_bpm_once_however_many_times_the_stats_run() {
+        let map = rosu_pp::Beatmap::from_bytes(BPM_FIXTURE).expect("parse bpm fixture");
+        assert_eq!(map.bpm(), 120.0);
+        let mut snapshot = bpm_fixture_snapshot("dt");
+
+        for call in 1..=2 {
+            populate_beatmap_statistics_with_diff(
+                &mut snapshot,
+                &map,
+                &bpm_fixture_diff(&map, mod_bits::DT),
+                mod_bits::DT,
+            );
+            assert_eq!(snapshot.stats.bpm.common, 180.0, "call {call}");
+            assert_eq!(snapshot.stats.bpm.realtime, 180.0, "call {call}");
+            assert_eq!(snapshot.stats.bpm.min, 180.0, "call {call}");
+            assert_eq!(snapshot.stats.bpm.max, 360.0, "call {call}");
+        }
+
+        assert_ne!(snapshot.stats.bpm.realtime, 270.0);
+        assert_ne!(snapshot.stats.bpm.max, 540.0);
+    }
+
+    /// The other half of the same bug, and the one a double-call test cannot
+    /// see: dropping back to nomod used to multiply by 1.0, which left the BPM
+    /// stranded at the 1.5x it was last scaled to. Every field has to return to
+    /// its own parsed base, with `max` still the 240 BPM half of the map.
+    #[test]
+    #[cfg(feature = "pp")]
+    fn leaving_double_time_restores_the_parsed_bpm() {
+        let map = rosu_pp::Beatmap::from_bytes(BPM_FIXTURE).expect("parse bpm fixture");
+        let mut snapshot = bpm_fixture_snapshot("dt-nomod");
+        populate_beatmap_statistics_with_diff(
+            &mut snapshot,
+            &map,
+            &bpm_fixture_diff(&map, mod_bits::DT),
+            mod_bits::DT,
+        );
+
+        populate_beatmap_statistics_with_diff(&mut snapshot, &map, &bpm_fixture_diff(&map, 0), 0);
+
+        assert_eq!(snapshot.stats.bpm.common, 120.0);
+        assert_eq!(snapshot.stats.bpm.realtime, 120.0);
+        assert_eq!(snapshot.stats.bpm.min, 120.0);
+        assert_eq!(snapshot.stats.bpm.max, 240.0);
+    }
+
+    /// Half Time is the same idempotence at 0.75x: 120 becomes 90 and the 240
+    /// maximum becomes 180, on the first call and on the repeat.
+    #[test]
+    #[cfg(feature = "pp")]
+    fn half_time_scales_the_bpm_once_however_many_times_the_stats_run() {
+        let map = rosu_pp::Beatmap::from_bytes(BPM_FIXTURE).expect("parse bpm fixture");
+        let mut snapshot = bpm_fixture_snapshot("ht");
+
+        for call in 1..=2 {
+            populate_beatmap_statistics_with_diff(
+                &mut snapshot,
+                &map,
+                &bpm_fixture_diff(&map, mod_bits::HT),
+                mod_bits::HT,
+            );
+            assert_eq!(snapshot.stats.bpm.common, 90.0, "call {call}");
+            assert_eq!(snapshot.stats.bpm.realtime, 90.0, "call {call}");
+            assert_eq!(snapshot.stats.bpm.min, 90.0, "call {call}");
+            assert_eq!(snapshot.stats.bpm.max, 180.0, "call {call}");
+        }
+    }
+
+    /// A snapshot whose `.osu` was never parsed has no bases at all, so all
+    /// three fall back to the rosu beatmap's own 120 BPM. The fallback keys off
+    /// the base rather than the last written value, so it stays idempotent.
+    #[test]
+    #[cfg(feature = "pp")]
+    fn a_snapshot_without_file_metadata_falls_back_and_stays_idempotent() {
+        let map = rosu_pp::Beatmap::from_bytes(BPM_FIXTURE).expect("parse bpm fixture");
+        let mut snapshot = BeatmapSnapshot::default();
+        assert_eq!(snapshot.stats.bpm_base, BpmBase::default());
+
+        for call in 1..=2 {
+            populate_beatmap_statistics_with_diff(
+                &mut snapshot,
+                &map,
+                &bpm_fixture_diff(&map, mod_bits::DT),
+                mod_bits::DT,
+            );
+            assert_eq!(snapshot.stats.bpm.common, 180.0, "call {call}");
+            assert_eq!(snapshot.stats.bpm.realtime, 180.0, "call {call}");
+            assert_eq!(snapshot.stats.bpm.min, 180.0, "call {call}");
+            assert_eq!(snapshot.stats.bpm.max, 180.0, "call {call}");
+        }
+    }
+
+    /// The bases are internal bookkeeping, not part of the tosu v2 payload: the
+    /// emitted `bpm` object stays exactly the four documented fields, and `pp`
+    /// stays out of it too.
+    #[test]
+    fn the_parsed_bpm_bases_stay_out_of_the_beatmap_json() {
+        let mut snapshot = BeatmapSnapshot::default();
+        snapshot.stats.bpm.realtime = 180.0;
+        snapshot.stats.bpm.common = 180.0;
+        snapshot.stats.bpm.min = 180.0;
+        snapshot.stats.bpm.max = 360.0;
+        snapshot.stats.bpm_base.realtime = 120.0;
+        snapshot.stats.bpm_base.min = 120.0;
+        snapshot.stats.bpm_base.max = 240.0;
+
+        let json = serde_json::to_string(&snapshot).expect("serialize beatmap");
+        assert!(!json.contains("\"pp\""));
+        assert!(!json.contains("bpmBase"));
+        assert!(!json.contains("base"));
+        assert!(
+            json.contains(
+                "\"bpm\":{\"realtime\":180.0,\"common\":180.0,\"min\":180.0,\"max\":360.0}"
+            )
+        );
     }
 }

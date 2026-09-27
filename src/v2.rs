@@ -1,5 +1,5 @@
 use crate::beatmap::{BeatmapSnapshot, BeatmapStats};
-use crate::client::{ModEntry, mod_acronyms};
+use crate::client::{ModEntry, mod_acronyms, mod_bits};
 use crate::pp::LivePpResult;
 use crate::tournament::TournamentChatMessage;
 use md5::Digest;
@@ -512,9 +512,9 @@ pub fn create_mods_state(mods_num: u32, mods_str: &str) -> ModsState {
     }
 
     let array = mod_acronyms(mods_num);
-    let rate = if (mods_num & 64) != 0 || (mods_num & 512) != 0 {
+    let rate = if (mods_num & mod_bits::DT) != 0 || (mods_num & mod_bits::NC) != 0 {
         1.5
-    } else if (mods_num & 256) != 0 {
+    } else if (mods_num & mod_bits::HT) != 0 {
         0.75
     } else {
         1.0
@@ -629,5 +629,25 @@ mod tests {
         assert_eq!(multi.checksum, "eec18211a1a9d581bafc90342c0bb4c6");
         let acronyms: Vec<&str> = multi.array.iter().map(|e| e.acronym.as_str()).collect();
         assert_eq!(acronyms, vec!["HD", "HT", "NF", "AT", "V2"]);
+    }
+
+    /// The parity pair behind the `mod_bits` rename, from a prior live
+    /// validation against osu! itself: `536873225` (a combined mask, so still a
+    /// literal at its use site) must keep both the acronym string tosu formats
+    /// and the MD5 tosu derives from the same array. A named bit that moved, or
+    /// a reordered table, changes the name and this checksum.
+    #[test]
+    fn the_mod_bit_rename_keeps_the_live_validated_tosu_parity() {
+        let name = crate::client::format_mods(536873225);
+        assert_eq!(name, "HDHTNFATv2");
+
+        let state = create_mods_state(536873225, &name);
+        assert_eq!(state.checksum, "eec18211a1a9d581bafc90342c0bb4c6");
+        assert_eq!(state.number, 536873225);
+        assert_eq!(state.name, "HDHTNFATv2");
+        // Half Time is the only rate mod in the mask, so it sets 0.75.
+        assert_eq!(state.rate, 0.75);
+        let acronyms: Vec<&str> = state.array.iter().map(|e| e.acronym.as_str()).collect();
+        assert_eq!(acronyms, ["HD", "HT", "NF", "AT", "V2"]);
     }
 }

@@ -15,6 +15,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[cfg(feature = "pp")]
+use crate::client::mod_bits;
+
 /// How many consecutive ticks a map is re-read for while its title is still
 /// unreadable, before the reader accepts the partial result. At the default
 /// 60 Hz that is about half a second of retrying, which covers osu! assembling
@@ -264,8 +267,7 @@ impl TournamentSession {
                             &client.memory,
                             client.play_time_pattern_addr,
                         );
-                        let live_id =
-                            crate::beatmap::read_beatmap_id(&client.memory, beatmap_addr);
+                        let live_id = crate::beatmap::read_beatmap_id(&client.memory, beatmap_addr);
                         let reuse = client.cached_beatmap_snapshot.is_some()
                             && !crate::beatmap::beatmap_refresh_needed(
                                 beatmap_addr,
@@ -578,7 +580,7 @@ impl TournamentSession {
                         self.cached_beatmap.as_ref(),
                         gameplay.as_ref(),
                     ) {
-                        let diff_mods = g.mods & !(1 << 29); // Strip ScoreV2
+                        let diff_mods = g.mods & !mod_bits::SCORE_V2;
                         if diff_mods == 0 {
                             beatmap.stats = self.cached_stats.clone();
                         } else if let Some(stats) = self.cached_stats_by_mods.get(&diff_mods) {
@@ -975,9 +977,9 @@ fn performance_graph(
     _last_object: i32,
     mp3_length: i32,
 ) -> crate::v2::PrecomputedGraph {
-    let clock_rate: f64 = if (mods & 64) != 0 || (mods & 512) != 0 {
+    let clock_rate: f64 = if (mods & mod_bits::DT) != 0 || (mods & mod_bits::NC) != 0 {
         1.5
-    } else if (mods & 256) != 0 {
+    } else if (mods & mod_bits::HT) != 0 {
         0.75
     } else {
         1.0
@@ -1007,7 +1009,7 @@ fn performance_graph(
     let mut aim_no_sliders = Vec::new();
     let mut speed = Vec::new();
     let mut flashlight = Vec::new();
-    let has_flashlight_mod = (mods & 1024) != 0;
+    let has_flashlight_mod = (mods & mod_bits::FL) != 0;
 
     let mut strain_count = 0;
     if let rosu_pp::any::Strains::Osu(values) = strains {
