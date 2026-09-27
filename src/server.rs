@@ -94,6 +94,10 @@ pub fn create_router(
             // The gosumemory-compatible payload. tosu serves this at `/json`;
             // `/json` is already the v2 route here, so v1 has its own path.
             .route("/json/v1", get(handle_json_v1))
+            // The StreamCompanion payload, for overlays written against
+            // StreamCompanion rather than against tosu. Flat and 136 keys, so
+            // nothing else in this router can be confused with it.
+            .route("/json/sc", get(handle_json_sc))
             .route("/health", get(handle_health))
             // tosu file endpoints that overlays use to display the current
             // beatmap background, so drop-in overlays render unchanged.
@@ -115,7 +119,21 @@ pub fn create_router(
             .route("/websocket/v2/precise", get(handle_ws_upgrade))
             // tosu's v1 socket, serving the same shape as `/json/v1`. The overlay
             // shim passes `/ws` straight through to here.
-            .route("/ws", get(handle_ws_upgrade_v1));
+            .route("/ws", get(handle_ws_upgrade_v1))
+            // tosu's StreamCompanion wrapper: `/tokens` is `WS_SC`, whose
+            // `stateFunctionName` is `getStateSC` -- the **SC** payload, not v2
+            // (`tosu-sourcecode/packages/server/index.ts:38-42`,
+            // `instances/index.ts:243-245`). tosu's own AGENTS.md calls it "a
+            // compatibility endpoint specifically designed for overlays built for
+            // StreamCompanion". The `:` and the array-shorthand are tosu's, and
+            // the filter language is shared with the other sockets.
+            .route("/tokens", get(handle_ws_upgrade_tokens))
+            // tosu's command channel: `WS_COMMANDS` is constructed with an empty
+            // `pollRateFieldName` and `stateFunctionName`
+            // (`packages/server/index.ts:58-63`), so it **sends no data frames** --
+            // it only delivers `applyFilters` and answers commands. Serving v2
+            // here would be a superset no client asked for.
+            .route("/websocket/commands", get(handle_ws_upgrade_commands));
     }
 
     if state.overlays.is_some() {
@@ -184,6 +202,32 @@ async fn handle_json_v1(State(state): State<AppState>) -> Response {
         Err(error) => {
             tracing::error!("failed to build the v1 payload: {error}");
             server_error("failed to build the v1 payload")
+        }
+    }
+}
+
+/// Serve the StreamCompanion payload, tosu's `/json/sc`
+/// (`tosu-sourcecode/packages/server/router/scApi.ts:5`).
+///
+/// Built per request for the same reason as v1: pre-encoding it would add a
+/// serialisation to every poll tick for a route almost nothing calls.
+///
+/// **The not-running contract is deliberately not implemented here.** tosu
+/// answers `500 {"error":"osu is not ready/running"}` when no client is
+/// attached (`router/scApi.ts:9-11`), but `/json/v2` and `/json/v1` here both
+/// serve the last packet with `200`, and `audit-1.0.5.md` records the choice
+/// between the two as one open decision spanning `C-01`, `A-06`, `E-04`, `L-08`
+/// and `M-08`. Making SC the only route that answers `500` would be worse than
+/// leaving it consistent, so this settles with the rest once the decision is
+/// made. See `audit-1.0.5.md` `M-08`.
+async fn handle_json_sc(State(state): State<AppState>) -> Response {
+    let published = state.packet_rx.borrow();
+    let sc = crate::sc::ScPayload::from_v2(&published.packet);
+    match serde_json::to_vec(&sc) {
+        Ok(json) => json_response(Bytes::from(json)),
+        Err(error) => {
+            tracing::error!("failed to build the SC payload: {error}");
+            server_error("failed to build the SC payload")
         }
     }
 }
@@ -765,6 +809,233 @@ async fn handle_ws_upgrade(
     ws.on_upgrade(move |socket| handle_ws_stream(socket, state.packet_rx))
 }
 
+/// tosu's `/tokens` socket: the StreamCompanion wrapper.
+///
+/// The connection sends a filter list and then receives only those leaves of the
+/// **SC** payload -- not v2, which is what the other sockets stream. Getting that
+/// backwards is easy, because the filter feature belongs to the socket layer
+/// generally, and it is why the live probe initially reported `{}` for filters
+/// naming v2 keys: the SC payload is flat and has no `session` or `client`.
+///
+/// This is the one rtosu socket that **reads** from the client, which is what
+/// makes it different from the other four
+/// (`audit-1.0.5.md` `D-04`: "inbound messages are never read at all"). The read
+/// is bounded -- one `select!` arm against the receiver, so a silent client costs
+/// nothing extra -- and every message is length-capped, because a filter list
+/// arrives from the network on a path that used to have no input at all.
+async fn handle_ws_upgrade_tokens(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_ws_tokens(socket, state.packet_rx, TokensRoute::Sc))
+}
+
+/// tosu's `/websocket/commands`.
+///
+/// **No data frames.** `WS_COMMANDS` is built with an empty `stateFunctionName`
+/// (`packages/server/index.ts:58-63`), so tosu's loop has nothing to send and the
+/// socket exists purely to carry commands -- `applyFilters` and the dashboard's
+/// overlay-list refreshes. Streaming a payload here would send frames a client
+/// written against tosu has no handler for.
+async fn handle_ws_upgrade_commands(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_ws_tokens(socket, state.packet_rx, TokensRoute::Commands))
+}
+
+/// Which payload a socket streams, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TokensRoute {
+    /// `/tokens`: the SC payload, filterable.
+    Sc,
+    /// `/websocket/commands`: no payload, commands only.
+    Commands,
+}
+
+impl TokensRoute {
+    fn pathname(self) -> &'static str {
+        match self {
+            TokensRoute::Sc => "/tokens",
+            TokensRoute::Commands => "/websocket/commands",
+        }
+    }
+
+    /// Whether this socket sends data frames at all.
+    fn streams(self) -> bool {
+        match self {
+            TokensRoute::Sc => true,
+            TokensRoute::Commands => false,
+        }
+    }
+}
+
+/// The filter socket's loop, shared by `/tokens` and `/websocket/commands`.
+async fn handle_ws_tokens(
+    mut socket: WebSocket,
+    mut packet_rx: watch::Receiver<PublishedPacket>,
+    route: TokensRoute,
+) {
+    let pathname = route.pathname();
+    tracing::debug!("WebSocket client connected to {pathname}");
+    let mut filters: Vec<crate::ws_filters::Filter> = Vec::new();
+
+    // A command-only socket has no receiver to poll, so it never selects on one.
+    // Sending the receiver in anyway would pin the last packet for the life of
+    // the connection, which the broadcast path pays for on every send.
+    if !route.streams() {
+        serve_commands_only(&mut socket, pathname, &mut filters).await;
+        tracing::debug!("WebSocket command client disconnected from {pathname}");
+        return;
+    }
+
+    loop {
+        // `biased` is load-bearing, not a style choice. The payload is broadcast
+        // on a timer, so the data branch is ready on essentially every wakeup; an
+        // unbiased `select!` picks uniformly among ready branches and the inbound
+        // branch loses often enough that a filter could sit unapplied across
+        // several ticks. With `biased` and `recv` first, a message that has
+        // already arrived is always taken before the next frame is built, which
+        // is also the order tosu applies it in -- its socket reads on the `message`
+        // event, decoupled from the send loop (`utils/socket.ts:76-93`).
+        tokio::select! {
+            biased;
+            inbound = socket.recv() => {
+                match inbound {
+                    Some(Ok(message)) => {
+                        if !handle_token_message(&message, pathname, &mut filters) {
+                            break;
+                        }
+                    }
+                    // A close frame, or a transport error, ends the connection.
+                    Some(Err(error)) => {
+                        tracing::debug!("websocket read error on {pathname}: {error}");
+                        break;
+                    }
+                    None => break,
+                }
+            }
+            changed = packet_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                // The frame is built inside a scope that ends before the
+                // `await`, because `borrow_and_update` holds a read guard and a
+                // guard held across an await makes the whole future
+                // non-`Send`. The existing handlers avoid this by cloning the
+                // bytes first; the filter path cannot, because the bytes only
+                // exist after the parse.
+                let frame = {
+                    let published = packet_rx.borrow_and_update();
+                    // The SC payload is built per frame, like `/json/sc`, so a
+                    // filtered connection is the only thing paying for it.
+                    let frame = if filters.is_empty() {
+                        None
+                    } else {
+                        let json = sc_bytes(&published.packet);
+                        match filter_frame(&filters, &json) {
+                            Some(frame) => Some(frame),
+                            // A payload that will not parse or will not encode must
+                            // not silently stop the stream. Fall back to the full
+                            // payload for this tick and keep the connection.
+                            None => {
+                                tracing::warn!("filtering failed; sending the full payload");
+                                ws_text(sc_bytes(&published.packet))
+                            }
+                        }
+                    };
+                    match frame {
+                        Some(frame) => Some(frame),
+                        // Unfiltered: the whole SC payload, freshly built.
+                        None => ws_text(sc_bytes(&published.packet)),
+                    }
+                };
+                let Some(frame) = frame else { continue };
+                if socket.send(frame).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    tracing::debug!("WebSocket client disconnected from {pathname}");
+}
+
+/// The command socket's loop: inbound frames only, no data frames.
+async fn serve_commands_only(
+    socket: &mut WebSocket,
+    pathname: &str,
+    filters: &mut Vec<crate::ws_filters::Filter>,
+) {
+    while let Some(Ok(message)) = socket.recv().await {
+        if !handle_token_message(&message, pathname, filters) {
+            break;
+        }
+    }
+}
+
+/// Serialise the SC payload, which is the one `/tokens` streams.
+fn sc_bytes(packet: &TosuV2Packet) -> Bytes {
+    serde_json::to_vec(&crate::sc::ScPayload::from_v2(packet))
+        .map(Bytes::from)
+        .unwrap_or_default()
+}
+
+/// Apply one inbound message. Returns `false` when the connection should close.
+fn handle_token_message(
+    message: &Message,
+    pathname: &str,
+    filters: &mut Vec<crate::ws_filters::Filter>,
+) -> bool {
+    let Message::Text(text) = message else {
+        // tosu ignores binary and ping/pong frames. A ping is answered by axum's
+        // own machinery, so only a close needs handling here.
+        return !matches!(message, Message::Close(_));
+    };
+    // A filter list arrives from the network onto a socket that previously had no
+    // input, so it is capped. tosu has no cap because it is a local overlay API;
+    // 64 KiB is far above any real filter list and far below anything that could
+    // be used to exhaust memory.
+    const MAX_COMMAND_BYTES: usize = 64 * 1024;
+    if text.len() > MAX_COMMAND_BYTES {
+        tracing::warn!(
+            "dropping an oversized {pathname} command: {} bytes",
+            text.len()
+        );
+        return true;
+    }
+
+    let command = crate::ws_filters::normalize_socket_command(text.as_str(), pathname);
+    match crate::ws_filters::filters_from_command(&command) {
+        // tosu assigns `socket.filters` only on success (`commands.ts:161`), so a
+        // rejected message leaves the previous list in place.
+        Some(parsed) => {
+            *filters = parsed;
+            true
+        }
+        // Not a command we act on. tosu answers anything it did not handle with
+        // `{command, message}` (`commands.ts:169-177`); a data socket must not
+        // echo, so it is dropped.
+        None => true,
+    }
+}
+
+/// One filtered frame, or `None` if the payload cannot be filtered.
+///
+/// The frame is built with `Message::text` rather than routed through
+/// [`ws_text`], because `serde_json` cannot produce invalid UTF-8 -- so a `None`
+/// here unambiguously means "filtering failed" and the caller should fall back to
+/// the full payload, with no risk of conflating it with the encoding failure
+/// `ws_text` exists to handle.
+fn filter_frame(filters: &[crate::ws_filters::Filter], json: &[u8]) -> Option<Message> {
+    let data = crate::ws_filters::parse_packet(json)?;
+    let bytes = crate::ws_filters::filter_json(filters, &data)?;
+    // `serde_json` emits UTF-8 by construction, so the string conversion below
+    // cannot fail; an error would mean a bug in the encoder, not bad input.
+    let text = String::from_utf8(bytes).ok()?;
+    Some(Message::text(text))
+}
+
 /// Wrap a serialized packet as a text frame, or `None` if it is not valid UTF-8.
 ///
 /// This is on the WebSocket broadcast path, so a bad frame must cost one dropped
@@ -940,6 +1211,304 @@ mod tests {
         tx.send(PublishedPacket::new(updated).expect("serialize"))
             .unwrap();
         assert_eq!(rx_holder.borrow().packet.client, "tournament");
+    }
+
+    /// `/json/sc` serves the StreamCompanion payload: 136 flat keys, none of
+    /// which appear in v1 or v2. Before this route existed the path 404'd, and
+    /// an SC client pointed at rtosu had nothing to read at all.
+    #[tokio::test]
+    async fn test_http_json_sc_endpoint() {
+        let mut sample = TosuV2Packet::default();
+        sample.client = "stable".to_string();
+        sample.state.number = 2;
+        sample.play.score = 4652;
+        sample.beatmap.id = 2964306;
+
+        let (_tx, rx) = watch::channel(PublishedPacket::new(sample).expect("serialize"));
+        let app = create_router(AppState::new(rx), true, true, true);
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/json/sc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "tosu sends application/json with no charset (utils/index.ts:81)"
+        );
+
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+        // Flat and 136 keys, with no subtrees.
+        let object = parsed.as_object().expect("an object");
+        assert_eq!(object.len(), 136, "SC key count");
+        assert!(!parsed.get("menu").is_some());
+        assert!(!parsed.get("beatmap").is_some());
+        assert!(!parsed.get("play").is_some());
+
+        // Spot-check leaves across the payload, including the two shapes most
+        // likely to be built wrongly.
+        assert_eq!(parsed["osuIsRunning"], 1);
+        assert_eq!(parsed["score"], 4652);
+        assert_eq!(parsed["mapid"], 2964306);
+        assert_eq!(parsed["dl"], "https://osu.ppy.sh/b/2964306");
+        assert_eq!(parsed["status"], 2, "play maps to SC's Playing");
+        assert_eq!(parsed["rawStatus"], 2);
+        assert!(parsed["keyOverlay"].is_string(), "JSON in a string");
+        assert!(parsed["mapStrains"].is_object());
+        assert!(parsed["mapKiaiPoints"].is_array());
+        assert!(parsed["mapKiaiPoints"].as_array().unwrap().is_empty());
+    }
+
+    /// The route is gated by `enable_http` like every other `/json*` route, so an
+    /// HTTP-disabled server must not answer it. `/json/sc` is not a websocket
+    /// route, which is asserted by the ws-disabled half below.
+    #[tokio::test]
+    async fn test_json_sc_follows_the_http_enable_flag() {
+        let sample = TosuV2Packet::default();
+
+        let (_tx1, rx1) = watch::channel(PublishedPacket::new(sample.clone()).expect("serialize"));
+        let enabled = create_router(AppState::new(rx1), true, true, true);
+        let ok = enabled
+            .oneshot(
+                Request::builder()
+                    .uri("/json/sc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+
+        let (_tx2, rx2) = watch::channel(PublishedPacket::new(sample).expect("serialize"));
+        let disabled = create_router(AppState::new(rx2), false, true, true);
+        let refused = disabled
+            .oneshot(
+                Request::builder()
+                    .uri("/json/sc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::NOT_FOUND);
+
+        // WS-disabled must still serve it: it is a plain GET.
+        let (_tx3, rx3) = watch::channel(PublishedPacket::new(TosuV2Packet::default()).expect("s"));
+        let no_ws = create_router(AppState::new(rx3), true, false, true);
+        let served = no_ws
+            .oneshot(
+                Request::builder()
+                    .uri("/json/sc")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(served.status(), StatusCode::OK);
+    }
+
+    /// `/tokens` is the one socket that reads from the client. Before this it
+    /// 404'd, so an SC client had no way to ask for a subset of the payload.
+    #[tokio::test]
+    async fn test_tokens_route_upgrades_and_answers_the_requested_leaves() {
+        use crate::ws_filters::{filter_json, parse_filters, parse_packet};
+
+        let mut sample = TosuV2Packet::default();
+        sample.client = "stable".to_string();
+        sample.play.score = 4652;
+        sample.beatmap.id = 2964306;
+
+        let json = serde_json::to_vec(&sample).expect("serialize");
+        // A dotted filter is a single key, not a path -- so the request uses the
+        // nested spelling to actually narrow. `ws_filters` pins the dotted case.
+        let filters = parse_filters(
+            r#"[{"field":"play","keys":["score"]},{"field":"beatmap","keys":["id"]}]"#,
+        )
+        .expect("filters");
+        let bytes = filter_json(&filters, &parse_packet(&json).expect("parse")).expect("frame");
+        let frame: serde_json::Value = serde_json::from_slice(&bytes).expect("frame parses");
+        // Only the two requested leaves, in filter order.
+        assert_eq!(
+            frame,
+            serde_json::json!({"play": {"score": 4652}, "beatmap": {"id": 2964306}})
+        );
+        assert_eq!(
+            String::from_utf8(bytes).unwrap(),
+            r#"{"play":{"score":4652},"beatmap":{"id":2964306}}"#
+        );
+
+        // The route must be wired to a WebSocket handler, not merely exist.
+        // axum's `WebSocketUpgrade` extractor rejects a plain GET with `400`,
+        // which is the assertion that distinguishes "the route is a WS upgrade"
+        // from "the route is missing" (`404`) and from "the route answers a plain
+        // GET with a payload" (`200`). A real handshake -- filters applied and
+        // filtered frames received -- is verified end to end by
+        // `validations/tokens_probe.py`.
+        let (_tx, rx) = watch::channel(PublishedPacket::new(sample).expect("serialize"));
+        let app = create_router(AppState::new(rx), true, true, true);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/tokens")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "the /tokens route must exist"
+        );
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "the /tokens route must require a websocket upgrade"
+        );
+    }
+
+    /// A rejected or non-command message must leave the connection's filters
+    /// alone, which is tosu's behaviour (`commands.ts:161` assigns only on
+    /// success). Driving `handle_token_message` directly keeps that out of a real
+    /// socket, and covers the length cap that only a live socket could reach.
+    #[test]
+    fn test_a_token_message_only_replaces_the_filters_on_success() {
+        use crate::ws_filters::Filter;
+
+        let mut filters = vec![Filter::Key("play.score".to_string())];
+
+        // A bare array on /tokens is normalised and applied.
+        assert!(handle_token_message(
+            &Message::text(r#"["beatmap.id"]"#),
+            "/tokens",
+            &mut filters,
+        ));
+        assert_eq!(filters, vec![Filter::Key("beatmap.id".to_string())]);
+
+        // A bare object array contains colons, so tosu's `data.includes(':')` check
+        // passes it through without the `applyFilters:` prefix and it is not a
+        // command at all. Verified live against tosu: the previous filter stays
+        // in place. Reproduced deliberately, so the test asserts the refusal.
+        assert!(handle_token_message(
+            &Message::text(r#"[{"field":"play","keys":["score"]}]"#),
+            "/tokens",
+            &mut filters,
+        ));
+        assert_eq!(
+            filters,
+            vec![Filter::Key("beatmap.id".to_string())],
+            "a bare object array is not a command"
+        );
+
+        // Sent with the explicit prefix, the same array is applied.
+        assert!(handle_token_message(
+            &Message::text(r#"applyFilters:[{"field":"play","keys":["score"]}]"#),
+            "/tokens",
+            &mut filters,
+        ));
+        assert_eq!(
+            filters,
+            vec![Filter::Nested {
+                field: "play".to_string(),
+                keys: vec![Filter::Key("score".to_string())],
+            }]
+        );
+
+        // From here on the live filter is the nested one, so that is what a
+        // rejected message has to leave in place.
+        let applied = || {
+            vec![Filter::Nested {
+                field: "play".to_string(),
+                keys: vec![Filter::Key("score".to_string())],
+            }]
+        };
+
+        // A malformed payload leaves the previous list in place.
+        assert!(handle_token_message(
+            &Message::text("applyFilters:{not json"),
+            "/tokens",
+            &mut filters,
+        ));
+        assert_eq!(filters, applied());
+
+        // A non-array payload is rejected the same way.
+        assert!(handle_token_message(
+            &Message::text(r#"applyFilters:{"a":1}"#),
+            "/tokens",
+            &mut filters,
+        ));
+        assert_eq!(filters, applied());
+
+        // A message that is not a command is ignored, and the connection stays up.
+        assert!(handle_token_message(
+            &Message::text("hello"),
+            "/tokens",
+            &mut filters,
+        ));
+        assert_eq!(filters, applied());
+
+        // A bare array whose entries parse to nothing empties the list, which
+        // re-enables the full payload -- matching tosu's `filters.length > 0` gate.
+        // It parses, so it is assigned; it is the *content* that is empty.
+        assert!(handle_token_message(
+            &Message::text("[1,2,3]"),
+            "/tokens",
+            &mut filters
+        ));
+        assert!(filters.is_empty());
+
+        // An oversized message is dropped without being parsed, and the
+        // connection survives it.
+        let huge = format!(r#"applyFilters:["{}"]"#, "a".repeat(70 * 1024));
+        assert!(handle_token_message(
+            &Message::text(huge),
+            "/tokens",
+            &mut filters
+        ));
+
+        // A close frame ends the connection.
+        assert!(!handle_token_message(
+            &Message::Close(None),
+            "/tokens",
+            &mut filters,
+        ));
+    }
+
+    /// A payload that cannot be filtered must not stop the stream: the caller
+    /// falls back to the full payload for that tick.
+    #[test]
+    fn test_filter_frame_returns_none_only_when_filtering_fails() {
+        use crate::ws_filters::{filter_json, parse_filters};
+
+        let filters = parse_filters(r#"[{"field":"play","keys":["score"]}]"#).expect("filters");
+        let good = br#"{"play":{"score":4652,"accuracy":68.75}}"#;
+        assert!(
+            filter_frame(&filters, good).is_some(),
+            "a valid payload must produce a frame"
+        );
+        assert!(
+            filter_frame(&filters, b"{not json").is_none(),
+            "an unparseable payload must be reported as a filtering failure"
+        );
+        // An empty filter list is the unfiltered path, so it is not a frame here.
+        assert!(filter_frame(&[], good).is_none());
+        // And the filtered frame carries only the requested leaf.
+        let bytes = filter_json(&filters, &serde_json::json!({"play":{"score":1},"x":2})).unwrap();
+        assert_eq!(String::from_utf8(bytes).unwrap(), r#"{"play":{"score":1}}"#);
     }
 
     #[tokio::test]

@@ -90,6 +90,39 @@ pub struct ObjectCounts {
     pub total: i32,
 }
 
+/// One `[Events] Break` span, in the shape SC's `mapBreaks` needs.
+///
+/// Parsed from the `.osu` file rather than from rosu's beatmap so it is available
+/// without the `pp` feature, the same file pass that already reads the object
+/// and timing-point sections.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct BreakSpan {
+    pub start_time: i32,
+    pub end_time: i32,
+    pub has_effect: bool,
+}
+
+/// One `[TimingPoints]` line: the raw declared beat length, negative for a
+/// redline. This is lazer's `TimingChangePoint.beatLength`, so SC's
+/// `mapTimingPoints[].beatLength` matches tosu on the value; see the `time`
+/// field for the one leaf it does not.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct TimingPointSpan {
+    /// The timing point's own time, **not** lazer's `group.startTime`.
+    ///
+    /// tosu emits `r.group?.startTime || 0`
+    /// (`tosu-sourcecode/packages/tosu/src/api/utils/buildResultSC.ts:138-141`),
+    /// which is the first object inheriting the timing group -- equal to the
+    /// point's own time only for the first point of a map. rtosu does not model
+    /// lazer's grouping, so this reports the point's own time. The divergence is
+    /// deliberate and is documented at the SC builder rather than papered over,
+    /// because the alternative is reporting `0` for every point outside a group
+    /// start, which is lossy in the other direction.
+    pub time: i32,
+    pub beat_length: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct HitWindowState {
@@ -153,6 +186,21 @@ pub struct BeatmapSnapshot {
     pub source: String,
     pub tags: String,
     pub stats: BeatmapStats,
+    /// `[Events] Break` spans. `#[serde(skip)]` because this is the v2 packet and
+    /// tosu's v2 payload has no such key -- it belongs only to the SC leaf
+    /// `mapBreaks` (`buildResultSC.ts:131-135`).
+    #[serde(skip)]
+    pub breaks: Vec<BreakSpan>,
+    /// `[TimingPoints]` lines, for the SC leaf `mapTimingPoints` only
+    /// (`buildResultSC.ts:138-141`). Skipped for the same reason.
+    #[serde(skip)]
+    pub timing_points: Vec<TimingPointSpan>,
+    /// `[General] PreviewTime`, for the SC leaf `previewtime`
+    /// (`buildResultSC.ts:116`, from `states/beatmap.ts:488`). `None` means the
+    /// line was absent, which osu!lazer reports as `-1`; `Some(-1)` is an
+    /// explicit `PreviewTime:-1`. Both serialise as `-1`.
+    #[serde(skip)]
+    pub preview_time: Option<i32>,
 }
 
 pub fn beatmap_status_name(status: i32) -> &'static str {
@@ -323,6 +371,12 @@ pub fn read_beatmap_from_ptr(
         filename,
         background_filename,
         audio_filename,
+        // Filled in by `populate_beatmap_file_metadata`, which is the only thing
+        // that reads the `.osu` file. A snapshot built straight from memory
+        // carries none, which is the same state the SC builder reports `-1` for.
+        breaks: Vec::new(),
+        timing_points: Vec::new(),
+        preview_time: None,
         stats: BeatmapStats {
             stars: StarsBreakdown {
                 live: 0.0,
@@ -404,6 +458,8 @@ pub fn populate_beatmap_file_metadata(snapshot: &mut BeatmapSnapshot, path: &Pat
     let mut spinners = 0;
     let mut holds = 0;
     let mut timing_points: Vec<(f64, f64)> = Vec::new();
+    let mut timing_spans: Vec<TimingPointSpan> = Vec::new();
+    let mut breaks: Vec<BreakSpan> = Vec::new();
     for raw_line in content.lines() {
         let line = raw_line.trim();
         if line.starts_with('[') && line.ends_with(']') {
@@ -414,6 +470,17 @@ pub fn populate_beatmap_file_metadata(snapshot: &mut BeatmapSnapshot, path: &Pat
             continue;
         }
         match section.as_str() {
+            "General" => {
+                // The only `[General]` key rtosu consumes today. `Mode:` sits in
+                // the same section and is what `A-08`/`F-05` need; it is left
+                // alone here so this change stays scoped to the SC payload.
+                if let Some((key, value)) = line.split_once(':')
+                    && key.trim() == "PreviewTime"
+                    && let Ok(preview) = value.trim().parse::<i32>()
+                {
+                    snapshot.preview_time = Some(preview);
+                }
+            }
             "Metadata" => {
                 if let Some((key, value)) = line.split_once(':') {
                     match key.trim() {
@@ -422,6 +489,42 @@ pub fn populate_beatmap_file_metadata(snapshot: &mut BeatmapSnapshot, path: &Pat
                         _ => {}
                     }
                 }
+            }
+            "Events" => {
+                // Two break spellings, and the legacy one is not rare -- map
+                // 2964306 (a 6.06-star Extra) uses it. Measured against tosu:
+                //
+                //   modern   `Break,<start>,<end>,<breakTimeFlag>`
+                //   legacy   `2,<start>,<end>`            (LegacyEventType.Break)
+                //
+                // The legacy form carries no flag, and lazer reports
+                // `HasEffect` as true for it, so it defaults to true rather than
+                // false. Reading only the modern form silently reported **zero**
+                // breaks for a map tosu reported three for.
+                let values = line.split(',').map(str::trim).collect::<Vec<_>>();
+                let (start_index, has_effect) = match values.first().copied() {
+                    Some(first) if first.eq_ignore_ascii_case("break") => (1, None),
+                    // A leading `2` is the legacy type code. Only that one value
+                    // is a break; `0` is a background/video and `1` a storyboard
+                    // layer, so neither may be mistaken for one.
+                    Some("2") => (1, Some(true)),
+                    _ => continue,
+                };
+                let (Some(start), Some(end)) = (
+                    values.get(start_index).and_then(|v| v.parse::<f64>().ok()),
+                    values
+                        .get(start_index + 1)
+                        .and_then(|v| v.parse::<f64>().ok()),
+                ) else {
+                    continue;
+                };
+                breaks.push(BreakSpan {
+                    start_time: start.round() as i32,
+                    end_time: end.round() as i32,
+                    has_effect: has_effect.unwrap_or_else(|| {
+                        values.get(start_index + 2).is_some_and(|flag| *flag != "0")
+                    }),
+                });
             }
             "TimingPoints" => {
                 let values = line.split(',').map(str::trim).collect::<Vec<_>>();
@@ -435,6 +538,10 @@ pub fn populate_beatmap_file_metadata(snapshot: &mut BeatmapSnapshot, path: &Pat
                             timing_points.last().map(|(_, bpm)| *bpm).unwrap_or(120.0)
                         };
                         timing_points.push((time, bpm));
+                        timing_spans.push(TimingPointSpan {
+                            time: time.round() as i32,
+                            beat_length,
+                        });
                     }
                 }
             }
@@ -480,6 +587,11 @@ pub fn populate_beatmap_file_metadata(snapshot: &mut BeatmapSnapshot, path: &Pat
         snapshot.stats.objects.holds = holds;
         snapshot.stats.objects.total = circles + sliders + spinners + holds;
     }
+    // Assigned unconditionally: a second call on a different file must not leave
+    // the previous map's breaks or timing points behind, and an absent line has
+    // to overwrite rather than survive.
+    snapshot.breaks = breaks;
+    snapshot.timing_points = timing_spans;
     if !timing_points.is_empty() {
         let mut min_bpm = f32::MAX;
         let mut max_bpm: f32 = 0.0;
@@ -529,7 +641,13 @@ pub fn populate_beatmap_file_metadata(snapshot: &mut BeatmapSnapshot, path: &Pat
     true
 }
 
-#[cfg(feature = "pp")]
+/// Round to `decimals` places, matching tosu's `fixDecimals`
+/// (`tosu-sourcecode/packages/tosu/src/utils/converters.ts:19-20`).
+///
+/// Not gated on `pp` any more: it is a pure numeric helper, and the SC payload
+/// needs the same rounding without pulling the calculator in. Behaviour is
+/// unchanged -- a non-finite input still propagates, and the SC builder folds
+/// that to zero itself because tosu's `x || 0` does.
 pub fn round_value(value: f32, decimals: u32) -> f32 {
     let factor = 10_f32.powi(decimals as i32);
     (value * factor).round() / factor
@@ -1385,5 +1503,209 @@ mod tests {
         let mut snapshot = BeatmapSnapshot::default();
         assert!(populate_beatmap_file_metadata(&mut snapshot, &path));
         snapshot
+    }
+
+    /// `[General] PreviewTime` is the source of SC's `previewtime` leaf
+    /// (`buildResultSC.ts:116` <- `states/beatmap.ts:488`). The section used to
+    /// be skipped whole, which is why the leaf had no source.
+    #[test]
+    fn the_general_section_now_yields_the_preview_time() {
+        let snapshot = file_metadata_snapshot(
+            "preview",
+            "osu file format v14\n\n[General]\nMode:0\nPreviewTime:72834\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\n\n[TimingPoints]\n0,300,4,1,0\n\n[HitObjects]\n64,192,1134,1,0,0:0:0:0:\n",
+        );
+        assert_eq!(snapshot.preview_time, Some(72834));
+    }
+
+    /// osu!lazer reports `-1` for a map with no `PreviewTime` line, and tosu
+    /// forwards that, so an absent line must not read as `0` -- and an explicit
+    /// `PreviewTime:-1` has to survive as the same value rather than being
+    /// confused with absence.
+    #[test]
+    fn an_absent_preview_time_stays_unresolved_rather_than_becoming_zero() {
+        let with_line = file_metadata_snapshot(
+            "preview-neg",
+            "osu file format v14\n\n[General]\nPreviewTime:-1\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\n\n[TimingPoints]\n0,300,4,1,0\n\n[HitObjects]\n64,192,1134,1,0,0:0:0:0:\n",
+        );
+        assert_eq!(with_line.preview_time, Some(-1));
+
+        let without_line = file_metadata_snapshot(
+            "preview-absent",
+            "osu file format v14\n\n[General]\nMode:0\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\n\n[TimingPoints]\n0,300,4,1,0\n\n[HitObjects]\n64,192,1134,1,0,0:0:0:0:\n",
+        );
+        assert_eq!(without_line.preview_time, None);
+
+        // A snapshot built straight from memory never sees the file at all.
+        assert_eq!(BeatmapSnapshot::default().preview_time, None);
+    }
+
+    /// `[Events] Break` is the source of SC's `mapBreaks`
+    /// (`buildResultSC.ts:131-135`). The fourth field is the break-time flag,
+    /// which is lazer's `BeatmapBreak.HasEffect`.
+    #[test]
+    fn the_events_section_yields_break_spans_with_their_effect_flag() {
+        let snapshot = file_metadata_snapshot(
+            "breaks",
+            "osu file format v14\n\n[General]\nMode:0\n\n[Events]\n0,0,0,0,0,0\nBreak,34934,36564,0\nBreak,70000,72000,1\nBackground,,\"bg.jpg\",0,0\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\n\n[TimingPoints]\n0,300,4,1,0\n\n[HitObjects]\n64,192,1134,1,0,0:0:0:0:\n",
+        );
+        assert_eq!(
+            snapshot.breaks.len(),
+            2,
+            "non-Break event lines are skipped"
+        );
+        assert_eq!(snapshot.breaks[0].start_time, 34934);
+        assert_eq!(snapshot.breaks[0].end_time, 36564);
+        assert!(!snapshot.breaks[0].has_effect, "flag 0");
+        assert_eq!(snapshot.breaks[1].start_time, 70000);
+        assert_eq!(snapshot.breaks[1].end_time, 72000);
+        assert!(snapshot.breaks[1].has_effect, "flag 1");
+    }
+
+    /// A second call on a different file has to clear the previous map's spans,
+    /// or a map with no breaks would report the previous map's.
+    #[test]
+    fn a_second_file_replaces_the_breaks_and_timing_points() {
+        let dir = std::env::temp_dir().join(format!(
+            "rtosu-filemeta-{}-breaks-replace",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("fixture.osu");
+
+        let with_breaks = "osu file format v14\n\n[Events]\nBreak,100,200,0\n\n[TimingPoints]\n0,300,4,1,0\n\n[Difficulty]\nCircleSize:4\n\n[HitObjects]\n64,192,1134,1,0,0:0:0:0:\n";
+        std::fs::write(&path, with_breaks).expect("write first fixture");
+        let mut snapshot = BeatmapSnapshot::default();
+        assert!(populate_beatmap_file_metadata(&mut snapshot, &path));
+        assert_eq!(snapshot.breaks.len(), 1);
+        assert_eq!(snapshot.timing_points.len(), 1);
+
+        let without_breaks = "osu file format v14\n\n[Difficulty]\nCircleSize:4\n\n[TimingPoints]\n0,500,4,1,0\n\n[HitObjects]\n64,192,1134,1,0,0:0:0:0:\n";
+        std::fs::write(&path, without_breaks).expect("write second fixture");
+        assert!(populate_beatmap_file_metadata(&mut snapshot, &path));
+        assert!(snapshot.breaks.is_empty(), "stale breaks survived");
+        assert_eq!(snapshot.timing_points.len(), 1);
+        assert_eq!(
+            snapshot.timing_points[0].beat_length, 500.0,
+            "stale timing point"
+        );
+    }
+
+    /// SC's `mapTimingPoints[].beatLength` is lazer's raw declared
+    /// `TimingChangePoint.beatLength`, so a redline keeps its **negative** value
+    /// rather than being normalised to the inherited length.
+    #[test]
+    fn timing_point_spans_keep_the_raw_declared_beat_length() {
+        let snapshot = file_metadata_snapshot(
+            "timing",
+            "osu file format v14\n\n[General]\nMode:0\n\n[Difficulty]\nCircleSize:4\n\n[TimingPoints]\n0,300,4,1,0\n1000,500,4,1,0\n5000,-150,4,1,0\n\n[HitObjects]\n64,192,1134,1,0,0:0:0:0:\n",
+        );
+        assert_eq!(snapshot.timing_points.len(), 3);
+        assert_eq!(snapshot.timing_points[0].time, 0);
+        assert_eq!(snapshot.timing_points[0].beat_length, 300.0);
+        assert_eq!(snapshot.timing_points[1].time, 1000);
+        assert_eq!(snapshot.timing_points[1].beat_length, 500.0);
+        assert_eq!(
+            snapshot.timing_points[2].beat_length, -150.0,
+            "a redline keeps its negative declared length"
+        );
+    }
+
+    /// The three new fields feed only the SC payload, so the v2 packet that
+    /// already ships must not gain a key because of them.
+    /// The **legacy** break spelling, from a real map.
+    ///
+    /// Map 2964306, "Toono Gensou Monogatari (MRM REMIX) (-Syncro) [Extra]", a
+    /// 6.06-star Extra, writes its breaks as `2,<start>,<end>` with no
+    /// `Break` keyword and no flag. The section below is transcribed verbatim
+    /// from that file, and the three expected spans are what tosu 4.26.2
+    /// reported for `mapBreaks` against the same map.
+    ///
+    /// This is a real miss, not a hypothetical one: reading only the modern
+    /// spelling reported **zero** breaks for a map tosu reported three for, and
+    /// the only way it was caught was the live diff. The legacy form carries no
+    /// flag, so `hasEffect` defaults to true -- which is what lazer reports and
+    /// what tosu served.
+    #[test]
+    fn the_legacy_numeric_break_spelling_is_parsed() {
+        let snapshot = file_metadata_snapshot(
+            "breaks-legacy",
+            concat!(
+                "osu file format v14\n\n",
+                "[General]\nAudioFilename: audio.mp3\nPreviewTime: 72834\nMode: 0\n\n",
+                "[Events]\n",
+                "//Background and Video events\n",
+                "0,0,\"Chen_waifu2x_art_noise1_scale_tta_1 (1).png\",0,0\n",
+                "//Break Periods\n",
+                "2,34934,36564\n",
+                "2,92534,94014\n",
+                "2,94934,95664\n",
+                "//Storyboard Layer 0 (Background)\n",
+                "\n[Difficulty]\nCircleSize:4\n\n[TimingPoints]\n0,300,4,1,0\n\n",
+                "[HitObjects]\n64,192,1134,1,0,0:0:0:0:\n"
+            ),
+        );
+
+        assert_eq!(snapshot.breaks.len(), 3, "one legacy break per `2,` line");
+        // Transcribed from tosu's live `mapBreaks` for this map.
+        let expected = [
+            (34934, 36564, true),
+            (92534, 94014, true),
+            (94934, 95664, true),
+        ];
+        for (span, (start, end, has_effect)) in snapshot.breaks.iter().zip(expected) {
+            assert_eq!(span.start_time, start);
+            assert_eq!(span.end_time, end);
+            assert!(span.has_effect, "the legacy form defaults to true");
+        }
+    }
+
+    /// Only a leading `2` is a break. `0` is a background/video event and `1` a
+    /// storyboard layer, and a modern `Background,...` or `Storyboard,...` line
+    /// is not a break either -- so neither may be mistaken for one.
+    #[test]
+    fn background_and_storyboard_events_are_not_breaks() {
+        let snapshot = file_metadata_snapshot(
+            "breaks-not-breaks",
+            concat!(
+                "osu file format v14\n\n",
+                "[Events]\n",
+                "0,0,\"bg.jpg\",0,0\n",
+                "1,512,0,0,0,0,1,0,0,0\n",
+                "2,0,0,0,0,0\n",
+                "Break,100,200,0\n",
+                "0,\"sound.mp3\",0,0,0,0,0,0,0,0\n",
+                "Background,\"bg2.jpg\",0,0\n",
+                "Storyboard Layer 0 (Background)\n",
+                "//2,300,400\n",
+                "\n[Difficulty]\nCircleSize:4\n\n[TimingPoints]\n0,300,4,1,0\n\n",
+                "[HitObjects]\n64,192,1134,1,0,0:0:0:0:\n"
+            ),
+        );
+        assert_eq!(snapshot.breaks.len(), 2, "only the `2,` and `Break,` lines");
+        assert_eq!(snapshot.breaks[0].start_time, 0);
+        assert_eq!(snapshot.breaks[0].end_time, 0);
+        assert_eq!(snapshot.breaks[1].start_time, 100);
+        assert_eq!(snapshot.breaks[1].end_time, 200);
+    }
+
+    #[test]
+    fn the_new_file_fields_stay_out_of_the_serialised_snapshot() {
+        let snapshot = file_metadata_snapshot(
+            "no-leak",
+            "osu file format v14\n\n[General]\nPreviewTime:72834\n\n[Events]\nBreak,100,200,1\n\n[Difficulty]\nCircleSize:4\n\n[TimingPoints]\n0,300,4,1,0\n\n[HitObjects]\n64,192,1134,1,0,0:0:0:0:\n",
+        );
+        assert_eq!(snapshot.breaks.len(), 1);
+        assert_eq!(snapshot.preview_time, Some(72834));
+
+        let json = serde_json::to_string(&snapshot).expect("serialize beatmap");
+        for absent in ["\"breaks\"", "\"timingPoints\"", "\"previewTime\""] {
+            assert!(!json.contains(absent), "v2 must not gain {absent}");
+        }
+        // The `#[serde(skip)]` fields still round-trip as their defaults, which
+        // is what a deserialised v2 packet carries.
+        let parsed: BeatmapSnapshot = serde_json::from_str(&json).expect("round trip");
+        assert!(parsed.breaks.is_empty());
+        assert!(parsed.timing_points.is_empty());
+        assert_eq!(parsed.preview_time, None);
     }
 }

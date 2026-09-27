@@ -421,7 +421,9 @@ fn snapshot_process_once(
             None
         }
     };
-    let gameplay = match read_gameplay_state(&memory, ruleset_address) {
+    // No beatmap context here, so `grade_max` falls back to the current grade;
+    // this is a diagnostic collector, not a served payload.
+    let gameplay = match read_gameplay_state(&memory, ruleset_address, 0) {
         Ok(value) => Some(value),
         Err(error) => {
             errors.insert("gameplay".to_owned(), error.to_string());
@@ -553,7 +555,9 @@ pub fn resolve_ruleset_container(
             Ok(address) if address != 0 => address,
             _ => continue,
         };
-        if read_gameplay_state(memory, candidate).is_ok()
+        // Only the success of the read matters here, so the object count that
+        // `grade_max` needs is irrelevant.
+        if read_gameplay_state(memory, candidate, 0).is_ok()
             || read_tournament_state(memory, candidate).is_ok()
             || read_result_screen_state(memory, candidate).is_ok()
         {
@@ -1034,6 +1038,59 @@ pub fn calculate_tosu_grade(
     }
 }
 
+/// tosu's `gameplay.gradeExpected` (`states/gameplay.ts:384-407`), which every
+/// payload exposes as `maxThisPlay` / `max_this_play`.
+///
+/// **The name is a lie: this is not a maximum, it is a projection.** tosu
+/// computes it as `calculateGrade` over a *hypothetical* statistics block in
+/// which every object the player has not yet judged is counted as a 300:
+///
+/// ```text
+/// great: statistics.great + objectCount
+///              - statistics.great - statistics.ok - statistics.meh - statistics.miss
+/// ```
+///
+/// i.e. `great + (objectCount - judged)`. Every other count and the accuracy are
+/// left alone, so the result is "the grade this play would end on if nothing
+/// else is missed".
+///
+/// Verified live on map 2964306 with 9 great / 6 ok / 0 meh / 1 miss of 604
+/// objects: the current grade is `D` (`r300 = 9/16 = 0.5625`) and the projection
+/// is `A` (`great` becomes 597, `r300 = 597/604 = 0.9884`, and the `r300 > 0.9`
+/// arm fires despite the one miss). tosu served `maxThisPlay: 'A'`; rtosu served
+/// `D`, because `grade_max` was a clone of the current grade.
+///
+/// `object_count` is `menu.objectCount`, read at `beatmap_addr + 0xF8`
+/// (`memory/stable.ts:959`) -- the same field rtosu already reads at
+/// `beatmap.rs:310` and stores as `beatmap.stats.objects.total`. An
+/// `object_count` at or below the number already judged makes the projection
+/// collapse to the current grade, which is what a caller with no beatmap
+/// context should report.
+pub fn calculate_tosu_grade_projected(
+    mode: i32,
+    hit_300: i16,
+    hit_100: i16,
+    hit_50: i16,
+    hit_miss: i16,
+    mods: u32,
+    object_count: i32,
+) -> String {
+    let judged = hit_300 as i64 + hit_100 as i64 + hit_50 as i64 + hit_miss as i64;
+    let remaining = object_count as i64 - judged;
+    if remaining <= 0 {
+        // Nothing left to judge: tosu's own expression collapses to
+        // `great - ok - meh - miss`, which is nonsense, so the current grade is
+        // the only defensible value.
+        return calculate_tosu_grade(mode, 0.0, hit_300, hit_100, hit_50, hit_miss, mods);
+    }
+    let projected_300 = (hit_300 as i64 + remaining).clamp(0, i16::MAX as i64) as i16;
+    // On stable, `calculateGrade` ignores `accuracy` entirely and works from the
+    // statistics alone (`utils/calculators.ts:400-407` vs the lazer branch at
+    // `:31-99`), so the accuracy argument here is inert. It is passed as `0.0`
+    // rather than a real value so that nobody later reads it as meaningful.
+    calculate_tosu_grade(mode, 0.0, projected_300, hit_100, hit_50, hit_miss, mods)
+}
+
 fn net_date_to_iso(memory: &ProcessMemory, base: u64) -> Result<String> {
     let low = memory.read_i32(checked_add(base, 0xa0)?)? as u32;
     let high = (memory.read_i32(checked_add(base, 0xa4)?)? as u32) & 0x3fff_ffff;
@@ -1109,14 +1166,23 @@ pub fn read_tournament_user(memory: &ProcessMemory, user_address: u64) -> Result
     })
 }
 
-pub fn read_gameplay_state(memory: &ProcessMemory, ruleset_address: u64) -> Result<GameplayState> {
-    read_gameplay_state_cached(memory, ruleset_address, None)
+/// `object_count` is `menu.objectCount` (`beatmap_addr + 0xF8`), needed for
+/// `grade_max`. Pass `0` when the caller has no beatmap context: the projection
+/// then collapses to the current grade, which is the old behaviour rather than a
+/// wrong number.
+pub fn read_gameplay_state(
+    memory: &ProcessMemory,
+    ruleset_address: u64,
+    object_count: i32,
+) -> Result<GameplayState> {
+    read_gameplay_state_cached(memory, ruleset_address, None, object_count)
 }
 
 pub fn read_gameplay_state_cached(
     memory: &ProcessMemory,
     ruleset_address: u64,
     cached_hits: Option<(u32, &Arc<[i16]>, f64)>,
+    object_count: i32,
 ) -> Result<GameplayState> {
     crate::instr_scope!(GameplayState);
     let gameplay_base = memory
@@ -1221,7 +1287,19 @@ pub fn read_gameplay_state_cached(
         (arr, ur)
     };
     let grade = calculate_tosu_grade(mode, accuracy, hit_300, hit_100, hit_50, hit_miss, mods);
-    let grade_max = grade.clone();
+    // The projection, not a running maximum -- see
+    // `calculate_tosu_grade_projected`. This used to be `grade.clone()`, which
+    // reported the current grade and diverged from tosu on every play where the
+    // grade had not yet fallen.
+    let grade_max = calculate_tosu_grade_projected(
+        mode,
+        hit_300,
+        hit_100,
+        hit_50,
+        hit_miss,
+        mods,
+        object_count,
+    );
 
     Ok(GameplayState {
         player_name: memory
@@ -1273,9 +1351,10 @@ pub fn find_pattern(
 mod tests {
     use super::{
         CommandLineTokens, GameplayState, MAX_HIT_ERRORS, ProcessSnapshotResult,
-        calculate_accuracy, calculate_unstable_rate, compute_format_mods, format_mods,
-        hit_error_items_address, hit_error_window, is_tournament_manager_cmd, mod_bits,
-        parse_hit_errors, parse_spectate_client_arg,
+        calculate_accuracy, calculate_tosu_grade, calculate_tosu_grade_projected,
+        calculate_unstable_rate, compute_format_mods, format_mods, hit_error_items_address,
+        hit_error_window, is_tournament_manager_cmd, mod_bits, parse_hit_errors,
+        parse_spectate_client_arg,
     };
 
     /// `List<int>._items` as it looks in the game's address space: the 8-byte
@@ -1874,5 +1953,96 @@ mod tests {
             );
         }
         assert_eq!(calculate_accuracy(4, 0, 0, 0, 0, 0, 0, 0), 0.0);
+    }
+
+    /// `grade_max` is a **projection**, not a running maximum, and getting that
+    /// wrong is invisible until the grade has fallen below its starting value.
+    ///
+    /// Both numbers are transcribed from a live capture: map 2964306, osu!std,
+    /// NF, 16 objects judged of 604. tosu served `rank.current: 'D'` and
+    /// `rank.maxThisPlay: 'A'`; rtosu served `D` for both, because `grade_max`
+    /// was a clone of the current grade.
+    ///
+    /// The arithmetic is tosu's own, from `states/gameplay.ts:393-407`:
+    /// `great + objectCount - great - ok - meh - miss` = 9 + 588 = 597, so
+    /// `r300` goes from 9/16 = 0.5625 to 597/604 = 0.98841 and the `r300 > 0.9`
+    /// arm fires as `A` even though the play is not perfect and one object is a
+    /// miss.
+    #[test]
+    fn the_projected_grade_is_not_the_current_grade() {
+        assert_eq!(calculate_tosu_grade(0, 68.75, 9, 6, 0, 1, 0), "D");
+        assert_eq!(
+            calculate_tosu_grade_projected(0, 9, 6, 0, 1, 0, 604),
+            "A",
+            "the value tosu served for maxThisPlay"
+        );
+
+        // An untouched 604-300 play projects to itself.
+        assert_eq!(calculate_tosu_grade(0, 100.0, 604, 0, 0, 0, 0), "X");
+        assert_eq!(
+            calculate_tosu_grade_projected(0, 604, 0, 0, 0, 0, 604),
+            "X",
+            "nothing left to judge: the projection is the current grade"
+        );
+
+        // Nothing judged at all: tosu's own expression subtracts more 300s than
+        // exist, so the guard returns the current grade rather than a nonsense
+        // ratio. This is also what a caller with no beatmap context gets.
+        assert_eq!(calculate_tosu_grade_projected(0, 0, 0, 0, 0, 0, 604), "X");
+        assert_eq!(calculate_tosu_grade_projected(0, 0, 0, 0, 0, 0, 0), "X");
+    }
+
+    /// A miss cannot be projected away, so the projection can never outrank what
+    /// the misses allow. The `r50` and `miss == 0` gates mean a single miss
+    /// blocks the S arm no matter how many 300s remain.
+    #[test]
+    fn the_projection_cannot_outrank_the_grade_a_miss_allows() {
+        // 1 miss in 604: the S arm needs `miss == 0`, so the best it can reach
+        // is A via the `r300 > 0.9` fallback. `great` projects to 603, so
+        // `r300 = 603/604`.
+        assert_eq!(calculate_tosu_grade_projected(0, 1, 0, 0, 1, 0, 604), "A");
+        // The same play with no miss projects to 604/604, which is the `r300 == 1`
+        // arm, so it reaches X rather than S.
+        assert_eq!(calculate_tosu_grade_projected(0, 1, 0, 0, 0, 0, 604), "X");
+        // Leaving one 100 unprojected keeps `r300` below 1, which is what makes
+        // the S arm reachable: 599/604, no miss, no 50s.
+        assert_eq!(calculate_tosu_grade_projected(0, 1, 5, 0, 0, 0, 604), "S");
+        // 50s are not projected away either, so enough of them cap the grade at A
+        // even with no miss at all: 584/604 with `r50 = 20/604`.
+        assert_eq!(calculate_tosu_grade_projected(0, 0, 0, 20, 0, 0, 604), "A");
+    }
+
+    /// HD and FL turn X into XH and S into SH, on the projection as well as on
+    /// the current grade -- `silver` is a property of the mods, not of the
+    /// statistics.
+    #[test]
+    fn the_projection_honours_the_silver_mods() {
+        let hd = mod_bits::HD;
+        assert_eq!(calculate_tosu_grade_projected(0, 1, 5, 0, 0, 0, 604), "S");
+        assert_eq!(calculate_tosu_grade_projected(0, 1, 5, 0, 0, hd, 604), "SH");
+        assert_eq!(calculate_tosu_grade_projected(0, 1, 0, 0, 0, 0, 604), "X");
+        assert_eq!(calculate_tosu_grade_projected(0, 1, 0, 0, 0, hd, 604), "XH");
+    }
+
+    /// osu!catch and osu!mania grade on **accuracy**, and tosu's projection never
+    /// touches it -- it swaps only the statistics. On stable `calculateGrade`
+    /// reads `params.accuracy` for those two modes
+    /// (`utils/calculators.ts:51-99`), so the projection cannot be reproduced
+    /// for them without also passing the accuracy through.
+    ///
+    /// `0.0` is passed deliberately: it makes the divergence visible as the
+    /// accuracy floor rather than hiding it, and it is what osu!mania/catch
+    /// report before any object is judged. Recorded rather than papered over.
+    #[test]
+    fn the_projection_is_inert_for_the_accuracy_driven_modes() {
+        // Catch needs accuracy > 98 for S and > 94 for A.
+        assert_eq!(calculate_tosu_grade(2, 99.0, 10, 5, 1, 0, 0), "S");
+        assert_eq!(calculate_tosu_grade(2, 97.0, 10, 5, 1, 0, 0), "A");
+        // Mania needs >= 95 for S.
+        assert_eq!(calculate_tosu_grade(3, 97.0, 10, 5, 1, 0, 0), "S");
+        // tosu returns the current grade here, because its accuracy is passed
+        // through unchanged. rtosu returns the floor. Known divergence.
+        assert_eq!(calculate_tosu_grade_projected(2, 10, 5, 1, 0, 0, 604), "D");
+        assert_eq!(calculate_tosu_grade_projected(3, 10, 5, 1, 0, 0, 604), "D");
     }
 }

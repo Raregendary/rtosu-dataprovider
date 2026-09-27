@@ -553,6 +553,90 @@ pub mod calculator {
             assert_eq!(detailed_25.current, detailed_25.fc);
         }
 
+        /// The live star rating is quantised to `gradual_pp_chunks` buckets, so
+        /// early in a map it reports the difficulty of a whole bucket rather than
+        /// of the objects actually judged. That is inherent to the design, but it
+        /// has a consequence worth pinning: at a low object count the reported
+        /// value can be the *full* map rating.
+        ///
+        /// Measured live on map 2964306 with 16 of 604 objects judged, rtosu
+        /// reported `stars.live` 6.06 against tosu's 2.42 -- and 6.06 was
+        /// `stars.total` exactly, which is what a one-element chunk vector
+        /// produces. The key is `(map, mods)` and does not include the chunk
+        /// count, so a cached single-chunk result is possible in principle; the
+        /// cache read at :183 refuses a one-element entry, so this asserts the
+        /// arithmetic instead, which is the part that can silently collapse.
+        #[test]
+        fn the_live_star_rating_is_never_the_full_rating_while_objects_remain() {
+            let mut map_content = String::from(
+                "osu file format v14\n\n[General]\nMode: 0\n\n[Metadata]\nTitle:Test\nArtist:Test\nCreator:Test\nVersion:Normal\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\nSliderMultiplier:1.4\nSliderTickRate:1\n\n[TimingPoints]\n0,500,4,2,0,50,1,0\n\n[HitObjects]\n",
+            );
+            // 200 circles, a tenth of a second apart.
+            for i in 0..200 {
+                map_content.push_str(&format!("256,192,{},1,0,0:0:0:0:\n", 1000 + i * 100));
+            }
+
+            let beatmap = Beatmap::from_bytes(map_content.as_bytes()).expect("parse map");
+            let mods = GameModsLegacy::default();
+            let total_objects = beatmap.hit_objects.len();
+            assert_eq!(total_objects, 200);
+
+            let full = Difficulty::new().calculate(&beatmap).stars();
+            let chunks = compute_chunks(&beatmap, mods, 100);
+            assert!(
+                chunks.len() > 1,
+                "a 200-object map at 100 chunks must produce a real vector, got {}",
+                chunks.len()
+            );
+
+            // The chunk actually selected for a handful of judged objects, and
+            // the value it holds.
+            let judged = 16u32;
+            let chunk_idx =
+                ((judged as usize * (chunks.len() - 1)) / total_objects).min(chunks.len() - 1);
+            let selected = chunks[chunk_idx].stars();
+            let reported = live_stars_from_chunks(&chunks, total_objects, judged);
+
+            assert_eq!(crate::beatmap::round_value(selected as f32, 2), reported);
+            // The point of the test: 16 of 200 objects is nowhere near the whole
+            // map, so the bucket must not be the final one.
+            assert!(
+                chunk_idx < chunks.len() - 1,
+                "16/200 objects selected the last chunk ({chunk_idx} of {})",
+                chunks.len()
+            );
+
+            // And the live value must track progress, rising toward the full
+            // rating -- a value pinned at `full` for the whole run is the
+            // failure mode this pins.
+            let at_start = live_stars_from_chunks(&chunks, total_objects, judged);
+            let at_half = live_stars_from_chunks(&chunks, total_objects, 100);
+            let at_end = live_stars_from_chunks(&chunks, total_objects, total_objects as u32);
+            assert!(at_start < at_half, "{at_start} should be below {at_half}");
+            assert!(at_half < at_end, "{at_half} should be below {at_end}");
+            assert!(
+                (at_end - full as f32).abs() < 0.01,
+                "a fully judged map should report the full rating: {at_end} vs {full}"
+            );
+        }
+
+        /// `passed_objects == 0` has to read as 0 stars, not as the first chunk.
+        /// The early-return at the top of `live_stars_from_chunks` covers it, and
+        /// this pins that the guard is there -- without it a play state with
+        /// nothing judged yet would report a nonzero difficulty.
+        #[test]
+        fn no_objects_judged_reads_as_zero_stars() {
+            let chunks = vec![Difficulty::new().calculate(
+                &Beatmap::from_bytes(
+                    b"osu file format v14\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\n\n[TimingPoints]\n0,500,4,1,0\n\n[HitObjects]\n256,192,1000,1,0,0:0:0:0:\n"
+                )
+                .expect("parse"),
+            )];
+            assert_eq!(live_stars_from_chunks(&chunks, 1, 0), 0.0);
+            assert_eq!(live_stars_from_chunks(&[], 100, 50), 0.0);
+            assert_eq!(live_stars_from_chunks(&chunks, 0, 50), 0.0);
+        }
+
         #[test]
         fn test_unsubmitted_map_cache_key_differentiation() {
             let map1_content = "osu file format v14\n\n[General]\nMode: 0\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\n\n[TimingPoints]\n0,500,4,2,0,50,1,0\n\n[HitObjects]\n256,192,1000,1,0,0:0:0:0:\n";

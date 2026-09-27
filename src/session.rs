@@ -557,7 +557,20 @@ impl TournamentSession {
                         &client.cached_hit_errors,
                         client.cached_unstable_rate,
                     ));
-                    crate::client::read_gameplay_state_cached(&client.memory, ruleset, cached).ok()
+                    // `grade_max` needs `menu.objectCount`; the tournament
+                    // client's cached metadata carries the same value the solo
+                    // path uses.
+                    let object_count = client
+                        .cached_metadata
+                        .as_ref()
+                        .map_or(0, |b| b.stats.objects.total);
+                    crate::client::read_gameplay_state_cached(
+                        &client.memory,
+                        ruleset,
+                        cached,
+                        object_count,
+                    )
+                    .ok()
                 });
                 if let Some(ref mut g) = gameplay {
                     let total_hits = (g.hit_300 + g.hit_100 + g.hit_50 + g.hit_miss) as u32;
@@ -1963,9 +1976,12 @@ impl SoloSession {
                     &self.cached_hit_errors,
                     self.cached_unstable_rate,
                 ));
-                if let Ok(mut g) =
-                    crate::client::read_gameplay_state_cached(memory, ruleset_addr, cached)
-                {
+                if let Ok(mut g) = crate::client::read_gameplay_state_cached(
+                    memory,
+                    ruleset_addr,
+                    cached,
+                    self.cached_packet.beatmap.stats.objects.total,
+                ) {
                     let total_hits = (g.hit_300 + g.hit_100 + g.hit_50 + g.hit_miss) as u32;
                     self.cached_hit_errors_total_hits = total_hits;
                     self.cached_unstable_rate = g.unstable_rate;
@@ -2060,7 +2076,11 @@ impl SoloSession {
                 self.cached_packet.beatmap.stats.stars.total;
 
             if let Some(ruleset_addr) = active_ruleset_addr {
-                if let Ok(g) = crate::client::read_gameplay_state(memory, ruleset_addr) {
+                if let Ok(g) = crate::client::read_gameplay_state(
+                    memory,
+                    ruleset_addr,
+                    self.cached_packet.beatmap.stats.objects.total,
+                ) {
                     self.cached_packet.play.player_name = g.player_name;
                     self.cached_packet.play.mode = crate::v2::OsuStatusState {
                         number: g.mode,
