@@ -22,7 +22,6 @@ use crate::client::mod_bits;
 /// unreadable, before the reader accepts the partial result. At the default
 /// 60 Hz that is about half a second of retrying, which covers osu! assembling
 /// a beatmap, without costing a full memory read every tick indefinitely.
-const BEATMAP_RESOLVE_RETRIES: u32 = 30;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TournamentClientView {
@@ -1267,9 +1266,6 @@ pub struct SoloSession {
     /// Difficulty id of the map behind `cached_beatmap`, so a map swap that
     /// reuses the same beatmap object is still noticed.
     cached_beatmap_id: i32,
-    /// Consecutive ticks the current map has read back without a title, before
-    /// giving up and settling for whatever did come through.
-    cached_beatmap_retry: u32,
     last_skin_read: Instant,
     last_profile_read: Instant,
     last_scan_attempt: Instant,
@@ -1342,7 +1338,6 @@ impl SoloSession {
             cached_stats: crate::beatmap::BeatmapStats::default(),
             cached_beatmap_ptr: 0,
             cached_beatmap_id: 0,
-            cached_beatmap_retry: 0,
             last_skin_read: Instant::now() - Duration::from_secs(10),
             last_profile_read: Instant::now() - Duration::from_secs(10),
             last_scan_attempt: Instant::now() - Duration::from_secs(10),
@@ -1703,36 +1698,41 @@ impl SoloSession {
                                     bm.time.mp3_length = audio_length as i32;
                                 }
 
-                                // Title, folder and filename are memory reads and
-                                // can all come back empty while osu! is still
-                                // assembling the beatmap. Treating that first
-                                // partial read as final left overlays showing no
-                                // beatmap for the rest of the map, because both
-                                // the checksum and the id were cached on a result
-                                // that had nothing in it. Retry instead, with a
-                                // bound so a map that never resolves costs a few
-                                // reads rather than one full read per tick
-                                // forever.
-                                let resolved = !bm.title.is_empty();
-                                if resolved {
-                                    self.cached_beatmap_retry = 0;
-                                    self.cached_beatmap_id = live_id;
-                                } else {
-                                    self.cached_beatmap_retry += 1;
+                                // osu! fills `BeatmapInfo` in field by field, so
+                                // the title and the id can already be current while
+                                // the md5 at +0x6C is still the previous map's, or
+                                // empty. tosu treats such a read as 'not-ready' and
+                                // skips the whole state update
+                                // (`states/beatmap.ts:355-377`,
+                                // `instances/osuInstance.ts:113`), so the previously
+                                // published beatmap stands and the next tick re-reads.
+                                // Requiring a checksum is also what makes Restore
+                                // unreachable for a different map, which is the whole
+                                // of the stale-metadata bug: that branch used to fire
+                                // whenever the held checksum was merely non-empty, and
+                                // stamped the previous map's source, tags, object
+                                // counts, first/last object, bpm and mp3 length onto
+                                // the new one.
+                                let read = beatmap_read_action(
+                                    &bm.title,
+                                    &bm.checksum,
+                                    &self.current_checksum,
+                                    live_id,
+                                    self.cached_beatmap_id,
+                                );
+                                let resolved = read != BeatmapReadAction::Retry;
+                                if read == BeatmapReadAction::Retry {
                                     // Leave the id uncached so the next tick tries
-                                    // again, up to the retry limit.
-                                    self.cached_beatmap_id =
-                                        if self.cached_beatmap_retry < BEATMAP_RESOLVE_RETRIES {
-                                            0
-                                        } else {
-                                            live_id
-                                        };
+                                    // again. Deliberately unbounded: the cost is one
+                                    // read per tick, and the 30-tick bound that used
+                                    // to stop that only saved the read at the price
+                                    // of permanently freezing whatever partial read
+                                    // happened to be in hand. tosu retries forever
+                                    // too, and so does TournamentSession.
+                                    self.cached_beatmap_id = 0;
                                 }
 
-                                let checksum_changed =
-                                    bm.checksum != self.current_checksum && !bm.checksum.is_empty();
-                                if resolved && checksum_changed {
-                                    self.current_checksum = bm.checksum.clone();
+                                if read == BeatmapReadAction::Load {
                                     // `self.memory` is borrowed for this whole
                                     // function, so write the disjoint fields in
                                     // place rather than through a `&mut self` method.
@@ -1751,26 +1751,54 @@ impl SoloSession {
                                     let osu_path = std::path::Path::new(&self.songs_folder)
                                         .join(&bm.folder)
                                         .join(&bm.filename);
-                                    crate::beatmap::populate_beatmap_file_metadata(
-                                        &mut bm, &osu_path,
-                                    );
+                                    let metadata_ok =
+                                        crate::beatmap::populate_beatmap_file_metadata(
+                                            &mut bm, &osu_path,
+                                        );
                                     self.cached_beatmap_metadata = bm.clone();
 
                                     #[cfg(feature = "pp")]
-                                    {
+                                    let file_ok = {
                                         crate::instr_scope!(BeatmapFileRead);
-                                        let file_bytes = std::fs::read(&osu_path);
-                                        if let Ok(bytes) = &file_bytes {
-                                            crate::instr_scope!(BeatmapParse);
-                                            self.cached_beatmap =
-                                                rosu_pp::Beatmap::from_bytes(bytes).ok();
-                                        } else {
-                                            self.cached_beatmap = None;
+                                        match std::fs::read(&osu_path) {
+                                            Ok(bytes) => {
+                                                crate::instr_scope!(BeatmapParse);
+                                                match rosu_pp::Beatmap::from_bytes(&bytes) {
+                                                    Ok(map) => {
+                                                        self.cached_beatmap = Some(map);
+                                                        true
+                                                    }
+                                                    Err(_) => {
+                                                        self.cached_beatmap = None;
+                                                        false
+                                                    }
+                                                }
+                                            }
+                                            Err(_) => {
+                                                self.cached_beatmap = None;
+                                                false
+                                            }
                                         }
+                                    };
+                                    #[cfg(not(feature = "pp"))]
+                                    let file_ok = true;
+
+                                    #[cfg(feature = "pp")]
+                                    {
                                         self.cached_difficulty_attrs = None;
                                         self.cached_mods = u32::MAX;
                                     }
-                                } else if resolved && !self.current_checksum.is_empty() {
+
+                                    if caches_may_advance(read, metadata_ok, file_ok) {
+                                        self.current_checksum = bm.checksum.clone();
+                                        self.cached_beatmap_id = live_id;
+                                    } else {
+                                        // Force a full re-read next tick rather than
+                                        // latching a map we could not load.
+                                        self.cached_beatmap_id = 0;
+                                        self.cached_beatmap_ptr = 0;
+                                    }
+                                } else if read == BeatmapReadAction::Restore {
                                     // Restore cached file metadata without reading disk!
                                     bm.source = self.cached_beatmap_metadata.source.clone();
                                     bm.tags = self.cached_beatmap_metadata.tags.clone();
@@ -1787,56 +1815,67 @@ impl SoloSession {
                                     bm.stats.bpm = self.cached_beatmap_metadata.stats.bpm.clone();
                                 }
 
-                                #[cfg(feature = "pp")]
-                                if let Some(map) = &self.cached_beatmap {
-                                    self.cached_mods = active_mods;
-                                    let mods_legacy =
-                                        crate::pp::calculator::parse_mods_bits(active_mods);
-                                    crate::instr_scope!(PpDifficulty);
-                                    let diff =
-                                        rosu_pp::Difficulty::new().mods(mods_legacy).calculate(map);
-                                    crate::beatmap::populate_beatmap_statistics_with_diff(
-                                        &mut bm,
-                                        map,
-                                        &diff,
-                                        active_mods,
-                                    );
-                                    self.cached_stats = bm.stats.clone();
-                                    self.cached_beatmap_metadata.time.last_object =
-                                        bm.time.last_object;
-                                    self.cached_accuracy =
-                                        crate::pp::calculator::calc_accuracy_table_from_diff(&diff);
-                                    crate::instr_scope!(GraphBuild);
-                                    self.cached_graph = performance_graph(
-                                        map,
-                                        active_mods,
-                                        bm.time.first_object,
-                                        bm.time.last_object,
-                                        bm.time.mp3_length,
-                                    );
-                                    self.cached_difficulty_attrs = Some(diff);
-                                    self.cached_packet.performance.accuracy =
-                                        self.cached_accuracy.clone();
-                                    self.cached_packet.performance.graph =
-                                        self.cached_graph.clone();
+                                // An unresolved read publishes nothing, which is what
+                                // tosu's `continue` amounts to: the last good beatmap
+                                // stays in the packet instead of being overwritten by a
+                                // partial one whose stars still come from the previous
+                                // map's parsed file.
+                                if resolved {
+                                    #[cfg(feature = "pp")]
+                                    if let Some(map) = &self.cached_beatmap {
+                                        self.cached_mods = active_mods;
+                                        let mods_legacy =
+                                            crate::pp::calculator::parse_mods_bits(active_mods);
+                                        crate::instr_scope!(PpDifficulty);
+                                        let diff = rosu_pp::Difficulty::new()
+                                            .mods(mods_legacy)
+                                            .calculate(map);
+                                        crate::beatmap::populate_beatmap_statistics_with_diff(
+                                            &mut bm,
+                                            map,
+                                            &diff,
+                                            active_mods,
+                                        );
+                                        self.cached_stats = bm.stats.clone();
+                                        self.cached_beatmap_metadata.time.last_object =
+                                            bm.time.last_object;
+                                        self.cached_accuracy =
+                                            crate::pp::calculator::calc_accuracy_table_from_diff(
+                                                &diff,
+                                            );
+                                        crate::instr_scope!(GraphBuild);
+                                        self.cached_graph = performance_graph(
+                                            map,
+                                            active_mods,
+                                            bm.time.first_object,
+                                            bm.time.last_object,
+                                            bm.time.mp3_length,
+                                        );
+                                        self.cached_difficulty_attrs = Some(diff);
+                                        self.cached_packet.performance.accuracy =
+                                            self.cached_accuracy.clone();
+                                        self.cached_packet.performance.graph =
+                                            self.cached_graph.clone();
+                                    }
+
+                                    self.cached_packet.folders.game = self.game_folder.clone();
+                                    self.cached_packet.folders.songs = self.songs_folder.clone();
+                                    self.cached_packet.folders.beatmap = bm.folder.clone();
+                                    self.cached_packet.files.beatmap = bm.filename.clone();
+                                    self.cached_packet.files.background =
+                                        bm.background_filename.clone();
+                                    self.cached_packet.files.audio = bm.audio_filename.clone();
+                                    self.cached_packet.direct_path.beatmap_folder =
+                                        bm.folder.clone();
+                                    self.cached_packet.direct_path.beatmap_file =
+                                        join_beatmap_path(&bm.folder, &bm.filename);
+                                    self.cached_packet.direct_path.beatmap_background =
+                                        join_beatmap_path(&bm.folder, &bm.background_filename);
+                                    self.cached_packet.direct_path.beatmap_audio =
+                                        join_beatmap_path(&bm.folder, &bm.audio_filename);
+
+                                    self.cached_packet.beatmap = bm;
                                 }
-
-                                self.cached_packet.folders.game = self.game_folder.clone();
-                                self.cached_packet.folders.songs = self.songs_folder.clone();
-                                self.cached_packet.folders.beatmap = bm.folder.clone();
-                                self.cached_packet.files.beatmap = bm.filename.clone();
-                                self.cached_packet.files.background =
-                                    bm.background_filename.clone();
-                                self.cached_packet.files.audio = bm.audio_filename.clone();
-                                self.cached_packet.direct_path.beatmap_folder = bm.folder.clone();
-                                self.cached_packet.direct_path.beatmap_file =
-                                    join_beatmap_path(&bm.folder, &bm.filename);
-                                self.cached_packet.direct_path.beatmap_background =
-                                    join_beatmap_path(&bm.folder, &bm.background_filename);
-                                self.cached_packet.direct_path.beatmap_audio =
-                                    join_beatmap_path(&bm.folder, &bm.audio_filename);
-
-                                self.cached_packet.beatmap = bm;
                             }
                         }
                     } else {
@@ -2243,8 +2282,69 @@ impl SoloSession {
 /// `play_state_dirty` is tosu's `isDefaultState` latch: it is set once gameplay
 /// has actually been read, so nothing is cleared for a client that was never in
 /// a map, and the reset runs once rather than every tick.
+/// What one beatmap read means for the session caches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BeatmapReadAction {
+    /// Not finished. Publish nothing, leave both caches unpinned, retry next tick.
+    Retry,
+    /// A different map: read its file, then commit only if the read worked.
+    Load,
+    /// The map already held: restore its file metadata from cache.
+    Restore,
+}
+
+/// Classify a beatmap read against the state currently held.
+///
+/// `live_id` is the difficulty id at +0xC8 and `cached_id` the one already held.
+/// The checksum alone cannot tell "same map" from "a different map whose md5 has
+/// not landed yet" -- both present the previous map's md5 -- and guessing wrong
+/// there is the stale-metadata bug, so the id breaks the tie. The id is stable for
+/// a given map and difficulty, so `live_id != cached_id` means a different map.
+fn beatmap_read_action(
+    title: &str,
+    checksum: &str,
+    current_checksum: &str,
+    live_id: i32,
+    cached_id: i32,
+) -> BeatmapReadAction {
+    // A title alone is not a finished beatmap.
+    if title.is_empty() || checksum.is_empty() {
+        return BeatmapReadAction::Retry;
+    }
+    if checksum != current_checksum {
+        return BeatmapReadAction::Load;
+    }
+    if live_id > 0 && cached_id > 0 && live_id != cached_id {
+        return BeatmapReadAction::Load;
+    }
+    BeatmapReadAction::Restore
+}
+
+/// Whether the session caches may advance past this tick.
+///
+/// `Retry` never advances, which is what makes the retry unbounded.
+///
+/// `Load` advances only if the map's own file was actually read. A transient lock
+/// at the moment of the switch -- an AV scanner, OneDrive, the osu! editor -- used
+/// to commit the checksum and the beatmap id against a read that had no stars, no
+/// object counts and no max combo, and the map then stayed that way for its whole
+/// duration. That is a different failure from the stale-metadata one and produces
+/// the same user-visible report, distinguishable only by the checksum being right.
+fn caches_may_advance(read: BeatmapReadAction, metadata_ok: bool, file_ok: bool) -> bool {
+    match read {
+        BeatmapReadAction::Retry => false,
+        BeatmapReadAction::Restore => true,
+        BeatmapReadAction::Load => metadata_ok && file_ok,
+    }
+}
+
 fn should_clear_play_state(play_state_dirty: bool, next_state: i32) -> bool {
-    play_state_dirty && !matches!(next_state, 0 | 2 | 7)
+    // 0 menu, 2 play and 7 resultScreen are excluded, and so are 11 lobby,
+    // 12 matchSetup and 15 onlineSelection: tosu breaks on those three with the
+    // comment "do not spam reset on multiplayer and direct"
+    // (`instances/osuInstance.ts:186-190`), deliberately keeping the last play
+    // frozen. GameState is numbered at `common/enums/osu.ts:13-40`.
+    play_state_dirty && !matches!(next_state, 0 | 2 | 7 | 11 | 12 | 15)
 }
 
 /// Drop every play-derived field so a finished attempt cannot leak into the
@@ -2466,5 +2566,145 @@ mod tests {
         assert!(packet.results_screen.player_name.is_empty());
         assert_eq!(packet.results_screen.mods.number, 0);
         assert_eq!(packet.results_screen.hits.n300, 0);
+    }
+
+    // ---------------------------------------------------------------------
+    // Beatmap switching. audit-1.0.5.md E-01, E-02, E-03, E-05.
+    //
+    // osu! fills `BeatmapInfo` in field by field, so mid-switch the title and the
+    // id at +0xC8 can already be current while the md5 at +0x6C is still the
+    // previous map's, or empty. tosu treats such a read as 'not-ready' and skips
+    // the whole state update (`states/beatmap.ts:355-377`,
+    // `instances/osuInstance.ts:113`), which leaves the previously published
+    // beatmap standing and retries on the next tick.
+    //
+    // Reported symptom, in both forms: after selecting a new map the overlay kept
+    // the previous map's stars, object counts, source and tags, while showing the
+    // new map's title. Two distinct causes, told apart by the checksum.
+    // ---------------------------------------------------------------------
+
+    use super::{BeatmapReadAction, beatmap_read_action, caches_may_advance};
+
+    const PREV_MD5: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    /// The whole classification table, so a change to any rule is visible here
+    /// rather than only in whichever test happened to exercise it.
+    #[test]
+    fn beatmap_read_actions_cover_the_switch_matrix() {
+        // title, checksum, held checksum, live id, held id -> action
+        let cases: &[(bool, &str, &str, i32, i32, BeatmapReadAction)] = &[
+            // Nothing yet: osu! cleared the pointer, or the record is empty.
+            (false, "", "", 0, 0, BeatmapReadAction::Retry),
+            // Title landed, md5 has not. Publishes nothing, retries.
+            (true, "", PREV_MD5, 2964306, 1, BeatmapReadAction::Retry),
+            // A clean new map.
+            (
+                true,
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                PREV_MD5,
+                2964306,
+                1,
+                BeatmapReadAction::Load,
+            ),
+            // The same map, re-read: restore the file metadata from cache.
+            (true, PREV_MD5, PREV_MD5, 1, 1, BeatmapReadAction::Restore),
+            // A different map still carrying the previous map's md5. This is the
+            // case the old code got wrong: the checksum matched, so it took the
+            // restore branch and stamped the previous map's stats onto the new
+            // one. The id is what distinguishes it.
+            (
+                true,
+                PREV_MD5,
+                PREV_MD5,
+                2964306,
+                1,
+                BeatmapReadAction::Load,
+            ),
+            // First ever read: nothing held, so there is nothing to restore.
+            (true, PREV_MD5, "", 2964306, 0, BeatmapReadAction::Load),
+            // An unresolved id must not manufacture a difference.
+            (true, PREV_MD5, PREV_MD5, 0, 1, BeatmapReadAction::Restore),
+            (true, PREV_MD5, PREV_MD5, 1, 0, BeatmapReadAction::Restore),
+        ];
+
+        for (has_title, checksum, held, live_id, cached_id, expected) in cases {
+            let title = if *has_title { "New Map" } else { "" };
+            assert_eq!(
+                beatmap_read_action(title, checksum, held, *live_id, *cached_id),
+                *expected,
+                "title={has_title} checksum={checksum} held={held} live_id={live_id} cached_id={cached_id}"
+            );
+        }
+    }
+
+    /// The regression in one assertion: a new map whose md5 has not landed must
+    /// never reach the cache-restore path.
+    #[test]
+    fn a_new_map_whose_md5_has_not_landed_is_never_restored_from_cache() {
+        let held = PREV_MD5;
+        let unresolved = beatmap_read_action("New Map", "", held, 2964306, 1);
+        assert_eq!(unresolved, BeatmapReadAction::Retry);
+
+        let stale_md5 = beatmap_read_action("New Map", held, held, 2964306, 1);
+        assert_ne!(
+            stale_md5,
+            BeatmapReadAction::Restore,
+            "a different difficulty id with a matching md5 is a different map"
+        );
+    }
+
+    /// A read that could not be loaded must not advance the caches, or the map is
+    /// latched with no stars, no object counts and no max combo for its whole
+    /// duration. This is the second cause of the same report, and the one a
+    /// user is more likely to hit: an AV scanner, OneDrive or the osu! editor
+    /// holding the `.osu` at the instant of the switch is enough.
+    #[test]
+    fn a_map_whose_file_could_not_be_read_is_retried_rather_than_latched() {
+        let load = BeatmapReadAction::Load;
+
+        assert!(
+            caches_may_advance(load, true, true),
+            "a clean load advances"
+        );
+        assert!(
+            !caches_may_advance(load, false, true),
+            "a failed metadata read must not commit the checksum"
+        );
+        assert!(
+            !caches_may_advance(load, true, false),
+            "a failed file read must not commit the checksum"
+        );
+        assert!(!caches_may_advance(load, false, false));
+
+        // An unresolved read never advances, whatever the load result claims,
+        // which is what makes the retry unbounded.
+        for (meta, file) in [(true, true), (false, false), (true, false)] {
+            assert!(!caches_may_advance(BeatmapReadAction::Retry, meta, file));
+        }
+
+        // Restoring the map already held changes nothing, so it always advances.
+        assert!(caches_may_advance(BeatmapReadAction::Restore, false, false));
+    }
+
+    /// tosu breaks out of the lobby, match-setup and online-selection arms with
+    /// "do not spam reset on multiplayer and direct"
+    /// (`instances/osuInstance.ts:186-190`), so the last play stays frozen there
+    /// rather than being zeroed. GameState is numbered at
+    /// `common/enums/osu.ts:13-40`: lobby 11, matchSetup 12, onlineSelection 15.
+    #[test]
+    fn the_multiplayer_lobby_freezes_the_last_play_like_tosu() {
+        for (state, name) in [(11, "lobby"), (12, "matchSetup"), (15, "onlineSelection")] {
+            assert!(
+                !should_clear_play_state(true, state),
+                "tosu keeps the last play in {name} (state {state})"
+            );
+        }
+        // The states that do clear, unchanged.
+        for state in [3, 4, 5, 6, 8, 13, 14, 22] {
+            assert!(
+                should_clear_play_state(true, state),
+                "state {state} should clear"
+            );
+        }
     }
 }
