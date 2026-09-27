@@ -108,6 +108,50 @@ pub struct RankState {
     pub max_this_play: String,
 }
 
+/// One key-overlay button: whether it is down, and how many keys it has
+/// registered this play.
+///
+/// `KeyOverlayButton` in `api/types/v2.ts:426-429`. The two fields are read from
+/// osu! stable memory at element `+0x1C` and `+0x14`
+/// (`memory/stable.ts:644-728`).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyOverlayButton {
+    pub is_pressed: bool,
+    pub count: i32,
+}
+
+impl KeyOverlayButton {
+    /// The value every fallback in tosu's builders produces: `?? false` and
+    /// `?? 0` on a missing array element.
+    pub const UNPRESSED: Self = Self {
+        is_pressed: false,
+        count: 0,
+    };
+}
+
+/// The four key-overlay buttons.
+///
+/// **Always four keys, for every ruleset.** tosu's builders index the read array
+/// positionally with `.at(0..3)` and `?? false` / `?? 0` fallbacks
+/// (`buildResultV2Precise.ts:28-49`, `buildResult.ts:194-207`), so a
+/// three-element taiko or catch array still yields four keys with `m2` at the
+/// neutral value. Reproducing the short array instead would drop a key that
+/// consumers index by name.
+///
+/// The names are positional, not the game's: osu! catch's three bindings are
+/// `L`, `R`, `D` and taiko's are `K1`, `K2`, `M1` on the game side
+/// (`memory/stable.ts:679-724`), but every payload calls positions 0..3
+/// `k1`, `k2`, `m1`, `m2`. `m2` is osu!std-only in the read, not in the payload.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KeyOverlay {
+    pub k1: KeyOverlayButton,
+    pub k2: KeyOverlayButton,
+    pub m1: KeyOverlayButton,
+    pub m2: KeyOverlayButton,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PlayState {
@@ -124,6 +168,15 @@ pub struct PlayState {
     pub rank: RankState,
     pub pp: LivePpResult,
     pub unstable_rate: f64,
+    /// The key overlay, read from osu! stable memory during gameplay.
+    ///
+    /// `#[serde(skip)]` because tosu's **v2** payload has no such key: it appears
+    /// only in the precise payload (`api/utils/buildResultV2Precise.ts:68-85`),
+    /// in v1's `gameplay.keyOverlay` and in SC's stringified `keyOverlay`. All
+    /// three are reshapes of this packet, so one read here serves all three --
+    /// the same arrangement the SC-only beatmap fields use.
+    #[serde(skip)]
+    pub key_overlay: KeyOverlay,
 }
 
 impl Default for PlayState {
@@ -145,6 +198,7 @@ impl Default for PlayState {
             rank: RankState::default(),
             pp: LivePpResult::default(),
             unstable_rate: 0.0,
+            key_overlay: KeyOverlay::default(),
         }
     }
 }
@@ -507,6 +561,76 @@ pub struct TosuV2Packet {
     pub tourney: TourneyRootState,
 }
 
+/// One tournament client's entry in the precise payload's `tourney` array.
+///
+/// `PreciseTourney` in `api/types/v2.ts:415-419`, assembled at
+/// `buildResultV2Precise.ts:26-51`. The same three keys as the top level, less
+/// the tourney array itself: a client needs its own keys and its own hit errors,
+/// and there is nothing else about it that is precise.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PreciseTourneyClient {
+    pub ipc_id: usize,
+    pub keys: KeyOverlay,
+    pub hit_errors: Arc<[i16]>,
+}
+
+/// tosu's `/json/v2/precise` payload: exactly three keys.
+///
+/// `TosuPreciseAnswer` in `api/types/v2.ts:409-413`, assembled at
+/// `buildResultV2Precise.ts:57-88`. **Three keys, not the v2 packet** -- and
+/// that is the whole point of the endpoint. It used to answer with the full v2
+/// packet, which meant an overlay asking for a ~1 KB high-frequency feed got
+/// 24 KB including five graph series of thousands of doubles, on every tick:
+/// 221 bytes against 24,039 bytes measured live, 109x, with no `keys` key at all
+/// and no `hitErrors` key either.
+///
+/// The three keys are the fast-changing ones -- key state and the hit-error
+/// list -- and nothing that is already available more cheaply on `/json/v2`.
+/// `hit_errors` is the same `Arc` the rest of the packet carries, so a precise
+/// frame does not re-read or re-copy the list: it clones an `Arc`.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TosuPrecisePacket {
+    pub keys: KeyOverlay,
+    pub hit_errors: Arc<[i16]>,
+    pub tourney: Vec<PreciseTourneyClient>,
+}
+
+impl TosuPrecisePacket {
+    /// The precise view of a full packet.
+    ///
+    /// The top level is the **focused** client's state, which on rtosu is the
+    /// packet's own `play` block: `packet.play` is built from the active ruleset
+    /// rather than from any one tourney client, and tosu reads the same two
+    /// values off `instanceManager.focusedClient`'s gameplay
+    /// (`buildResultV2Precise.ts:61-66`).
+    ///
+    /// The array is every known tourney client, ordered by `ipcId`, because tosu
+    /// sorts the same way (`buildResultV2Precise.ts:22` -- `a.ipcId - b.ipcId`)
+    /// and an array whose order differs is a byte-diff. rtosu holds the clients in
+    /// a `BTreeMap<u32, _>` keyed by pid, so the sort has to be explicit here.
+    pub fn from_v2(packet: &TosuV2Packet) -> Self {
+        let mut tourney: Vec<PreciseTourneyClient> = packet
+            .tourney
+            .clients
+            .iter()
+            .map(|client| PreciseTourneyClient {
+                ipc_id: client.ipc_id,
+                keys: client.play.key_overlay,
+                hit_errors: Arc::clone(&client.play.hit_error_array),
+            })
+            .collect();
+        tourney.sort_by_key(|client| client.ipc_id);
+
+        Self {
+            keys: packet.play.key_overlay,
+            hit_errors: Arc::clone(&packet.play.hit_error_array),
+            tourney,
+        }
+    }
+}
+
 pub fn create_mods_state(mods_num: u32, mods_str: &str) -> ModsState {
     crate::instr_scope!(ModsState);
     static CACHE: std::sync::LazyLock<
@@ -621,6 +745,195 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&raw).expect("graph parses");
         assert_eq!(parsed["series"].as_array().map(Vec::len), Some(1));
         assert_eq!(parsed["xaxis"].as_array().map(Vec::len), Some(2));
+    }
+
+    /// The precise payload is **three keys**, and that is the endpoint's whole
+    /// purpose. It used to be the full v2 packet on both the route and the
+    /// socket, so a client asking for a cheap high-frequency feed got the strain
+    /// graph with it -- 221 bytes from tosu against 24,039 from rtosu on the same
+    /// map in the same state, with no `keys` and no `hitErrors` at all.
+    ///
+    /// The order is asserted off the serialised bytes rather than a parsed
+    /// `Value`, because `serde_json` sorts map keys and an order assertion written
+    /// that way passes for every order.
+    #[test]
+    fn the_precise_payload_is_three_keys_and_not_the_v2_packet() {
+        let mut packet = TosuV2Packet::default();
+        packet.play.key_overlay.k1 = KeyOverlayButton {
+            is_pressed: true,
+            count: 11,
+        };
+        packet.play.hit_error_array = Arc::from(vec![-3i16, 0, 7, 12, -20]);
+        // A graph big enough that carrying it would be obvious in the size.
+        packet.performance.graph = PrecomputedGraph::new(&PerformanceGraph {
+            series: (0..5)
+                .map(|index| GraphSeries {
+                    name: format!("series{index}"),
+                    data: (0..2_000).map(|point| point as f64 * 0.5).collect(),
+                })
+                .collect(),
+            xaxis: (0..2_000).map(|point| point as f64 * 400.0).collect(),
+        });
+
+        let precise = TosuPrecisePacket::from_v2(&packet);
+        let json = serde_json::to_string(&precise).expect("serialize the precise payload");
+
+        assert_eq!(
+            crate::testutil::json_key_order(&json),
+            ["keys", "hitErrors", "tourney"],
+            "tosu's three keys, in order (buildResultV2Precise.ts:68-87)"
+        );
+        // The keys the old payload did not have at all.
+        assert!(json.contains("\"keys\":{"), "keys is present: {json}");
+        assert!(json.contains("\"hitErrors\":["), "hitErrors is present");
+        assert!(
+            json.contains("\"isPressed\":true"),
+            "the read is carried through"
+        );
+        assert!(json.contains("\"count\":11"));
+        // And none of the heavy v2 leaves.
+        for absent in ["\"beatmap\"", "\"performance\"", "\"graph\"", "\"profile\""] {
+            assert!(
+                !json.contains(absent),
+                "the precise payload must not carry {absent}"
+            );
+        }
+    }
+
+    /// The size claim, as an invariant rather than a number in a comment. A
+    /// default packet's v2 body is dominated by the graph; the precise body must
+    /// not grow with it.
+    #[test]
+    fn the_precise_payload_does_not_carry_the_strain_graph() {
+        let mut packet = TosuV2Packet::default();
+        packet.performance.graph = PrecomputedGraph::new(&PerformanceGraph {
+            series: (0..5)
+                .map(|index| GraphSeries {
+                    name: format!("series{index}"),
+                    data: (0..4_778).map(|point| point as f64 * 0.1234).collect(),
+                })
+                .collect(),
+            xaxis: (0..4_778).map(|point| point as f64 * 400.0).collect(),
+        });
+
+        let full = serde_json::to_string(&packet).expect("serialize v2");
+        let precise = serde_json::to_string(&TosuPrecisePacket::from_v2(&packet))
+            .expect("serialize the precise payload");
+
+        assert!(
+            full.len() > 100_000,
+            "the fixture's v2 body should be graph-dominated, got {} bytes",
+            full.len()
+        );
+        assert!(
+            precise.len() < 5_000,
+            "the precise body must stay small, got {} bytes",
+            precise.len()
+        );
+    }
+
+    /// `tourney` is one entry per client, ordered by `ipcId`, and each entry
+    /// carries that client's own keys and hit errors -- not the focused client's.
+    /// tosu sorts the same way (`buildResultV2Precise.ts:22`) and an array in a
+    /// different order is a byte-diff, so the sort is asserted rather than assumed:
+    /// rtosu holds clients in a `BTreeMap` keyed by **pid**, so ipc order and map
+    /// order are not the same thing.
+    #[test]
+    fn the_precise_tourney_array_is_sorted_by_ipc_id_and_per_client() {
+        let mut packet = TosuV2Packet::default();
+        for (ipc_id, count) in [(7usize, 3usize), (2, 1), (5, 2)] {
+            let mut client = TourneyIpcClient {
+                ipc_id,
+                ..Default::default()
+            };
+            client.play.key_overlay.k2 = KeyOverlayButton {
+                is_pressed: true,
+                count: count as i32,
+            };
+            client.play.hit_error_array = Arc::from(vec![count as i16; count]);
+            packet.tourney.clients.push(client);
+        }
+        // The focused client's own values, which are not any client's.
+        packet.play.key_overlay.k1 = KeyOverlayButton {
+            is_pressed: true,
+            count: 99,
+        };
+
+        let precise = TosuPrecisePacket::from_v2(&packet);
+        let ids: Vec<usize> = precise.tourney.iter().map(|c| c.ipc_id).collect();
+        assert_eq!(
+            ids,
+            [2, 5, 7],
+            "ascending ipcId, whatever order they arrived in"
+        );
+        assert_eq!(
+            precise.keys.k1.count, 99,
+            "the top level is the focused client"
+        );
+
+        // Each entry carries its own client's data, not the top level's.
+        assert_eq!(precise.tourney[0].keys.k2.count, 1);
+        assert_eq!(precise.tourney[2].keys.k2.count, 3);
+        assert_eq!(precise.tourney[2].hit_errors.as_ref(), &[3i16, 3, 3]);
+        assert!(
+            precise.tourney.iter().all(|c| c.keys.k1.count == 0),
+            "a client entry is not the focused client's overlay"
+        );
+
+        // The entry key order is tosu's too.
+        let json = serde_json::to_string(&precise.tourney[0]).expect("serialize an entry");
+        assert_eq!(
+            crate::testutil::json_key_order(&json),
+            ["ipcId", "keys", "hitErrors"],
+            "tosu's per-client key order (buildResultV2Precise.ts:26-51)"
+        );
+    }
+
+    /// The key overlay is **always four buttons**, whatever the ruleset, because
+    /// tosu indexes the read array positionally with `.at(0..3)` and `?? false` /
+    /// `?? 0`. A taiko or catch read has three elements, and the builders still
+    /// emit `m2` at the neutral value. Dropping the key would be a shape change
+    /// for every consumer that reads it by name.
+    #[test]
+    fn the_key_overlay_has_four_buttons_whatever_the_ruleset() {
+        for (mode, elements) in [(0, 4), (1, 3), (2, 3), (3, 3)] {
+            let overlay = crate::v2::KeyOverlay::default();
+            let json = serde_json::to_string(&overlay).expect("serialize the overlay");
+            assert_eq!(
+                crate::testutil::json_key_order(&json),
+                ["k1", "k2", "m1", "m2"],
+                "mode {mode} reads {elements} elements and still emits four"
+            );
+            assert_eq!(overlay, crate::v2::KeyOverlay::default());
+        }
+
+        // A default overlay is the neutral value, which is what every unresolved
+        // read and every `?? false` / `?? 0` fallback produces.
+        let neutral = crate::v2::KeyOverlay::default();
+        assert_eq!(neutral.k1, KeyOverlayButton::UNPRESSED);
+        assert_eq!(neutral.m2, KeyOverlayButton::UNPRESSED);
+    }
+
+    /// `keyOverlay` is not a v2 key. It rides on the packet for the three
+    /// consumers that need it -- the precise payload, v1's
+    /// `gameplay.keyOverlay` and SC's stringified `keyOverlay` -- and must not
+    /// appear in the v2 body, which is why the field is `#[serde(skip)]`.
+    #[test]
+    fn the_key_overlay_stays_out_of_the_v2_body() {
+        let mut packet = TosuV2Packet::default();
+        packet.play.key_overlay.k1 = KeyOverlayButton {
+            is_pressed: true,
+            count: 42,
+        };
+        let json = serde_json::to_string(&packet).expect("serialize v2");
+        assert!(
+            !json.contains("keyOverlay") && !json.contains("\"keys\""),
+            "v2 gained a key overlay: {json}"
+        );
+        // And it survives a round trip as the default, like the other skipped
+        // beatmap fields.
+        let back: TosuV2Packet = serde_json::from_str(&json).expect("deserialize v2");
+        assert_eq!(back.play.key_overlay, crate::v2::KeyOverlay::default());
     }
 
     #[test]

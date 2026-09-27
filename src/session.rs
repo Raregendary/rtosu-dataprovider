@@ -111,6 +111,16 @@ pub struct TournamentSession {
 }
 
 impl TournamentSession {
+    /// How many osu! processes are currently attached.
+    ///
+    /// The tournament session's answer to the same question the solo session
+    /// answers with its `attached` flag: the not-running contract is a property
+    /// of the process handles, so with no clients there is nothing for the
+    /// `/json*` routes to serve and tosu's `500` is the right answer.
+    pub fn client_count(&self) -> usize {
+        self.clients.len()
+    }
+
     pub fn new(
         profile_name: &str,
         pointer_width: Option<usize>,
@@ -337,7 +347,13 @@ impl TournamentSession {
                     self.current_checksum = beatmap_ref.checksum.clone();
                     self.cached_stats_by_mods.clear();
                     if let Some(beatmap_mut) = beatmap.as_mut() {
-                        crate::beatmap::populate_beatmap_file_metadata(beatmap_mut, &osu_path);
+                        // Same contract as the solo path: the game's current
+                        // ruleset is what `mode.number` holds until the file's
+                        // own ruleset replaces it.
+                        let current_ruleset = beatmap_mut.mode.number;
+                        if crate::beatmap::populate_beatmap_file_metadata(beatmap_mut, &osu_path) {
+                            crate::beatmap::apply_beatmap_ruleset(beatmap_mut, current_ruleset);
+                        }
                         self.cached_metadata = Some(beatmap_mut.clone());
                     }
                     #[cfg(feature = "pp")]
@@ -1080,8 +1096,26 @@ fn performance_graph(
                 data: pad_series(aim_no_sliders),
             },
             crate::v2::GraphSeries {
+                // **The reading series is present and empty, and that is deliberate.**
+                //
+                // `rosu-pp-gemini` has no `reading` strain at all -- its `OsuStrains`
+                // carries only `aim`, `aim_no_sliders`, `speed` and `flashlight`, and the
+                // desructure that would bind it discards the field -- so there is nothing
+                // to compute this from. tosu reads it from a native lazer calculator
+                // rtosu has no equivalent of, so exact parity here is structurally
+                // unreachable rather than merely unimplemented (audit-1.0.5.md `G-03`).
+                //
+                // Zero-filling it was the previous behaviour and it is worse than empty:
+                // a flat line at 0.0 is a claim about the map's difficulty that is
+                // indistinguishable from a real reading value to anything that plots it,
+                // and it is the same shape as a map that genuinely has no reading skill.
+                // An empty array keeps the key and its position in the series list, so
+                // the payload shape still matches tosu, and reports nothing it cannot
+                // back up. Do not "fix" this by filling it with the aim series: reading
+                // is a distinct skill, and a clone is a wrong value rather than an
+                // absent one.
                 name: "reading".to_string(),
-                data: pad_series(vec![0.0; strain_count]),
+                data: Vec::new(),
             },
             crate::v2::GraphSeries {
                 name: "flashlight".to_string(),
@@ -1148,62 +1182,28 @@ fn guest_profile_state() -> crate::v2::ProfileState {
 }
 
 fn ruleset_name(value: i32) -> &'static str {
-    match value {
-        0 => "osu",
-        1 => "taiko",
-        2 => "fruits",
-        3 => "mania",
-        _ => "",
-    }
+    crate::reader::ruleset_name(value)
 }
 
 fn profile_state_from_local(profile: &LocalProfile) -> crate::v2::ProfileState {
     crate::v2::ProfileState {
         user_status: crate::v2::OsuStatusState {
             number: profile.raw_login_status,
-            name: match profile.raw_login_status {
-                0 => "reconnecting",
-                256 => "guest",
-                257 => "recieving_data",
-                65537 => "disconnected",
-                65793 => "connected",
-                _ => "",
-            }
-            .to_string(),
+            // The three name tables are the ones in `reader`, transcribed from
+            // `common/enums/osu.ts`. They used to be inlined here as byte-equal
+            // duplicates, which is not a defect today and is exactly the shape
+            // that lets a table be corrected in one place and not the other.
+            name: crate::reader::login_status_name(profile.raw_login_status).to_string(),
         },
         bancho_status: crate::v2::OsuStatusState {
             number: profile.raw_bancho_status,
-            name: match profile.raw_bancho_status {
-                0 => "idle",
-                1 => "afk",
-                2 => "playing",
-                3 => "editing",
-                4 => "modding",
-                5 => "multiplayer",
-                6 => "watching",
-                7 => "unknown",
-                8 => "testing",
-                9 => "submitting",
-                10 => "paused",
-                11 => "lobby",
-                12 => "multiplaying",
-                13 => "osuDirect",
-                _ => "",
-            }
-            .to_string(),
+            name: crate::reader::bancho_status_name(profile.raw_bancho_status).to_string(),
         },
         id: profile.id,
         name: profile.name.clone(),
         mode: crate::v2::OsuStatusState {
             number: profile.play_mode,
-            name: match profile.play_mode {
-                0 => "osu",
-                1 => "taiko",
-                2 => "fruits",
-                3 => "mania",
-                _ => "",
-            }
-            .to_string(),
+            name: crate::reader::ruleset_name(profile.play_mode).to_string(),
         },
         ranked_score: profile.ranked_score,
         level: profile.level as f64,
@@ -1221,14 +1221,11 @@ fn profile_state_from_local(profile: &LocalProfile) -> crate::v2::ProfileState {
 }
 
 fn country_code_name(value: i32) -> &'static str {
-    const CODES: &str = "oc eu ad ae af ag ai al am an ao aq ar as at au aw az ba bb bd be bf bg bh bi bj bm bn bo br bs bt bv bw by bz ca cc cd cf cg ch ci ck cl cm cn co cr cu cv cw cx cy cz de dj dk dm do dz ec ee eg eh er es et fi fj fk fm fo fr fx ga gb gd ge gf gh gi gl gm gn gq gr gs gt gu gw gy hk hm hn hr ht hu id ie il in io iq ir is it jm jo jp ke kg kh ki km kn kp kr kw ky kz la lb lc li lk lr ls lt lu lv ly ma mc md mg mh mk ml mm mn mo mq mr ms mt mu mv mw mx my mz na nc ne nf ng ni nl no np nr nu nz om pa pe pf pg ph pk pl pm pn pr ps pt pw py qa re ro ru rw sa sb sc sd se sg sh si sj sk sl sm sn so sr st sv sy sz tc td tf tg th tj tk tm tn to tl tr tt tv tw tz ua ug um us uy uz va vc ve vg vi vn vu wf ws ye yt rs za zm me zw xx a2 o1 ax gg im je bl mf";
-    if value < 1 {
-        return "";
-    }
-    CODES
-        .split_whitespace()
-        .nth((value - 1) as usize)
-        .unwrap_or("")
+    // The table lives in `reader` and is transcribed from tosu's `country.ts`.
+    // This used to be a second, byte-identical copy of the same drifted string
+    // literal, which is how a one-entry fix could have been applied to one copy
+    // and not the other. One table, one function; see `reader::COUNTRY_CODES`.
+    crate::reader::country_name(value)
 }
 
 pub struct SoloSession {
@@ -1293,6 +1290,23 @@ pub struct SoloSession {
     /// screen has actually been read, so the exit clear runs once and never
     /// fires for a client that was never in a map.
     play_state_dirty: bool,
+    /// Whether an osu! process is currently attached.
+    ///
+    /// This is the replacement for the invented `client: "none"` /
+    /// `state.name: "notRunning"` pair, which had two problems: neither string
+    /// is a value tosu can produce (`client` is `ClientType[game.client]`, so
+    /// `"none"` only occurs for an older enum, and `state.name` is always
+    /// `GameStates[number]`, which has no `notRunning` member), and encoding
+    /// "no game" inside the payload forced every consumer to special-case a
+    /// sentinel instead of a transport-level failure.
+    ///
+    /// tosu's actual behaviour is the transport: with no instance, every `/json*`
+    /// route throws and answers `500 {"error":"osu is not ready/running"}`
+    /// (`packages/server/utils/http.ts:186-207`), and every socket's loop skips
+    /// its send entirely (`utils/socket.ts`, `if (!osuInstance || clients.size
+    /// === 0) { sleep; continue; }`). The flag travels out of the reader on
+    /// `PublishedPacket::attached` so the server can reproduce that.
+    attached: bool,
 }
 
 impl SoloSession {
@@ -1365,14 +1379,29 @@ impl SoloSession {
             cached_hit_errors: Arc::default(),
             cached_unstable_rate: 0.0,
             play_state_dirty: false,
+            attached: false,
         })
     }
 
     /// Report that there is nothing to read, so a poll without a live process
     /// does not keep serving the last known state.
+    ///
+    /// The play-derived fields are dropped for the same reason -- a poll that
+    /// cannot read must not leave a finished attempt's score and hit counts
+    /// looking current -- and the `attached` flag goes false, which is what
+    /// actually makes the `/json*` routes answer `500` the way tosu's do.
+    ///
+    /// What this deliberately does **not** do is write a marker into the
+    /// payload. See [`SoloSession::attached`].
     fn mark_not_running(&mut self) {
-        self.cached_packet.client = "none".to_string();
-        self.cached_packet.state.name = "notRunning".to_string();
+        self.attached = false;
+        clear_play_state_for_new_map(&mut self.cached_packet);
+    }
+
+    /// Whether an osu! process is currently attached. Drives the not-running
+    /// contract on every `/json*` route and the sockets' silence.
+    pub fn is_attached(&self) -> bool {
+        self.attached
     }
 
     pub fn poll(&mut self) -> Result<crate::v2::TosuV2Packet> {
@@ -1453,12 +1482,15 @@ impl SoloSession {
 
         // Every path above either returns or leaves `memory` populated, so this
         // cannot be `None`. It is a let-else rather than an `unwrap` anyway: the
-        // release profile aborts on panic, and a silent `notRunning` packet is a
-        // far better failure than the process vanishing mid-match.
+        // release profile aborts on panic, and reporting "not attached" is a far
+        // better failure than the process vanishing mid-match.
         let Some(memory) = self.memory.as_ref() else {
             self.mark_not_running();
             return Ok(self.cached_packet.clone());
         };
+        // Past this point every return path has a live handle, so this is the one
+        // place that has to clear the flag `mark_not_running` sets.
+        self.attached = true;
         let can_scan = self.last_scan_attempt.elapsed() >= std::time::Duration::from_millis(1000);
         let mut attempted_scan = false;
 
@@ -1764,10 +1796,21 @@ impl SoloSession {
                                     let osu_path = std::path::Path::new(&self.songs_folder)
                                         .join(&bm.folder)
                                         .join(&bm.filename);
+                                    // The game's current ruleset, which
+                                    // `read_beatmap_from_ptr` has just put in
+                                    // `mode.number`. Captured before the file
+                                    // pass overwrites it with the map's own.
+                                    let current_ruleset = bm.mode.number;
                                     let metadata_ok =
                                         crate::beatmap::populate_beatmap_file_metadata(
                                             &mut bm, &osu_path,
                                         );
+                                    if metadata_ok {
+                                        crate::beatmap::apply_beatmap_ruleset(
+                                            &mut bm,
+                                            current_ruleset,
+                                        );
+                                    }
                                     self.cached_beatmap_metadata = bm.clone();
 
                                     #[cfg(feature = "pp")]
@@ -2014,6 +2057,15 @@ impl SoloSession {
                     self.cached_packet.play.unstable_rate = g.unstable_rate;
                     self.cached_packet.play.rank.current = g.grade;
                     self.cached_packet.play.rank.max_this_play = g.grade_max;
+                    // osu! only populates the key overlay during a play, and this
+                    // is the play-state read, so this is the one place the value
+                    // is live. tosu reads it under the same gate
+                    // (`osuInstance.ts:225-238`: `updateKeyOverlay()` in
+                    // `GameState.play` only, `resetKeyOverlay()` in every other
+                    // state), and the two other consumers of the read -- the
+                    // precise payload and v1's `gameplay.keyOverlay` -- are
+                    // reshapes of this packet rather than separate reads.
+                    self.cached_packet.play.key_overlay = g.key_overlay;
                     if self.cached_packet.play.mods.number != g.mods {
                         self.cached_packet.play.mods =
                             crate::v2::create_mods_state(g.mods, &g.mods_str);
@@ -2102,6 +2154,14 @@ impl SoloSession {
                     self.cached_packet.play.unstable_rate = g.unstable_rate;
                     self.cached_packet.play.rank.current = g.grade;
                     self.cached_packet.play.rank.max_this_play = g.grade_max;
+                    // The results screen is **not** `GameState.play`, and tosu's
+                    // precise loop calls `gameplay.resetKeyOverlay()` in every
+                    // state but that one (`osuInstance.ts:234-237`). So the
+                    // buttons go back to neutral here even though the rest of the
+                    // play block is deliberately left frozen -- a results screen
+                    // showing the last play's score with the last play's keys
+                    // still held would be reporting a state that does not exist.
+                    self.cached_packet.play.key_overlay = Default::default();
                     if self.cached_packet.play.mods.number != g.mods {
                         self.cached_packet.play.mods =
                             crate::v2::create_mods_state(g.mods, &g.mods_str);
@@ -2387,6 +2447,12 @@ fn clear_play_state_for_new_map(packet: &mut crate::v2::TosuV2Packet) {
     play.rank = Default::default();
     play.unstable_rate = 0.0;
     play.pp = Default::default();
+    // tosu's `gameplay.resetKeyOverlay()`, which its precise loop calls in every
+    // state except `play` (`osuInstance.ts:234-237`). Resetting the buttons
+    // without resetting the rest of the play block is deliberate: the frozen
+    // last play is tosu's behaviour for the *lobby/match-setup/online-selection*
+    // states, whereas the key overlay is reset in **all** of them.
+    play.key_overlay = Default::default();
 
     let results = &mut packet.results_screen;
     results.player_name.clear();
@@ -2402,6 +2468,8 @@ fn clear_play_state_for_new_map(packet: &mut crate::v2::TosuV2Packet) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "pp")]
+    use super::performance_graph;
     use super::{clear_play_state_for_new_map, should_clear_play_state};
     use crate::v2::TosuV2Packet;
 
@@ -2726,5 +2794,70 @@ mod tests {
                 "state {state} should clear"
             );
         }
+    }
+
+    /// The `reading` graph series is **present and empty**, and that is the
+    /// decision rather than an accident of the calculator.
+    ///
+    /// `rosu-pp-gemini` exposes no `reading` strain at all, so there is nothing
+    /// to compute the series from; the question this pins is only what the key
+    /// should carry. tosu builds five series for osu!std
+    /// (`states/beatmap.ts:727-734`: `aim, aimNoSliders, reading, flashlight,
+    /// speed`), so dropping the key would make rtosu's list four long and change
+    /// the shape for every consumer that indexes by name or position.
+    ///
+    /// Three earlier behaviours are all rejected here, and the assertions are
+    /// written so each one fails rather than merely differing:
+    ///
+    /// * **zeros** (what rtosu did until this pass) -- passes a "not the aim
+    ///   series" check, so it needs its own: a flat 0.0 line is a claim about the
+    ///   map that is indistinguishable from a real reading value.
+    /// * **a clone of the aim series** (1.0.4's defect) -- caught by the
+    ///   length and content comparison against `aim`.
+    /// * **omission** -- caught by the name list, which is the whole point of
+    ///   keeping the key.
+    #[test]
+    #[cfg(feature = "pp")]
+    fn the_reading_series_is_present_and_empty_rather_than_faked() {
+        use rosu_pp::Beatmap;
+
+        let mut content = String::from(
+            "osu file format v14\n\n[General]\nMode: 0\n\n[Metadata]\nTitle:Test\nArtist:Test\nCreator:Test\nVersion:Normal\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\nSliderMultiplier:1.4\nSliderTickRate:1\n\n[TimingPoints]\n0,500,4,2,0,50,1,0\n\n[HitObjects]\n",
+        );
+        for i in 0..200 {
+            content.push_str(&format!("256,192,{},1,0,0:0:0:0:\n", 1000 + i * 100));
+        }
+        let map = Beatmap::from_bytes(content.as_bytes()).expect("parse map");
+
+        let graph = performance_graph(&map, 0, 0, 0, 30_000);
+        let graph: crate::v2::PerformanceGraph =
+            serde_json::from_str(graph.raw.get()).expect("graph decodes");
+
+        let names: Vec<&str> = graph.series.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["aim", "aimNoSliders", "reading", "flashlight", "speed"],
+            "the five osu!std series and their order are tosu's (beatmap.ts:727-734)"
+        );
+
+        let reading = &graph
+            .series
+            .iter()
+            .find(|s| s.name == "reading")
+            .expect("the reading key is present")
+            .data;
+        assert!(
+            reading.is_empty(),
+            "reading carries no samples it cannot compute, got {reading:?}"
+        );
+
+        // The aim series on the same graph is real, so "empty" is a decision
+        // about reading and not a graph that failed to build at all.
+        let aim = &graph.series[0].data;
+        assert!(!aim.is_empty(), "aim is populated on the same graph");
+
+        // And it is not the aim series wearing the wrong name, which is the
+        // defect 1.0.4 found here.
+        assert_ne!(reading, aim, "reading must never be an aim clone");
     }
 }

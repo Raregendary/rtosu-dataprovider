@@ -63,6 +63,11 @@ pub struct GameplayState {
     pub grade: String,
     pub grade_max: String,
     pub unstable_rate: f64,
+    /// The four key-overlay buttons, read from osu! stable memory. Consumed by
+    /// the precise payload, v1's `gameplay.keyOverlay` and SC's `keyOverlay`
+    /// string -- three consumers of one read, so the walk happens here rather
+    /// than three times.
+    pub key_overlay: crate::v2::KeyOverlay,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1329,7 +1334,138 @@ pub fn read_gameplay_state_cached(
         grade,
         grade_max,
         unstable_rate,
+        key_overlay: read_key_overlay(memory, ruleset_address, mode),
     })
+}
+
+/// The osu! stable key overlay: which of the four key bindings are down, and how
+/// many keys each has registered this play.
+///
+/// A port of `keyOverlay(mode)` in
+/// `tosu-sourcecode/packages/tosu/src/memory/stable.ts:644-728`, against the
+/// already-resolved `ruleset_address` -- the same base tosu reaches by its own
+/// `[[patternAddr - 0xB] + 0x4]` walk, which is [`read_active_ruleset`]. No new
+/// pattern scan is involved.
+///
+/// The walk, and every early exit, is tosu's:
+///
+/// ```text
+/// keyOverlayPtr  = u32  (rulesetAddress + 0xAC)
+/// arrayAddress   = i32 (i32 (keyOverlayPtr + 0x10) + 0x4)
+/// itemsSize      = i32  (arrayAddress + 0x4)
+/// element[i]     = i32  (arrayAddress + 0x8 + 4 * i)
+/// isPressed      = u8   (element[i] + 0x1C)
+/// count          = i32  (element[i] + 0x14)
+/// ```
+///
+/// Three gates matter and all of them are reproduced rather than smoothed over:
+///
+/// * **`itemsSize < 4` returns an empty array.** Then every button falls back to
+///   the neutral value in the payload builders, because they index `.at(0..3)`
+///   with `?? false` / `?? 0`. That is why this returns a full four-button
+///   struct rather than a `Vec`: the builders never see a short list.
+/// * **A null `keyOverlayPtr` is mode-dependent.** tosu returns an empty string
+///   (no key state) for mania and taiko, and an *error* for the others. Both
+///   paths end up as "no key data" on the wire, so one neutral result covers
+///   them, and the mode check is kept in a comment rather than in a branch that
+///   cannot change the answer.
+/// * **Only osu!std reads a fourth element.** Catch's three bindings are read as
+///   `L`, `R`, `D` and taiko's as `K1`, `K2`, `M1`; `m2` exists only for
+///   `mode == 0`. The *names* never reach the payload -- the builders address the
+///   array positionally as `k1`, `k2`, `m1`, `m2` -- so the name difference is a
+///   comment and the positional difference is the `mode == 0` element count.
+///
+/// Every failure path here returns the neutral overlay rather than propagating.
+/// This runs inside the per-tick gameplay read, and tosu's own version answers
+/// with an `Error` object that its callers then treat as an empty overlay -- so
+/// propagating would make rtosu stricter than the implementation it is matching,
+/// at the cost of dropping the whole gameplay block over a key that is not a
+/// gameplay value.
+pub fn read_key_overlay(
+    memory: &ProcessMemory,
+    ruleset_address: u64,
+    mode: i32,
+) -> crate::v2::KeyOverlay {
+    let neutral = crate::v2::KeyOverlay::default();
+    if ruleset_address == 0 {
+        return neutral;
+    }
+
+    // `saturating_add` rather than the `checked_add(...)?` the other readers use:
+    // this function answers with a neutral overlay rather than an `Err`, because
+    // it runs inside the per-tick gameplay read and a key that is not a gameplay
+    // value must not be able to fail the whole block. Saturation can only produce
+    // `u64::MAX`, which is not a readable address, so the read below fails and the
+    // button stays neutral -- the same answer, by a longer route.
+    let at = |base: u64, offset: u64| base.saturating_add(offset);
+    // tosu's reads are all `readInt`/`readUInt`, so every address in this walk is
+    // a 32-bit value widened to 64. A null or saturated pointer is how a .NET
+    // field that was never assigned shows up, and each one is a distinct early
+    // exit in tosu, so they are rejected here rather than read from.
+    fn pointer(value: u32) -> Option<u64> {
+        (value != 0 && value != u32::MAX).then_some(value as u64)
+    }
+
+    let Some(key_overlay_ptr) = memory
+        .read_u32(at(ruleset_address, 0xAC))
+        .ok()
+        .and_then(pointer)
+    else {
+        // tosu: a null pointer is "no key state" for taiko and mania, and an
+        // error for everything else. Both reach the payload as the neutral
+        // overlay.
+        return neutral;
+    };
+
+    let Some(list) = memory
+        .read_u32(at(key_overlay_ptr, 0x10))
+        .ok()
+        .and_then(pointer)
+    else {
+        return neutral;
+    };
+    let Some(array) = memory.read_u32(at(list, 0x4)).ok().and_then(pointer) else {
+        return neutral;
+    };
+
+    // `itemsSize` is the array's length. tosu gates on `< 4` and returns an empty
+    // list, which the builders turn into four neutral buttons.
+    let Ok(items_size) = memory.read_i32(at(array, 0x4)) else {
+        return neutral;
+    };
+    if items_size < 4 {
+        return neutral;
+    }
+
+    // osu!std has a fourth binding; catch and taiko have three. tosu only pushes
+    // the fourth element for `mode === 0`, and the builders still emit `m2`
+    // (defaulted) for the three-element modes.
+    let elements = if mode == 0 { 4 } else { 3 };
+
+    let mut buttons = [crate::v2::KeyOverlayButton::default(); 4];
+    for (index, button) in buttons.iter_mut().enumerate().take(elements) {
+        let Some(element) = memory
+            .read_u32(at(array, 0x8 + 4 * index as u64))
+            .ok()
+            .and_then(pointer)
+        else {
+            continue;
+        };
+        // `Boolean(byte)`, so any non-zero byte is pressed.
+        if let Ok(pressed) = memory.read_u8(at(element, 0x1C)) {
+            button.is_pressed = pressed != 0;
+        }
+        if let Ok(count) = memory.read_i32(at(element, 0x14)) {
+            button.count = count;
+        }
+    }
+
+    crate::v2::KeyOverlay {
+        k1: buttons[0],
+        k2: buttons[1],
+        m1: buttons[2],
+        m2: buttons[3],
+    }
 }
 
 pub fn find_pattern(

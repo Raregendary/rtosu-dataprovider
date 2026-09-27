@@ -33,10 +33,14 @@ these endpoints onto whichever origin the page was loaded from.
 | Overlay does this | Rewritten to |
 | --- | --- |
 | `ws://127.0.0.1:24050/websocket/v2` | `ws://<page-host>/websocket/v2` |
-| `ws://127.0.0.1:24050/ws` | `ws://<page-host>/websocket/v2` |
+| `ws://127.0.0.1:24050/ws` | `ws://<page-host>/ws` |
 | `ws://<host>:<port>` | `ws://<page-host>/websocket/v2` |
 | `http://127.0.0.1:24050/backgroundImage?mapset=1` | `/files/beatmap/background` |
 | `http://127.0.0.1:24050/Songs/...` | `/files/beatmap/...` |
+
+Every row keeps the **path** and only re-homes the host and scheme. `/ws` used to
+be rewritten onto `/websocket/v2`, which handed every v1 (gosumemory) overlay the v2
+payload; rtosu now serves the real v1 payload on `/ws`, so it is an identity mapping.
 
 `WebSocket`, `fetch`, and `XMLHttpRequest` are all covered, so bundled
 `ReconnectingWebSocket` copies work too.
@@ -52,9 +56,16 @@ way, point them at the shim's origin instead:
 background-image: url("/files/beatmap/background?mapset=1");
 ```
 
-Overlays that read tosu's **v1** payload shape (for example `tourney.ipcClients`
-or `client.gameplay`) will connect but see v2 field names. Only the URL is
-rewritten, not the JSON body.
+**JSON routes are not rewritten either**, which is now the right answer: `/json`
+serves the gosumemory-compatible **v1** payload and `/json/v2` the v2 payload,
+on the same paths tosu serves them (`router/index.ts:43`,
+`router/v2.ts:4-7`). A v1 overlay that fetches `/json` gets v1, and a v2 overlay
+that fetches `/json/v2` gets v2, with no shim involvement.
+
+Overlays that read tosu's **v1** payload shape (`client.gameplay`, `resultsScreen`,
+`menu`) work over `/ws` and `/json`. Only the URL is rewritten, never the JSON
+body — an overlay that expects v1 field names at `/json/v2` will still be reading
+v2.
 
 ## Which values are populated when
 
@@ -136,8 +147,13 @@ If you would rather address the provider directly, the shim exposes it:
 window.__rtosu.socket();                 // ws://<host>/websocket/v2
 window.__rtosu.preciseSocketUrl;         // '/websocket/v2/precise'
 window.__rtosu.jsonUrl;                  // '/json/v2'
+window.__rtosu.v1SocketUrl;              // '/ws'
+window.__rtosu.v1JsonUrl;                // '/json'
 window.__rtosu.backgroundUrl;            // '/files/beatmap/background'
 ```
+
+`jsonUrl` and `socket` address the v2 payload; `v1JsonUrl` and `v1SocketUrl` address
+the gosumemory-compatible v1 payload, on the same paths tosu uses for them.
 
 ## `metadata.txt`
 

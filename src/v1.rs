@@ -1,10 +1,12 @@
-//! The gosumemory-compatible payload, served at `/json/v1` and on the `/ws` socket.
+//! The gosumemory-compatible payload, served at `/json`, `/json/v1` and on the
+//! `/ws` socket.
 //!
 //! tosu exposes this as `GosuCompatibleApi` on `/json` and on `/ws`
 //! (`tosu-sourcecode/packages/server/router/index.ts:43`,
-//! `router/socket.ts:47`). rtosu already had `/json` on its v2 route, so v1 lives
-//! at `/json/v1` instead and `/json` is left alone; the two differ in shape and a
-//! consumer cannot read the other.
+//! `router/socket.ts:47`), and rtosu serves it on the same two paths. `/json/v1`
+//! is an extra alias for the same payload, added because rtosu used to serve v2
+//! on `/json`; v2's own path is `/json/v2` and the two shapes are not
+//! interchangeable.
 //!
 //! Every type here is a pure reshape of the v2 packet, so there is one reader, one
 //! cache and one source of truth. The shapes are dictated by
@@ -297,10 +299,36 @@ pub struct V1KeyButton {
 }
 
 impl V1KeyButton {
-    const UNPRESSED: Self = Self {
+    /// The value every fallback in tosu's builder produces: `?? false` and `?? 0`
+    /// on a missing array element. Public because it is the expected reading for
+    /// any button the read could not resolve, which makes it a meaningful value to
+    /// compare against rather than an internal detail.
+    pub const UNPRESSED: Self = Self {
         is_pressed: false,
         count: 0,
     };
+}
+
+impl V1KeyOverlay {
+    /// A straight field-for-field copy of the one key-overlay read.
+    ///
+    /// The two shapes are identical, so this is a rename rather than a
+    /// conversion -- but they are separate types on purpose: v1 is a wire
+    /// contract transcribed from `buildResult.ts` and the v2-side type is
+    /// carried on the packet, and letting one borrow the other would tie the v1
+    /// wire shape to a field on the v2 packet.
+    fn from(overlay: &crate::v2::KeyOverlay) -> Self {
+        let button = |b: &crate::v2::KeyOverlayButton| V1KeyButton {
+            is_pressed: b.is_pressed,
+            count: b.count,
+        };
+        Self {
+            k1: button(&overlay.k1),
+            k2: button(&overlay.k2),
+            m1: button(&overlay.m1),
+            m2: button(&overlay.m2),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -734,18 +762,13 @@ impl GosuCompatibleApi {
                     // session best.
                     max_this_play: play.pp.max_achieved,
                 },
-                // tosu's v1 keyOverlay indexes a four-element array with
-                // `?? false` / `?? 0` fallbacks, so it always emits four buttons
-                // even for taiko's three. rtosu has no key-state read yet
-                // (audit-1.0.5.md B-02), so all four are the neutral value: a
-                // consumer cannot tell "not pressed" from "not read", which is
-                // recorded rather than hidden.
-                key_overlay: V1KeyOverlay {
-                    k1: V1KeyButton::UNPRESSED,
-                    k2: V1KeyButton::UNPRESSED,
-                    m1: V1KeyButton::UNPRESSED,
-                    m2: V1KeyButton::UNPRESSED,
-                },
+                // tosu's v1 keyOverlay indexes the read array with `.at(0..3)`
+                // and `?? false` / `?? 0` fallbacks, so it always emits four
+                // buttons even for taiko's three (`buildResult.ts:194-207`).
+                // The values come from the one read in `client::read_key_overlay`;
+                // `V1KeyOverlay::from` reproduces the four-key shape, and
+                // `audit-1.0.5.md` `B-02` is now closed rather than deferred.
+                key_overlay: V1KeyOverlay::from(&play.key_overlay),
                 leaderboard: V1Leaderboard {
                     has_leaderboard: false,
                     is_visible: false,
@@ -934,51 +957,10 @@ mod tests {
     ];
 
     /// Read the key order out of a serialised JSON object without a parser that
-    /// would reorder it.
+    /// would reorder it. Shared with `server`'s route tests, which assert the
+    /// same property across payloads.
     fn key_order(json: &str) -> Vec<String> {
-        let bytes = json.as_bytes();
-        let mut keys = Vec::new();
-        let mut i = 1; // skip '{'
-        while i < bytes.len() {
-            if bytes[i] == b'"' {
-                let start = i;
-                i += 1;
-                while i < bytes.len() && bytes[i] != b'"' {
-                    i += 1;
-                }
-                let raw = &json[start + 1..i];
-                i += 1; // closing quote
-                if i < bytes.len() && bytes[i] == b':' {
-                    // The token between this colon and the next top-level comma is
-                    // the value; skip it, tracking nesting.
-                    let mut depth = 0i32;
-                    while i < bytes.len() {
-                        match bytes[i] {
-                            b'{' | b'[' => depth += 1,
-                            b'}' | b']' => {
-                                if depth == 0 {
-                                    break;
-                                }
-                                depth -= 1;
-                            }
-                            b',' if depth == 0 => break,
-                            b'"' => {
-                                i += 1;
-                                while i < bytes.len() && bytes[i] != b'"' {
-                                    i += 1;
-                                }
-                            }
-                            _ => {}
-                        }
-                        i += 1;
-                    }
-                    keys.push(raw.to_string());
-                }
-            } else {
-                i += 1;
-            }
-        }
-        keys
+        crate::testutil::json_key_order(json)
     }
 
     #[test]
@@ -1046,14 +1028,59 @@ mod tests {
     fn replay_ui_hidden_is_the_constant_tosu_serves() {
         let v1 = GosuCompatibleApi::from_v2(&TosuV2Packet::default());
         assert!(!v1.gameplay.is_replay_ui_hidden);
-        assert_eq!(v1.gameplay.key_overlay.k1, V1KeyButton::UNPRESSED);
-        // tosu always emits four buttons, even for taiko's three, because the
-        // builder indexes `.at(0..3)` with `?? false` / `?? 0` fallbacks.
-        let json = serde_json::to_string(&v1.gameplay.key_overlay).unwrap();
+    }
+
+    /// The key overlay is **four buttons, always**, and the values come from the
+    /// one read on the packet.
+    ///
+    /// tosu indexes the read array positionally with `.at(0..3)` and `?? false` /
+    /// `?? 0` fallbacks (`buildResult.ts:194-207`), so a three-element taiko or
+    /// catch read still emits four keys. Emitting three would be a shape change
+    /// for every consumer that reads the fourth by name.
+    ///
+    /// The values used to be the neutral default on every button, because rtosu
+    /// had no key-state read; that was a recorded gap, not a passing value. The
+    /// read exists now (`client::read_key_overlay`), so the count is carried
+    /// through rather than dropped on the floor.
+    #[test]
+    fn the_key_overlay_carries_four_buttons_and_the_reads_values() {
+        let json_of = |packet: &TosuV2Packet| {
+            let v1 = GosuCompatibleApi::from_v2(packet);
+            serde_json::to_string(&v1.gameplay.key_overlay).unwrap()
+        };
+
+        // A default packet: the neutral overlay, four keys.
+        let empty = json_of(&TosuV2Packet::default());
+        assert_eq!(key_order(&empty), vec!["k1", "k2", "m1", "m2"]);
+        assert!(empty.contains("\"isPressed\":false"));
+        assert!(empty.contains("\"count\":0"));
+
+        // A packet carrying a read: the values survive the reshape.
+        let mut packet = TosuV2Packet::default();
+        packet.play.key_overlay = crate::v2::KeyOverlay {
+            k1: crate::v2::KeyOverlayButton {
+                is_pressed: true,
+                count: 11,
+            },
+            k2: crate::v2::KeyOverlayButton {
+                is_pressed: false,
+                count: 9,
+            },
+            m1: crate::v2::KeyOverlayButton::default(),
+            // taiko has three bindings; `m2` is still emitted, defaulted.
+            m2: crate::v2::KeyOverlayButton::default(),
+        };
+        let v1 = GosuCompatibleApi::from_v2(&packet);
+        assert_eq!(v1.gameplay.key_overlay.k1.count, 11);
+        assert!(v1.gameplay.key_overlay.k1.is_pressed);
+        assert_eq!(v1.gameplay.key_overlay.k2.count, 9);
+        assert!(!v1.gameplay.key_overlay.k2.is_pressed);
+        assert_eq!(v1.gameplay.key_overlay.m2, V1KeyButton::UNPRESSED);
         assert_eq!(
-            key_order(&json),
+            key_order(&json_of(&packet)),
             vec!["k1", "k2", "m1", "m2"],
-            "four buttons, always"
+            "still four, whatever the mode"
         );
+        assert!(json_of(&packet).contains("\"isPressed\":true"));
     }
 }

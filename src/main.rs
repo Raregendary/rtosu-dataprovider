@@ -678,7 +678,15 @@ async fn run_serve_loop(
         println!(" Live Endpoints:");
         if enable_http {
             println!(
-                "   - HTTP JSON:        http://{}:{}/json/v2",
+                "   - HTTP JSON (v2):   http://{}:{}/json/v2",
+                display_host, port
+            );
+            println!(
+                "   - HTTP JSON (v1):   http://{}:{}/json",
+                display_host, port
+            );
+            println!(
+                "   - HTTP JSON (SC):   http://{}:{}/json/sc",
                 display_host, port
             );
             println!(
@@ -691,6 +699,7 @@ async fn run_serve_loop(
                 "   - WebSocket Stream: ws://{}:{}/websocket/v2",
                 display_host, port
             );
+            println!("   - WebSocket v1:     ws://{}:{}/ws", display_host, port);
         }
         if enable_http && let Some(dir) = overlays_dir.as_ref() {
             println!(" Browser Overlays:");
@@ -788,12 +797,23 @@ async fn run_serve_loop(
             }
             _ = tokio::time::sleep(interval) => {
                 if let Ok(packet) = reader.poll() {
+                    // Read the attachment flag off the reader rather than out of
+                    // the packet: the packet no longer carries a marker for it
+                    // (see `SoloSession::attached`), and it is a property of the
+                    // reader's process handle, not of the payload.
+                    let attached = reader.is_attached();
+                    // The flag is part of the dedupe, not just the body. A game
+                    // exiting mid-poll changes nothing in the packet -- the same
+                    // last-known state is published -- but it must still reach
+                    // clients, because it is what turns the `/json*` routes from
+                    // `200` into tosu's `500`.
                     if let Some(last) = &last_published {
-                        if *last.packet == packet {
+                        if last.attached == attached && *last.packet == packet {
                             continue;
                         }
                     }
                     if let Some(published) = rtosu_dataprovider::server::PublishedPacket::new(packet) {
+                        let published = if attached { published } else { published.detached() };
                         let _ = tx.send(published.clone());
                         last_published = Some(published);
                     }

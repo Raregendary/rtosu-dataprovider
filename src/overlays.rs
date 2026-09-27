@@ -617,6 +617,12 @@ const OVERLAY_SHIM_TEMPLATE: &str = r##"/* rtosu-dataprovider browser overlay co
     socketUrl: '/websocket/v2',
     preciseSocketUrl: '/websocket/v2/precise',
     jsonUrl: '/json/v2',
+    /* The gosumemory-compatible v1 payload, on the same two paths tosu serves
+     * it on (router/index.ts:43 for the route, router/socket.ts:47 for the
+     * socket). Separate from the handles above because '/json' and '/ws' serve
+     * v1 -- a v1 overlay that followed 'jsonUrl' would be handed v2. */
+    v1SocketUrl: '/ws',
+    v1JsonUrl: '/json',
     healthUrl: '/health',
     backgroundUrl: '/files/beatmap/background',
     overlayBase: '/overlays/',
@@ -1191,6 +1197,168 @@ mod tests {
             "new Proxy(NativeWebSocket",
         ] {
             assert!(js.contains(needle), "shim must contain {needle}");
+        }
+    }
+
+    /// Every field the two **bundled** overlays read exists in the v2 payload.
+    ///
+    /// Both overlays are pure `/websocket/v2` consumers -- neither fetches
+    /// `/json` -- so the question "do they still work" is entirely "do the paths
+    /// they read still exist in the payload". Reading the JavaScript by eye
+    /// answers that only until the next rename, and a rename here is silent: the
+    /// overlay degrades to `undefined` and renders an em-dash or a `0.00` with
+    /// nothing in the console.
+    ///
+    /// The list is transcribed from the two `index.js` files' `render()` paths,
+    /// and it is deliberately the *union* of what both read. Where a path is
+    /// reached only in one, it says which, so a future reader knows whether
+    /// breaking it breaks one overlay or both.
+    #[test]
+    fn every_field_the_bundled_overlays_read_exists_in_the_v2_payload() {
+        // A packet with real content in each branch, so "present" means "present
+        // with a value" rather than "present because it is a default".
+        let mut packet = crate::v2::TosuV2Packet {
+            client: "stable".to_string(),
+            ..Default::default()
+        };
+        packet.state.number = 2;
+        packet.state.name = "play".to_string();
+        packet.beatmap.title = "Test Map".to_string();
+        packet.beatmap.artist = "Test Artist".to_string();
+        packet.beatmap.version = "Insane".to_string();
+        packet.beatmap.mapper = "Mapper".to_string();
+        packet.beatmap.set = 4242;
+        packet.beatmap.stats.stars.total = 5.12;
+        packet.play.accuracy = 98.5;
+        packet.play.score = 1_234_567;
+        packet.play.unstable_rate = 1.75;
+        packet.play.rank.current = "XH".to_string();
+        packet.play.pp.current = 1200.5;
+        packet.play.pp.fc = 1450.25;
+        packet.play.combo.current = 300;
+        packet.play.combo.max = 400;
+        packet.play.mods.number = 3;
+        packet.play.mods.name = "HD".to_string();
+        packet.play.hits.n0 = 1;
+        packet.play.hits.n50 = 2;
+        packet.play.hits.n100 = 300;
+        packet.play.hits.n300 = 500;
+        packet.play.hits.geki = 1;
+        packet.play.hits.katu = 2;
+        packet.play.hits.slider_breaks = 3;
+        packet.tourney.team = crate::v2::TourneyTeam {
+            left: "Left".to_string(),
+            right: "Right".to_string(),
+        };
+        packet.tourney.total_score = crate::v2::TourneyTotalScore { left: 3, right: 1 };
+        packet.tourney.points = crate::v2::TourneyPoints { left: 1, right: 0 };
+        packet.tourney.best_of = 5;
+        packet.tourney.clients = vec![crate::v2::TourneyIpcClient {
+            ipc_id: 1,
+            team: "left".to_string(),
+            user: crate::v2::TourneyUser {
+                id: 7,
+                name: "player".to_string(),
+                ..Default::default()
+            },
+            play: packet.play.clone(),
+            ..Default::default()
+        }];
+
+        let json = serde_json::to_value(&packet).expect("serialize the packet");
+
+        // `(json pointer, which overlay reads it)`.
+        let paths: &[(&str, &str)] = &[
+            // Both: the status line in `render()`.
+            ("/client", "both"),
+            ("/state/name", "both"),
+            // Both: the header block.
+            ("/beatmap/title", "both"),
+            ("/beatmap/artist", "both"),
+            ("/beatmap/version", "both"),
+            ("/beatmap/mapper", "both"),
+            ("/beatmap/set", "both"),
+            ("/beatmap/stats/stars/total", "both"),
+            // Both: play.pp, play.combo, play.rank, play.accuracy, play.hits.
+            ("/play/pp/current", "both"),
+            ("/play/pp/fc", "Example"),
+            ("/play/combo/current", "both"),
+            ("/play/combo/max", "both"),
+            ("/play/rank/current", "both"),
+            ("/play/accuracy", "both"),
+            ("/play/score", "Tourney"),
+            ("/play/unstableRate", "Example"),
+            ("/play/hits/0", "both"),
+            ("/play/hits/50", "both"),
+            ("/play/hits/100", "both"),
+            ("/play/hits/300", "both"),
+            ("/play/hits/geki", "Example"),
+            ("/play/hits/katu", "Example"),
+            ("/play/hits/sliderBreaks", "Example"),
+            ("/play/mods/name", "Example"),
+            // Both: the tournament list. `Tourney` also reads `clients[].team`.
+            ("/tourney/clients/0/user/name", "both"),
+            ("/tourney/clients/0/team", "Tourney"),
+            ("/tourney/clients/0/play/score", "both"),
+            ("/tourney/clients/0/play/accuracy", "both"),
+            // Tourney: the score bar.
+            ("/tourney/totalScore/left", "Tourney"),
+            ("/tourney/totalScore/right", "Tourney"),
+            ("/tourney/points/left", "Tourney"),
+            ("/tourney/points/right", "Tourney"),
+            ("/tourney/team/left", "Tourney"),
+            ("/tourney/team/right", "Tourney"),
+            // Read as `tourney.bestOF !== undefined ? bestOF : bestOf`; the v2
+            // name is `bestOF` and the `bestOf` fallback is dead but harmless.
+            ("/tourney/bestOF", "Tourney"),
+        ];
+
+        for (pointer, reader) in paths {
+            assert!(
+                !json.pointer(pointer).is_none(),
+                "the {reader} overlay reads {pointer}, which the v2 payload no longer has"
+            );
+        }
+
+        // And the hit counters have to be *strings* in the wire form, because
+        // both overlays index them as `hits['100']` rather than `hits.n100`. This
+        // is the one place where a serde rename would be invisible to a field
+        // count, and both overlays would silently read 0 for every judgement.
+        let hits = &json["play"]["hits"];
+        for key in ["0", "50", "100", "300", "geki", "katu", "sliderBreaks"] {
+            assert!(
+                hits.get(key).is_some(),
+                "hits must be keyed by {key}; the overlays index hits['{key}']"
+            );
+        }
+    }
+
+    /// The two bundled overlays connect to `/websocket/v2` and nothing else.
+    ///
+    /// The `/json` repoint (tosu's `/json` is the **v1** payload, and rtosu now
+    /// matches that) is invisible to them only because neither reads `/json`. If
+    /// one ever does, this is the test that has to be updated deliberately, rather
+    /// than a socket URL quietly finding a payload it cannot parse.
+    #[test]
+    fn the_bundled_overlays_only_open_the_v2_socket() {
+        for folder in ["rtosu Example", "rtosu Tourney"] {
+            let path = Path::new("browser_overlays").join(folder).join("index.js");
+            let source = fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+
+            assert!(
+                source.contains("ws://127.0.0.1:24050/websocket/v2"),
+                "{} must open the v2 socket",
+                path.display()
+            );
+            for forbidden in ["/json", "/ws'", "/tokens", "/websocket/commands"] {
+                assert!(
+                    !source.contains(forbidden),
+                    "{} now references {forbidden}, which is a different payload; \
+                     update the bundled overlays and this test together",
+                    path.display()
+                );
+            }
         }
     }
 }

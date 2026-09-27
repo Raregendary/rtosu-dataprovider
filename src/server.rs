@@ -22,6 +22,21 @@ use tower_http::cors::CorsLayer;
 pub struct PublishedPacket {
     pub packet: Arc<TosuV2Packet>,
     pub json: Bytes,
+    /// Whether an osu! process is attached right now.
+    ///
+    /// Not part of the payload, because tosu does not express "no game" in the
+    /// payload -- it refuses to produce one. Every `/json*` route there throws when
+    /// `getInstance(focusedClient)` is null and the route wrapper answers
+    /// `500` with `{"error": message}`
+    /// (`packages/server/utils/http.ts:186-207`), and every socket's loop skips
+    /// its send (`packages/server/utils/socket.ts`, `if (!osuInstance ||
+    /// clients.size === 0)`).
+    ///
+    /// So this flag reproduces the transport instead of inventing a body: an
+    /// overlay pointed at rtosu sees the same `500` tosu's would produce, and a
+    /// socket subscriber goes quiet rather than being handed a payload full of
+    /// values tosu would never emit.
+    pub attached: bool,
 }
 
 impl PublishedPacket {
@@ -33,6 +48,7 @@ impl PublishedPacket {
             Ok(json) => Some(Self {
                 packet: Arc::new(packet),
                 json: Bytes::from(json),
+                attached: true,
             }),
             Err(err) => {
                 tracing::error!("failed to serialize packet: {err:#}");
@@ -41,14 +57,44 @@ impl PublishedPacket {
         }
     }
 
+    /// The same payload, marked as having no game behind it.
+    pub fn detached(mut self) -> Self {
+        self.attached = false;
+        self
+    }
+
     pub fn default_packet() -> Self {
         let packet = TosuV2Packet::default();
         let json = serde_json::to_vec(&packet).unwrap_or_else(|_| b"{}".to_vec());
         Self {
             packet: Arc::new(packet),
             json: Bytes::from(json),
+            attached: true,
         }
     }
+}
+
+/// tosu's answer when no osu! instance is running, verbatim.
+///
+/// Every one of tosu's four `/json*` routes has the same guard and the same
+/// message -- `router/index.ts:44-46` (`/json`), `router/v2.ts:9-15` (`/json/v2`)
+/// and `:17-23` (`/json/v2/precise`), `router/scApi.ts:6-12` (`/json/sc`) -- and
+/// the thrown `Error` is turned into `500` plus `sendJson(res, { error: message })`
+/// by the route wrapper (`utils/http.ts:186-207`), with the message also set as
+/// the HTTP status message, URI-encoded.
+///
+/// The body is `application/json` because that is what `sendJson` sets
+/// (`utils/index.ts`), and it is a JSON object rather than plain text: an earlier
+/// reading of this contract had the body as plain text, which is the shape
+/// `utils/http.ts:450` uses for a *different* failure and not the one these
+/// routes take.
+fn not_ready() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        [(header::CONTENT_TYPE, "application/json")],
+        r#"{"error":"osu is not ready/running"}"#,
+    )
+        .into_response()
 }
 
 #[derive(Clone)]
@@ -89,10 +135,19 @@ pub fn create_router(
     if enable_http {
         router = router
             .route("/json/v2", get(handle_json_v2))
-            .route("/json/v2/precise", get(handle_json_v2))
-            .route("/json", get(handle_json_v2))
-            // The gosumemory-compatible payload. tosu serves this at `/json`;
-            // `/json` is already the v2 route here, so v1 has its own path.
+            .route("/json/v2/precise", get(handle_json_v2_precise))
+            // tosu serves the gosumemory-compatible payload at `/json`
+            // (`packages/server/router/index.ts:43-53`), so `/json` serves it
+            // here too. rtosu had `/json` on the v2 payload; v2 keeps its own
+            // canonical path at `/json/v2`, which is what an existing v2
+            // consumer has to be pointed at.
+            //
+            // This is a breaking change for anything already reading v2 from
+            // `/json`, and it was a deliberate call: the point of the reader is
+            // to be a drop-in for tosu, and a gosumemory overlay pointed at
+            // `/json` cannot read v2 at all. `/json/v1` stays as an explicit
+            // alias for the same payload. See `audit-1.0.5.md` `C-01`/`L-07`.
+            .route("/json", get(handle_json_v1))
             .route("/json/v1", get(handle_json_v1))
             // The StreamCompanion payload, for overlays written against
             // StreamCompanion rather than against tosu. Flat and 136 keys, so
@@ -116,7 +171,7 @@ pub fn create_router(
     if enable_ws {
         router = router
             .route("/websocket/v2", get(handle_ws_upgrade))
-            .route("/websocket/v2/precise", get(handle_ws_upgrade))
+            .route("/websocket/v2/precise", get(handle_ws_upgrade_precise))
             // tosu's v1 socket, serving the same shape as `/json/v1`. The overlay
             // shim passes `/ws` straight through to here.
             .route("/ws", get(handle_ws_upgrade_v1))
@@ -179,16 +234,47 @@ fn json_response(json: Bytes) -> Response {
 }
 
 async fn handle_json_v2(State(state): State<AppState>) -> Response {
-    let published = state.packet_rx.borrow().clone();
-    json_response(published.json)
+    let published = state.packet_rx.borrow();
+    if !published.attached {
+        return not_ready();
+    }
+    json_response(published.json.clone())
+}
+
+/// tosu's `/json/v2/precise` (`packages/server/router/v2.ts:21-31`).
+///
+/// `{keys, hitErrors, tourney}` and nothing else. This used to be the full v2
+/// handler, so a precise client received the whole payload -- five graph series
+/// included -- on every tick, with neither `keys` nor `hitErrors` present. Live
+/// measurement: 221 bytes from tosu against 24,039 from rtosu on the same map in
+/// the same state, and the endpoint whose entire reason to exist is a cheap
+/// high-frequency feed.
+///
+/// Built per request rather than pre-encoded per poll, for the same reason as
+/// v1 and SC: the precise payload is a view over data the poll already produced,
+/// and pre-encoding it would add a serialisation to every tick for a route that
+/// most consumers never open. The `hitErrors` array is an `Arc` clone, so the
+/// frame does not copy the list.
+async fn handle_json_v2_precise(State(state): State<AppState>) -> Response {
+    let published = state.packet_rx.borrow();
+    if !published.attached {
+        return not_ready();
+    }
+    let precise = crate::v2::TosuPrecisePacket::from_v2(&published.packet);
+    match serde_json::to_vec(&precise) {
+        Ok(json) => json_response(Bytes::from(json)),
+        Err(error) => {
+            tracing::error!("failed to build the precise payload: {error}");
+            server_error("failed to build the precise payload")
+        }
+    }
 }
 
 /// Serve the gosumemory-compatible payload.
 ///
-/// tosu serves this shape at `/json`. rtosu's `/json` is the v2 route and stays
-/// that way, so v1 lives at `/json/v1` -- a v1 consumer pointed at `/json` still
-/// receives v2 and cannot read it. That is the deliberate cost of not breaking
-/// anything already reading v2 from that path.
+/// This is tosu's `/json` (`packages/server/router/index.ts:43-53`), and it is
+/// what `/json` serves here. `/json/v1` is an alias for the same payload;
+/// `/json/v2` is the only path to the v2 shape.
 ///
 /// The v1 payload is built per request rather than pre-encoded by the poll loop,
 /// because it includes the strain graph and pre-encoding it would add a
@@ -196,6 +282,9 @@ async fn handle_json_v2(State(state): State<AppState>) -> Response {
 /// `audit-1.0.5.md` `L-07`.
 async fn handle_json_v1(State(state): State<AppState>) -> Response {
     let published = state.packet_rx.borrow();
+    if !published.attached {
+        return not_ready();
+    }
     let v1 = crate::v1::GosuCompatibleApi::from_v2(&published.packet);
     match serde_json::to_vec(&v1) {
         Ok(json) => json_response(Bytes::from(json)),
@@ -212,16 +301,16 @@ async fn handle_json_v1(State(state): State<AppState>) -> Response {
 /// Built per request for the same reason as v1: pre-encoding it would add a
 /// serialisation to every poll tick for a route almost nothing calls.
 ///
-/// **The not-running contract is deliberately not implemented here.** tosu
-/// answers `500 {"error":"osu is not ready/running"}` when no client is
-/// attached (`router/scApi.ts:9-11`), but `/json/v2` and `/json/v1` here both
-/// serve the last packet with `200`, and `audit-1.0.5.md` records the choice
-/// between the two as one open decision spanning `C-01`, `A-06`, `E-04`, `L-08`
-/// and `M-08`. Making SC the only route that answers `500` would be worse than
-/// leaving it consistent, so this settles with the rest once the decision is
-/// made. See `audit-1.0.5.md` `M-08`.
+/// Like the other three `/json*` routes, it answers `500 {"error":"osu is not
+/// ready/running"}` when no client is attached -- tosu's guard is the same on all
+/// four (`router/scApi.ts:9-11`), and making SC the only route that served a
+/// stale `200` would have been worse than leaving the choice open. See
+/// `audit-1.0.5.md` `M-08`.
 async fn handle_json_sc(State(state): State<AppState>) -> Response {
     let published = state.packet_rx.borrow();
+    if !published.attached {
+        return not_ready();
+    }
     let sc = crate::sc::ScPayload::from_v2(&published.packet);
     match serde_json::to_vec(&sc) {
         Ok(json) => json_response(Bytes::from(json)),
@@ -269,21 +358,46 @@ async fn handle_ws_stream_v1(
         return;
     }
 
-    while packet_rx.changed().await.is_ok() {
-        let Some(frame) = v1_frame(&mut packet_rx) else {
-            continue;
-        };
-        if socket.send(frame).await.is_err() {
-            break;
+    // `biased` so a queued inbound frame is taken before the next data frame is
+    // built; see `drain_inbound_frame`.
+    loop {
+        tokio::select! {
+            biased;
+            inbound = socket.recv() => {
+                if !drain_inbound_frame(inbound, "/ws") {
+                    break;
+                }
+            }
+            changed = packet_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let Some(frame) = v1_frame(&mut packet_rx) else {
+                    continue;
+                };
+                if socket.send(frame).await.is_err() {
+                    break;
+                }
+            }
         }
     }
 
     tracing::debug!("v1 WebSocket client disconnected");
 }
-
 /// Build, encode and wrap the v1 payload for the current published state.
+///
+/// `None` while no osu! is attached, which is how the streams go quiet: tosu's
+/// socket loop skips its send entirely when `getInstance(focusedClient)` is null
+/// (`packages/server/utils/socket.ts`, `if (!osuInstance || clients.size === 0)
+/// { await sleep(500); continue; }`), so it never sends a frame at all in that
+/// state -- not a stale one, and not an error frame either. Returning `None`
+/// rather than an error value is what reproduces that, and it also means a
+/// consumer never has to distinguish "no game" from a payload.
 fn v1_frame(packet_rx: &mut watch::Receiver<PublishedPacket>) -> Option<Message> {
     let published = packet_rx.borrow_and_update();
+    if !published.attached {
+        return None;
+    }
     let v1 = crate::v1::GosuCompatibleApi::from_v2(&published.packet);
     let json = match serde_json::to_vec(&v1) {
         Ok(json) => json,
@@ -809,6 +923,118 @@ async fn handle_ws_upgrade(
     ws.on_upgrade(move |socket| handle_ws_stream(socket, state.packet_rx))
 }
 
+/// tosu's `/websocket/v2/precise`: the same three-key payload as
+/// `/json/v2/precise`, streamed.
+///
+/// This used to be the full v2 stream, so a precise subscriber paid the whole
+/// packet -- including the strain graph -- on every tick. The rate is still the
+/// main loop's rather than tosu's 10 ms precise loop; that gap is `audit-1.0.5.md`
+/// `B-03` and is the threading restructure `FIX-008` owns, not something to
+/// paper over here. What this fixes is the payload, which is the part that was
+/// wrong by two orders of magnitude.
+async fn handle_ws_upgrade_precise(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    tracing::debug!("Incoming precise WebSocket upgrade request");
+    ws.on_upgrade(move |socket| handle_ws_stream_precise(socket, state.packet_rx))
+}
+
+/// Stream the precise payload on each change.
+async fn handle_ws_stream_precise(
+    mut socket: WebSocket,
+    mut packet_rx: watch::Receiver<PublishedPacket>,
+) {
+    tracing::debug!("precise WebSocket client connected");
+
+    if let Some(frame) = precise_frame(&mut packet_rx)
+        && socket.send(frame).await.is_err()
+    {
+        tracing::debug!("precise WebSocket client disconnected during initial handshake");
+        return;
+    }
+
+    // `biased` so a queued inbound frame is taken before the next data frame is
+    // built; see `drain_inbound_frame`.
+    loop {
+        tokio::select! {
+            biased;
+            inbound = socket.recv() => {
+                if !drain_inbound_frame(inbound, "/websocket/v2/precise") {
+                    break;
+                }
+            }
+            changed = packet_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let Some(frame) = precise_frame(&mut packet_rx) else {
+                    continue;
+                };
+                if socket.send(frame).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+
+    tracing::debug!("precise WebSocket client disconnected");
+}
+
+/// The one inbound rule every data socket shares: a frame that arrives from a
+/// data socket is **discarded**, and only a close or a transport error ends the
+/// connection.
+///
+/// tosu reads messages on every socket -- `ws.on('message', data =>
+/// this.onMessageCallback(data.toString(), ws, this))` in
+/// `packages/server/utils/socket.ts:36-41` -- and v1, v2 and the precise socket
+/// pass `handleSocketCommands`, while `/ws` and `/tokens` only get the filter
+/// reader. So all five consume their input; none of them treat a message as a
+/// reason to stop.
+///
+/// rtosu used to read nothing at all on four of the five, so a client that sent
+/// anything left the frame queued on the transport: pong replies and the
+/// keepalive an overlay's own library sends are the ordinary case, and a socket
+/// that never reads a pong is a socket whose peer eventually gives up on it. The
+/// fix is to read and drop, not to implement a command surface: the *only* socket
+/// with a documented inbound contract in rtosu is the filter list, and that one
+/// already had a reader.
+///
+/// `biased` matters for the same reason it does in the filter loop: the payload
+/// is broadcast on a timer, so the data branch is ready on nearly every wakeup,
+/// and an unbiased `select!` would let inbound frames sit behind it.
+fn drain_inbound_frame(message: Option<Result<Message, axum::Error>>, pathname: &str) -> bool {
+    match message {
+        // Read and drop. Pings are answered by axum's own machinery, so a
+        // `Message::Ping` reaching here is already handled bookkeeping.
+        Some(Ok(_)) => true,
+        Some(Err(error)) => {
+            tracing::debug!("websocket read error on {pathname}: {error}");
+            false
+        }
+        None => false,
+    }
+}
+
+/// Build, encode and wrap the precise payload for the current published state.
+fn precise_frame(packet_rx: &mut watch::Receiver<PublishedPacket>) -> Option<Message> {
+    let published = packet_rx.borrow_and_update();
+    // Silent while detached, like the other three streams and like tosu's own
+    // loop; see `v1_frame`.
+    if !published.attached {
+        return None;
+    }
+    let precise = crate::v2::TosuPrecisePacket::from_v2(&published.packet);
+    match serde_json::to_vec(&precise) {
+        Ok(json) => ws_text(Bytes::from(json)),
+        Err(error) => {
+            // A payload that will not encode must not silently stop the stream.
+            tracing::error!("failed to build the precise payload: {error}");
+            None
+        }
+    }
+}
+
 /// tosu's `/tokens` socket: the StreamCompanion wrapper.
 ///
 /// The connection sends a filter list and then receives only those leaves of the
@@ -927,27 +1153,33 @@ async fn handle_ws_tokens(
                 // exist after the parse.
                 let frame = {
                     let published = packet_rx.borrow_and_update();
-                    // The SC payload is built per frame, like `/json/sc`, so a
-                    // filtered connection is the only thing paying for it.
-                    let frame = if filters.is_empty() {
+                    if !published.attached {
+                        // Silent while no game is attached, as on every other
+                        // stream; see `v1_frame`.
                         None
                     } else {
-                        let json = sc_bytes(&published.packet);
-                        match filter_frame(&filters, &json) {
-                            Some(frame) => Some(frame),
-                            // A payload that will not parse or will not encode must
-                            // not silently stop the stream. Fall back to the full
-                            // payload for this tick and keep the connection.
-                            None => {
-                                tracing::warn!("filtering failed; sending the full payload");
-                                ws_text(sc_bytes(&published.packet))
+                        // The SC payload is built per frame, like `/json/sc`, so a
+                        // filtered connection is the only thing paying for it.
+                        let frame = if filters.is_empty() {
+                            None
+                        } else {
+                            let json = sc_bytes(&published.packet);
+                            match filter_frame(&filters, &json) {
+                                Some(frame) => Some(frame),
+                                // A payload that will not parse or will not encode must
+                                // not silently stop the stream. Fall back to the full
+                                // payload for this tick and keep the connection.
+                                None => {
+                                    tracing::warn!("filtering failed; sending the full payload");
+                                    ws_text(sc_bytes(&published.packet))
+                                }
                             }
+                        };
+                        match frame {
+                            Some(frame) => Some(frame),
+                            // Unfiltered: the whole SC payload, freshly built.
+                            None => ws_text(sc_bytes(&published.packet)),
                         }
-                    };
-                    match frame {
-                        Some(frame) => Some(frame),
-                        // Unfiltered: the whole SC payload, freshly built.
-                        None => ws_text(sc_bytes(&published.packet)),
                     }
                 };
                 let Some(frame) = frame else { continue };
@@ -1055,8 +1287,15 @@ fn ws_text(json: Bytes) -> Option<Message> {
 async fn handle_ws_stream(mut socket: WebSocket, mut packet_rx: watch::Receiver<PublishedPacket>) {
     tracing::debug!("WebSocket client connected");
 
-    // Send immediate initial state
-    let initial_json = packet_rx.borrow_and_update().json.clone();
+    // Send immediate initial state, unless there is no game: tosu's socket loop
+    // skips its send entirely with no instance, so it never opens with a frame
+    // either. See `v1_frame`.
+    let initial_json = if packet_rx.borrow().attached {
+        packet_rx.borrow_and_update().json.clone()
+    } else {
+        packet_rx.borrow_and_update();
+        Bytes::new()
+    };
     if !initial_json.is_empty() {
         match ws_text(initial_json) {
             Some(frame) => {
@@ -1071,13 +1310,34 @@ async fn handle_ws_stream(mut socket: WebSocket, mut packet_rx: watch::Receiver<
 
     // Stream updates on each tick. The payload was encoded once by the poll
     // loop, so this is a refcount bump and a write, not a re-serialization.
-    while packet_rx.changed().await.is_ok() {
-        let json_str = packet_rx.borrow_and_update().json.clone();
-        let Some(frame) = ws_text(json_str) else {
-            continue;
-        };
-        if socket.send(frame).await.is_err() {
-            break;
+    //
+    // `biased` so a queued inbound frame is taken before the next data frame is
+    // built; see `drain_inbound_frame`.
+    loop {
+        tokio::select! {
+            biased;
+            inbound = socket.recv() => {
+                if !drain_inbound_frame(inbound, "/websocket/v2") {
+                    break;
+                }
+            }
+            changed = packet_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let json_str = if packet_rx.borrow().attached {
+                    packet_rx.borrow_and_update().json.clone()
+                } else {
+                    packet_rx.borrow_and_update();
+                    Bytes::new()
+                };
+                let Some(frame) = ws_text(json_str) else {
+                    continue;
+                };
+                if socket.send(frame).await.is_err() {
+                    break;
+                }
+            }
         }
     }
 
@@ -1211,6 +1471,257 @@ mod tests {
         tx.send(PublishedPacket::new(updated).expect("serialize"))
             .unwrap();
         assert_eq!(rx_holder.borrow().packet.client, "tournament");
+    }
+
+    /// `/json` serves the **gosumemory-compatible v1** payload, because that is
+    /// what tosu serves there (`packages/server/router/index.ts:43-53`), and
+    /// rtosu used to serve v2 on that path instead. A drop-in replacement that
+    /// answers a different shape on the same URL is not a drop-in replacement,
+    /// and a v1 consumer cannot read v2 at all.
+    ///
+    /// The three payload routes are pinned together because the mistake this
+    /// guards against is silent: a swapped handler still returns 200 and still
+    /// returns JSON, so only the shape distinguishes them. `client`,
+    /// `settings` and `menu` exist in v1 and not in v2; `profile` and `tourney`
+    /// exist in v2 and not in v1.
+    #[tokio::test]
+    async fn the_json_routes_serve_the_shapes_tosu_serves_on_them() {
+        let mut sample = TosuV2Packet::default();
+        sample.client = "stable".to_string();
+        sample.state.number = 2;
+        sample.play.score = 4652;
+        sample.beatmap.id = 2964306;
+
+        let (_tx, rx) = watch::channel(PublishedPacket::new(sample).expect("serialize"));
+        let app = create_router(AppState::new(rx), true, true, true);
+
+        let fetch = |uri: &'static str| {
+            let router = app.clone();
+            async move {
+                let response = router
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK, "{uri}");
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                // The raw bytes, because the order assertion below is about the
+                // wire and `serde_json::Value` sorts its keys.
+                let text = String::from_utf8(body.to_vec()).expect("utf-8 body");
+                let parsed: serde_json::Value = serde_json::from_str(&text).expect("json body");
+                (text, parsed)
+            }
+        };
+
+        // `/json` and `/json/v1` are the same payload.
+        let (root_bytes, root) = fetch("/json").await;
+        let (v1_bytes, _v1) = fetch("/json/v1").await;
+        assert_eq!(root_bytes, v1_bytes, "/json and /json/v1 are aliases");
+        assert_eq!(
+            crate::testutil::json_key_order(&root_bytes),
+            [
+                "client",
+                "settings",
+                "menu",
+                "gameplay",
+                "resultsScreen",
+                "userProfile",
+                "tourney"
+            ],
+            "tosu's v1 top level, in wire order (router/index.ts:43-53)"
+        );
+        for v1_only in ["settings", "menu", "gameplay", "userProfile"] {
+            assert!(root.get(v1_only).is_some(), "v1 carries {v1_only}");
+        }
+
+        // `/json/v2` is the v2 shape. `profile` is v2-only and `gameplay` is
+        // v1-only, so the two routes are distinguishable by a single key either
+        // way -- `tourney` is in **both** shapes and so distinguishes nothing.
+        let (_v2_bytes, v2) = fetch("/json/v2").await;
+        assert!(
+            v2.get("profile").is_some() && root.get("profile").is_none(),
+            "profile is the v2-only key"
+        );
+        for v1_only in ["settings", "menu", "gameplay"] {
+            assert!(
+                v2.get(v1_only).is_none(),
+                "v2 has no {v1_only}; settings is the accepted divergence"
+            );
+        }
+    }
+
+    /// With no osu! attached, **all four** `/json*` routes answer
+    /// `500 {"error":"osu is not ready/running"}` -- and none of them serves a
+    /// payload.
+    ///
+    /// tosu's guard is identical on all four (`router/index.ts:44-46`,
+    /// `router/v2.ts:9-15` and `:17-23`, `router/scApi.ts:6-12`) and the thrown
+    /// error becomes `500` plus `sendJson(res, {error: message})`
+    /// (`utils/http.ts:186-207`), so all four answers are byte-identical. They
+    /// used to be four `200`s with different bodies, and a payload containing
+    /// `client: "none"` and `state.name: "notRunning"` -- neither of which is a
+    /// value tosu can emit -- which forced a consumer to recognise rtosu's
+    /// invention instead of reading tosu's error.
+    ///
+    /// The four are asserted together on purpose: they are one contract, and
+    /// leaving one of them as a `200` is exactly the state this replaces.
+    #[tokio::test]
+    async fn every_json_route_answers_tosus_not_ready_when_nothing_is_attached() {
+        // A packet that looks like a real, running client. If any route leaks it
+        // while detached, the body assertions below catch it even though the
+        // status check would already have failed.
+        let mut sample = TosuV2Packet::default();
+        sample.client = "stable".to_string();
+        sample.state.number = 2;
+        sample.state.name = "play".to_string();
+        sample.play.score = 1_234_567;
+
+        let (_tx, rx) = watch::channel(PublishedPacket::new(sample).expect("serialize").detached());
+        let app = create_router(AppState::new(rx), true, true, true);
+
+        for uri in [
+            "/json",
+            "/json/v1",
+            "/json/v2",
+            "/json/v2/precise",
+            "/json/sc",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "{uri} must refuse rather than serve the last packet"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("application/json"),
+                "{uri} content type"
+            );
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let text = String::from_utf8(body.to_vec()).expect("utf-8 body");
+            assert_eq!(
+                text, r#"{"error":"osu is not ready/running"}"#,
+                "{uri} body must be tosu's, verbatim"
+            );
+        }
+
+        // And the same routes serve normally once something is attached, so the
+        // guard is not just "always refuse".
+        let attached = PublishedPacket::new({
+            let mut packet = TosuV2Packet::default();
+            packet.client = "stable".to_string();
+            packet.state.number = 2;
+            packet.state.name = "play".to_string();
+            packet
+        })
+        .expect("serialize");
+        assert!(attached.attached);
+        let (_tx2, rx2) = watch::channel(attached);
+        let app = create_router(AppState::new(rx2), true, true, true);
+        for uri in [
+            "/json",
+            "/json/v1",
+            "/json/v2",
+            "/json/v2/precise",
+            "/json/sc",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri} when attached");
+        }
+    }
+
+    /// `/json/v2/precise` serves `{keys, hitErrors, tourney}` -- three keys, and
+    /// none of the v2 payload. It used to be the same handler as `/json/v2`, so
+    /// the endpoint whose entire purpose is a cheap high-frequency feed returned
+    /// the whole packet including the strain graph, and returned neither `keys`
+    /// nor `hitErrors`. Measured live against tosu 4.26.2 on the same map in the
+    /// same state: 221 bytes there, 24,039 here.
+    ///
+    /// The size assertion is the point. A shape assertion alone would pass on a
+    /// payload that carried the graph in a fourth key, and the byte count is what
+    /// an overlay's bandwidth actually depends on.
+    #[tokio::test]
+    async fn the_precise_route_serves_three_keys_and_not_the_v2_packet() {
+        let mut sample = TosuV2Packet::default();
+        sample.client = "stable".to_string();
+        sample.state.number = 2;
+        sample.beatmap.id = 2964306;
+        sample.play.key_overlay.k1 = crate::v2::KeyOverlayButton {
+            is_pressed: true,
+            count: 11,
+        };
+        sample.play.hit_error_array = std::sync::Arc::from(vec![-3i16, 0, 7, 12, -20]);
+        sample.performance.graph = crate::v2::PrecomputedGraph::new(&crate::v2::PerformanceGraph {
+            series: (0..5)
+                .map(|index| crate::v2::GraphSeries {
+                    name: format!("series{index}"),
+                    data: (0..4_778).map(|point| point as f64 * 0.1234).collect(),
+                })
+                .collect(),
+            xaxis: (0..4_778).map(|point| point as f64 * 400.0).collect(),
+        });
+
+        let (_tx, rx) = watch::channel(PublishedPacket::new(sample).expect("serialize"));
+        let app = create_router(AppState::new(rx), true, true, true);
+
+        let body = |app: Router, uri: &'static str| async move {
+            let response = app
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{uri}");
+            axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap()
+        };
+
+        let precise = body(app.clone(), "/json/v2/precise").await;
+        let full = body(app, "/json/v2").await;
+
+        assert!(
+            precise.len() < 5_000 && full.len() > 100_000,
+            "precise {} bytes against v2 {} bytes: the precise route must not \
+             carry the graph",
+            precise.len(),
+            full.len()
+        );
+
+        let text = String::from_utf8(precise.to_vec()).expect("utf-8 body");
+        assert_eq!(
+            crate::testutil::json_key_order(&text),
+            ["keys", "hitErrors", "tourney"],
+            "tosu's three keys, in wire order (buildResultV2Precise.ts:68-87)"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&text).expect("json body");
+        assert_eq!(
+            parsed["keys"]["k1"]["count"], 11,
+            "the read reaches the wire"
+        );
+        assert_eq!(
+            parsed["keys"]["k1"]["isPressed"],
+            serde_json::json!(true),
+            "and the pressed flag, which is a bool on the wire"
+        );
+        assert_eq!(
+            parsed["hitErrors"].as_array().map(Vec::len),
+            Some(5),
+            "the hit errors are the packet's own list"
+        );
+        assert!(parsed["tourney"].is_array());
     }
 
     /// `/json/sc` serves the StreamCompanion payload: 136 flat keys, none of

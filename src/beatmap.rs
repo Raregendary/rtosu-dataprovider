@@ -201,30 +201,89 @@ pub struct BeatmapSnapshot {
     /// explicit `PreviewTime:-1`. Both serialise as `-1`.
     #[serde(skip)]
     pub preview_time: Option<i32>,
+    /// `[General] Mode:` -- the beatmap file's **own** ruleset, which is what
+    /// tosu puts in `beatmap.mode.number` and what `isConvert` is computed
+    /// against. Distinct from the game's current ruleset, which is what the
+    /// memory read at `base_addr - 0x33` returns. `None` when the line is
+    /// absent or unparseable, which both parsers treat as osu!standard; see
+    /// [`apply_beatmap_ruleset`].
+    #[serde(skip)]
+    pub file_mode: Option<i32>,
 }
 
+/// The name for a stable beatmap ranked status.
+///
+/// Transcribed from `tosu-sourcecode/packages/common/enums/osu.ts:51-59`:
+/// `unknown, notSubmitted = 1, pending = 2, ranked = 4, approved = 5,
+/// qualified = 6, loved = 7`. **There is no member for 3, and none above 7** --
+/// the enum skips 3 entirely, which is why `3 => "unused"` in the previous
+/// version was both wrong and dead code (the number was clamped to `0` before it
+/// was ever named).
+///
+/// The `""` cases are not a fallback, they are tosu's behaviour:
+/// `StableBeatmapStatuses[raw || -1] || ''` (`api/utils/buildResultV2.ts:340`).
+/// Indexing a numeric enum with a number that has no member is `undefined`, and
+/// `undefined || ''` is `''`. So `0` yields `""` too -- the `|| -1` sends it
+/// off the front of the enum -- and so does anything `>= 8`. The old `"unknown"`
+/// was an invented word that no tosu build can emit.
 pub fn beatmap_status_name(status: i32) -> &'static str {
     match status {
-        0 => "unknown",
         1 => "notSubmitted",
         2 => "pending",
-        3 => "unused",
         4 => "ranked",
         5 => "approved",
         6 => "qualified",
         7 => "loved",
-        _ => "unknown",
+        // 0 goes through the `|| -1` quirk, 3 has no member, and 8+ is past the
+        // end. All three are `''` in tosu.
+        _ => "",
     }
 }
 
+/// The ruleset name for a beatmap, from the one shared table.
+///
+/// tosu emits `Rulesets[mode] || ''` at all four sites that carry a ruleset
+/// name -- `play.mode` (`buildResultV2.ts:911`), `profile.mode` (`:308`),
+/// `resultsScreen.mode` (`:384`) and `beatmap.mode` (`:349`) -- and
+/// `common/enums/osu.ts:62-67` has no default member, so every out-of-range
+/// number is `''`. This one used to answer `"osu"` for those, which put a
+/// fourth copy of the table in the payload with a different fallback from the
+/// other three.
 pub fn beatmap_mode_name(mode: i32) -> &'static str {
-    match mode {
-        0 => "osu",
-        1 => "taiko",
-        2 => "fruits",
-        3 => "mania",
-        _ => "osu",
-    }
+    crate::reader::ruleset_name(mode)
+}
+
+/// Apply the beatmap **file's** own ruleset to `beatmap.mode` and
+/// `beatmap.isConvert`.
+///
+/// tosu sources `beatmap.mode.number` from the `.osu` file's own `Mode:` line
+/// (`states/beatmap.ts:505` <- the parsed beatmap, not the game's current
+/// ruleset), and `isConvert` is then exactly
+/// `mode === 0 ? mode !== currentMode : false`
+/// (`api/utils/buildResultV2.ts:330-331`). That is deliberately independent of
+/// `currentMode`, and the independence is the whole point: it is what makes a
+/// converted map detectable at all. rtosu read the game's current ruleset into
+/// `mode` instead, which makes the two identical and therefore makes `isConvert`
+/// permanently `false`.
+///
+/// An absent `Mode:` line is treated as osu!standard, because that is what both
+/// parsers behind the two implementations do: lazer's `BeatmapInfo.Ruleset`
+/// defaults to `Ruleset.Osu` and `rosu-map`'s `GameMode` defaults to `Osu`
+/// (`rosu-map-0.2.1/src/section/general/mod.rs`). The `.osu` format requires the
+/// line, so this only decides the malformed case, and matching both is the
+/// answer rather than inventing a third one.
+///
+/// Called only after [`populate_beatmap_file_metadata`] has read the file.
+/// `current_ruleset` is the game's current ruleset -- the value `mode.number`
+/// held before this call, read from the song-select base rather than from the
+/// beatmap record.
+pub fn apply_beatmap_ruleset(snapshot: &mut BeatmapSnapshot, current_ruleset: i32) {
+    let file_mode = snapshot.file_mode.unwrap_or(0);
+    snapshot.mode = BeatmapMode {
+        number: file_mode,
+        name: crate::reader::ruleset_name(file_mode).to_string(),
+    };
+    snapshot.is_convert = file_mode == 0 && current_ruleset != 0;
 }
 
 /// Read the active beatmap pointer address from osu! process memory.
@@ -299,11 +358,6 @@ pub fn read_beatmap_from_ptr(
     let status_raw = memory
         .read_i16(checked_add_signed(beatmap_addr, 0x12C)?)
         .unwrap_or(0) as i32;
-    let status_num = if (1..=7).contains(&status_raw) {
-        status_raw
-    } else {
-        0
-    };
     let mode = memory
         .read_indirect_pointer(checked_add_signed(base_addr, -0x33)?)
         .unwrap_or(0) as i32;
@@ -351,8 +405,13 @@ pub fn read_beatmap_from_ptr(
             mp3_length: 0,
         },
         status: BeatmapStatus {
-            number: status_num,
-            name: beatmap_status_name(status_num).to_string(),
+            // The raw value, unclamped: tosu writes `number: menu.rankedStatus`
+            // straight through (`buildResultV2.ts:339`). Clamping 3 and anything
+            // `>= 8` to `0` moved *both* halves of the object, so a status the
+            // game really reported came back as a different number with a
+            // different name.
+            number: status_raw,
+            name: beatmap_status_name(status_raw).to_string(),
         },
         checksum,
         id,
@@ -377,6 +436,7 @@ pub fn read_beatmap_from_ptr(
         breaks: Vec::new(),
         timing_points: Vec::new(),
         preview_time: None,
+        file_mode: None,
         stats: BeatmapStats {
             stars: StarsBreakdown {
                 live: 0.0,
@@ -471,14 +531,31 @@ pub fn populate_beatmap_file_metadata(snapshot: &mut BeatmapSnapshot, path: &Pat
         }
         match section.as_str() {
             "General" => {
-                // The only `[General]` key rtosu consumes today. `Mode:` sits in
-                // the same section and is what `A-08`/`F-05` need; it is left
-                // alone here so this change stays scoped to the SC payload.
-                if let Some((key, value)) = line.split_once(':')
-                    && key.trim() == "PreviewTime"
-                    && let Ok(preview) = value.trim().parse::<i32>()
-                {
-                    snapshot.preview_time = Some(preview);
+                if let Some((key, value)) = line.split_once(':') {
+                    match key.trim() {
+                        "PreviewTime" => {
+                            if let Ok(preview) = value.trim().parse::<i32>() {
+                                snapshot.preview_time = Some(preview);
+                            }
+                        }
+                        // The map's own ruleset, which is what `beatmap.mode` and
+                        // `isConvert` need. A **repeated** `Mode:` line is
+                        // malformed, and both parsers behind the two
+                        // implementations assign on every occurrence, so the last
+                        // one wins (`rosu-map-0.2.1/src/section/general/decode.rs`
+                        // `GeneralKey::Mode => state.mode = value.parse()?`, and
+                        // lazer's `readGeneral` assigns in the same place). An
+                        // unparseable value is ignored rather than failing the
+                        // section, so one bad line cannot cost the whole file's
+                        // metadata -- which is a deliberate difference from
+                        // `rosu-map`, where it is a hard parse error.
+                        "Mode" => {
+                            if let Ok(mode) = value.trim().parse::<i32>() {
+                                snapshot.file_mode = Some(mode);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             "Metadata" => {
@@ -941,12 +1018,117 @@ pub fn read_sharp_string_ptr(memory: &ProcessMemory, str_ptr: u64) -> Result<Str
 mod tests {
     use super::*;
 
+    /// `beatmap.status` is a `{number, name}` pair, and tosu builds it as
+    /// `{ number: raw, name: StableBeatmapStatuses[raw || -1] || '' }`
+    /// (`api/utils/buildResultV2.ts:338-341`). Both halves are pinned together
+    /// here because they used to disagree: the number was clamped into `1..=7`
+    /// and the name table answered `"unknown"` for everything else, so raw `3`
+    /// shipped as `{"number": 0, "name": "unknown"}` where tosu ships
+    /// `{"number": 3, "name": ""}`.
+    ///
+    /// The `""` for `0` is the non-obvious one. `StableBeatmapStatuses` has an
+    /// `unknown` member with the implicit value `0`, so a naive transcription
+    /// would answer `"unknown"` -- but the `|| -1` sends index `0` off the front
+    /// of the enum, where it is `undefined`, and `undefined || ''` is `''`.
+    /// `"unknown"` is a word no tosu build can put in this field.
     #[test]
-    fn test_status_names() {
-        assert_eq!(beatmap_status_name(4), "ranked");
-        assert_eq!(beatmap_status_name(7), "loved");
-        assert_eq!(beatmap_status_name(1), "notSubmitted");
-        assert_eq!(beatmap_status_name(999), "unknown");
+    fn the_status_number_and_name_are_both_tosus() {
+        // (raw, number, name) -- the pair the packet builder emits.
+        let cases: &[(i32, i32, &str)] = &[
+            (-1, -1, ""),
+            (0, 0, ""),
+            (1, 1, "notSubmitted"),
+            (2, 2, "pending"),
+            // The enum skips 3 entirely: `ranked = 4`.
+            (3, 3, ""),
+            (4, 4, "ranked"),
+            (5, 5, "approved"),
+            (6, 6, "qualified"),
+            (7, 7, "loved"),
+            (8, 8, ""),
+            (999, 999, ""),
+        ];
+        for (raw, number, name) in cases {
+            assert_eq!(
+                beatmap_status_name(*raw),
+                *name,
+                "name for raw status {raw}"
+            );
+            // The number is the raw value, unclamped: `number: menu.rankedStatus`.
+            assert_eq!(
+                *raw, *number,
+                "number for raw status {raw} is passed through"
+            );
+        }
+    }
+
+    /// `beatmap.mode.name` is `Rulesets[mode] || ''` at every one of tosu's four
+    /// ruleset-name sites, and `common/enums/osu.ts:62-67` declares no default
+    /// member, so an out-of-range number is `""`. This one used to answer
+    /// `"osu"`, which made `beatmap.mode` the odd one out of the four and gave a
+    /// garbage read a plausible-looking name.
+    #[test]
+    fn an_out_of_range_ruleset_has_no_name_rather_than_osu() {
+        for value in [-1, 4, 99, i32::MAX, i32::MIN] {
+            assert_eq!(beatmap_mode_name(value), "", "ruleset {value}");
+        }
+        // The in-table values are 4/4 in every copy, and stay that way.
+        for (value, name) in [(0, "osu"), (1, "taiko"), (2, "fruits"), (3, "mania")] {
+            assert_eq!(beatmap_mode_name(value), name);
+            // And the shared table the other three sites call agrees.
+            assert_eq!(crate::reader::ruleset_name(value), name);
+        }
+    }
+
+    /// `isConvert` is `mode === 0 ? mode !== currentMode : false`
+    /// (`buildResultV2.ts:330-331`), where `mode` is the **file's** ruleset and
+    /// `currentMode` is the game's. rtosu used to read the game's ruleset into
+    /// `mode` as well, which makes the comparison vacuously false and the flag
+    /// permanently `false`.
+    ///
+    /// The four combinations are the whole truth table: a converted map is a
+    /// standard map being played in another mode, and nothing else is.
+    #[test]
+    fn is_convert_is_the_files_ruleset_against_the_current_one() {
+        let cases: &[(Option<i32>, i32, i32, &str, bool)] = &[
+            // file mode, current ruleset, expected number, expected name, isConvert
+            (Some(0), 0, 0, "osu", false),
+            (Some(0), 1, 0, "osu", true),
+            (Some(0), 3, 0, "osu", true),
+            // A natively taiko map is never a conversion, in any mode.
+            (Some(1), 0, 1, "taiko", false),
+            (Some(1), 1, 1, "taiko", false),
+            (Some(3), 0, 3, "mania", false),
+            // An absent `Mode:` line is osu!standard to both parsers, so it
+            // converts exactly as an explicit `Mode: 0` would.
+            (None, 2, 0, "osu", true),
+            (None, 0, 0, "osu", false),
+        ];
+
+        for (file_mode, current, number, name, is_convert) in cases {
+            let mut snapshot = BeatmapSnapshot::default();
+            // What the memory read leaves behind: the game's current ruleset.
+            snapshot.mode = BeatmapMode {
+                number: *current,
+                name: beatmap_mode_name(*current).to_string(),
+            };
+            snapshot.file_mode = *file_mode;
+
+            apply_beatmap_ruleset(&mut snapshot, *current);
+
+            assert_eq!(
+                snapshot.mode.number, *number,
+                "file {file_mode:?} played in {current}: number"
+            );
+            assert_eq!(
+                snapshot.mode.name, *name,
+                "file {file_mode:?} in {current}: name"
+            );
+            assert_eq!(
+                snapshot.is_convert, *is_convert,
+                "file {file_mode:?} played in {current}: isConvert"
+            );
+        }
     }
 
     #[test]
@@ -1425,13 +1607,19 @@ mod tests {
         assert_eq!(snapshot.time.mp3_length, 0);
     }
 
-    /// Nothing in `[General]` is read any more, so the section has to be inert
-    /// rather than break the scan that follows it. Several of these lines carry
-    /// colons inside their values and one is a duplicate `Mode`, so this is also
-    /// the check that ignoring the section does not disturb the object and
-    /// timing parsing further down the file.
+    /// `[General]` used to be skipped whole, and is now read for two keys
+    /// (`PreviewTime` and `Mode:`). The point of this arm is that consuming the
+    /// section did not disturb the scan that follows it: several `[General]`
+    /// lines carry colons inside their values, and this fixture also carries a
+    /// **duplicate** `Mode:` line, so it covers the repeated-key rule as well.
+    ///
+    /// The duplicate resolves to the last value, because that is what both
+    /// parsers do -- `rosu-map` assigns on every occurrence
+    /// (`GeneralKey::Mode => state.mode = value.parse()?`) and lazer's
+    /// `readGeneral` assigns in the same place. A first-wins rule would be a
+    /// silent divergence from the implementation being matched.
     #[test]
-    fn a_general_section_is_inert_and_the_scan_continues() {
+    fn the_general_section_is_read_and_the_scan_continues() {
         let snapshot = file_metadata_snapshot(
             "general",
             "osu file format v14\n\n[General]\nMode:0\nAudioFilename:audio.mp3\nAudioLeadIn:0\nPreviewTime:-1\nCountdown:0\nSampleSet:Normal\nStackLeniency:0.7\nMode:3\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\nSliderMultiplier:1.4\nSliderTickRate:1\n\n[TimingPoints]\n0,500,4,1,0\n\n[HitObjects]\n64,192,1000,1,0,0:0:0:0:\n64,192,2500,1,0,0:0:0:0:\n",
@@ -1443,6 +1631,25 @@ mod tests {
         assert_eq!(snapshot.stats.objects.total, 2);
         // 60_000 / 500, so the timing points were parsed too.
         assert_eq!(snapshot.stats.bpm.min, 120.0);
+        // The keys that are now read, and the repeated-key rule.
+        assert_eq!(snapshot.preview_time, Some(-1));
+        assert_eq!(snapshot.file_mode, Some(3), "the last Mode: line wins");
+    }
+
+    /// A `Mode:` value that is not a number must not cost the file its other
+    /// metadata. `rosu-map` treats it as a hard parse error for the whole
+    /// `[General]` section; rtosu ignores the line instead, because the cost of
+    /// being wrong here is one unknown ruleset rather than a beatmap with no
+    /// artist, no tags and no object counts.
+    #[test]
+    fn an_unparseable_mode_line_is_ignored_rather_than_failing_the_section() {
+        let snapshot = file_metadata_snapshot(
+            "mode-bogus",
+            "osu file format v14\n\n[General]\nMode:bogus\nPreviewTime:1234\n\n[Difficulty]\nCircleSize:4\n\n[TimingPoints]\n0,300,4,1,0\n\n[HitObjects]\n64,192,1134,1,0,0:0:0:0:\n",
+        );
+        assert_eq!(snapshot.file_mode, None, "unresolved, not zero");
+        assert_eq!(snapshot.preview_time, Some(1234), "the rest still parsed");
+        assert_eq!(snapshot.stats.objects.total, 1);
     }
 
     /// A hit object whose type does not parse must not be able to widen the
@@ -1655,7 +1862,14 @@ mod tests {
         for (span, (start, end, has_effect)) in snapshot.breaks.iter().zip(expected) {
             assert_eq!(span.start_time, start);
             assert_eq!(span.end_time, end);
-            assert!(span.has_effect, "the legacy form defaults to true");
+            // Compared against the expected value rather than asserted `true`
+            // outright, so a parser that read the flag as `false` fails here.
+            // The modern spelling's flag *is* honoured, and that is covered
+            // separately in `the_events_section_yields_break_spans_with_their_effect_flag`.
+            assert_eq!(
+                span.has_effect, has_effect,
+                "the legacy form carries no flag, so it defaults to true"
+            );
         }
     }
 
@@ -1698,7 +1912,12 @@ mod tests {
         assert_eq!(snapshot.preview_time, Some(72834));
 
         let json = serde_json::to_string(&snapshot).expect("serialize beatmap");
-        for absent in ["\"breaks\"", "\"timingPoints\"", "\"previewTime\""] {
+        for absent in [
+            "\"breaks\"",
+            "\"timingPoints\"",
+            "\"previewTime\"",
+            "\"fileMode\"",
+        ] {
             assert!(!json.contains(absent), "v2 must not gain {absent}");
         }
         // The `#[serde(skip)]` fields still round-trip as their defaults, which

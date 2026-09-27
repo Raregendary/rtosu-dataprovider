@@ -247,9 +247,10 @@ impl Serialize for ScStrains {
 /// The inner shape of the `keyOverlay` string (`buildResultSC.ts:169-179`).
 ///
 /// `Enabled` is tosu's `config.enableKeyOverlay`, not a value read from the
-/// game. The four buttons come from `gameplay.keyOverlay`, which tosu fills
-/// from osu! stable memory (`memory/stable.ts:644-728`); rtosu has no key-state
-/// read (`audit-1.0.5.md` `B-02`), so all eight values are the neutral default.
+/// game -- it is a tosu setting and has no osu! counterpart, so it stays `true`
+/// to match the live capture. The eight button values come from the one
+/// key-overlay read (`client::read_key_overlay`, a port of
+/// `memory/stable.ts:644-728`).
 ///
 /// The `.at(0..3)` indexing with `?? false` / `?? 0` fallbacks is reproduced
 /// implicitly: four buttons are always emitted, even for taiko's three-element
@@ -274,6 +275,27 @@ pub struct ScKeyOverlay {
     pub m2_pressed: bool,
     #[serde(rename = "M2Count")]
     pub m2_count: i32,
+}
+
+impl ScKeyOverlay {
+    /// The same read, renamed into SC's `PascalCase` field names.
+    ///
+    /// SC flattens the four buttons into eight scalar keys rather than nesting
+    /// four objects, so this is a reshape rather than a copy. `Enabled` is
+    /// *not* derived from the read: it is tosu's own config flag.
+    fn from_read(overlay: &crate::v2::KeyOverlay, enabled: bool) -> Self {
+        Self {
+            enabled,
+            k1_pressed: overlay.k1.is_pressed,
+            k1_count: overlay.k1.count,
+            k2_pressed: overlay.k2.is_pressed,
+            k2_count: overlay.k2.count,
+            m1_pressed: overlay.m1.is_pressed,
+            m1_count: overlay.m1.count,
+            m2_pressed: overlay.m2.is_pressed,
+            m2_count: overlay.m2.count,
+        }
+    }
 }
 
 /// One entry of the `leaderBoardPlayers` string (`buildResultSC.ts:216-242`).
@@ -1005,13 +1027,12 @@ impl ScPayload {
             player_hp_smooth: play.health_bar.smooth * 2.0,
             combo: play.combo.current,
             current_max_combo: play.combo.max,
-            key_overlay: encode_json(&ScKeyOverlay {
+            key_overlay: encode_json(&ScKeyOverlay::from_read(
+                &play.key_overlay,
                 // tosu's `config.enableKeyOverlay`, not a value read from the
-                // game. Enabled even though rtosu has no key read yet, matching
-                // the live capture.
-                enabled: true,
-                ..ScKeyOverlay::default()
-            }),
+                // game. Always on, matching the live capture.
+                true,
+            )),
 
             geki: play.hits.geki,
             c300: play.hits.n300,
@@ -1336,6 +1357,25 @@ mod tests {
             number: 0,
             name: "osu".to_string(),
         };
+        // The capture's `keyOverlay` string, field for field:
+        // `{"Enabled":true,"K1Pressed":false,"K1Count":11,"K2Pressed":false,
+        // "K2Count":9,"M1Pressed":false,"M1Count":0,"M2Pressed":false,
+        // "M2Count":0}`. Reproducing the two non-zero counts is what turns this
+        // leaf from a recorded gap into a leaf rtosu can actually serve -- they
+        // come from the key-overlay read, and osu! was paused mid-play, which is
+        // why nothing was held down.
+        packet.play.key_overlay = crate::v2::KeyOverlay {
+            k1: crate::v2::KeyOverlayButton {
+                is_pressed: false,
+                count: 11,
+            },
+            k2: crate::v2::KeyOverlayButton {
+                is_pressed: false,
+                count: 9,
+            },
+            m1: crate::v2::KeyOverlayButton::UNPRESSED,
+            m2: crate::v2::KeyOverlayButton::UNPRESSED,
+        };
         // The capture was taken on a guest login, which is what the bancho block
         // reports: `UserLoginStatus.guest` is 256 and the id is -1
         // (`common/enums/osu.ts:80`).
@@ -1488,10 +1528,13 @@ mod tests {
     fn the_stringified_leaves_parse_and_keep_their_inner_key_order() {
         let sc = ScPayload::from_v2(&live_like_packet());
 
-        // Transcribed from `buildResultSC.ts:169-179`.
+        // Transcribed from `buildResultSC.ts:169-179`, with the capture's real
+        // key counts rather than the neutral default: the inner key order and the
+        // flattening into eight scalars are the contract, and the values are the
+        // read's.
         assert_eq!(
             sc.key_overlay,
-            r#"{"Enabled":true,"K1Pressed":false,"K1Count":0,"K2Pressed":false,"K2Count":0,"M1Pressed":false,"M1Count":0,"M2Pressed":false,"M2Count":0}"#
+            r#"{"Enabled":true,"K1Pressed":false,"K1Count":11,"K2Pressed":false,"K2Count":9,"M1Pressed":false,"M1Count":0,"M2Pressed":false,"M2Count":0}"#
         );
         // Transcribed from `buildResultSC.ts:203-222`, with tosu's own `-1` XOR
         // constants. Fifteen keys -- the leading `IsLeaderboardVisible` is on
@@ -2201,6 +2244,15 @@ mod tests {
             // rather than fabricated.
             ("skin", "\u{2d} # re;owoTuna v1.1 \u{300e}Selyu\u{300f} # \u{2d}".into()),
             ("skinPath", "\u{2d} # re;owoTuna v1.1 \u{300e}Selyu\u{300f} # \u{2d}".into()),
+            // The key overlay, verbatim from the capture. This leaf was on the
+            // "cannot compare" list until the read landed
+            // (`client::read_key_overlay`); with the read in place the whole
+            // string is a value rtosu produces, so it is pinned here instead.
+            (
+                "keyOverlay",
+                r#"{"Enabled":true,"K1Pressed":false,"K1Count":11,"K2Pressed":false,"K2Count":9,"M1Pressed":false,"M1Count":0,"M2Pressed":false,"M2Count":0}"#
+                    .into(),
+            ),
         ];
 
         for (key, expected) in expect {
@@ -2266,10 +2318,12 @@ mod tests {
             // `the_leaves_that_need_live_data_record_what_the_capture_saw`.
             "mapTimingPoints",
             "mapBreaks",
-            // No rtosu read exists for either: `B-02` for the key state,
-            // `I-10`/`L-09` for the scoreboard. The captured values are
-            // recorded in the test named above.
-            "keyOverlay",
+            // No rtosu read exists: `I-10`/`L-09` for the scoreboard. The
+            // captured values are recorded in the test named above.
+            //
+            // `keyOverlay` used to be on this list. It is not any more -- the
+            // read exists (`client::read_key_overlay`) and the leaf is pinned to
+            // the capture in `the_stringified_leaves_parse_and_keep_their_inner_key_order`.
             "leaderBoardMainPlayer",
         ];
         named.sort_unstable();
@@ -2295,14 +2349,20 @@ mod tests {
         assert_eq!(sc.skin, "skin-from-memory");
         assert_eq!(sc.skin_path, sc.skin, "tosu sends one string for both");
 
-        // `keyOverlay` in the capture had non-zero counts
-        // (K1Count 11, K2Count 9), because tosu reads key state from osu!
-        // stable (`memory/stable.ts:644-728`). rtosu has no such read
-        // (`audit-1.0.5.md` B-02), so the counts are zero -- which is a real,
-        // recorded gap rather than a passing value.
+        // `keyOverlay` in the capture had non-zero counts (K1Count 11,
+        // K2Count 9), read from osu! stable (`memory/stable.ts:644-728`). rtosu
+        // has that read now (`client::read_key_overlay`), so the fixture's values
+        // reach the string instead of the neutral default -- which is why this
+        // leaf is no longer on the unpinned list.
         let overlay: serde_json::Value = serde_json::from_str(&sc.key_overlay).unwrap();
-        assert_eq!(overlay["K1Count"], 0);
-        assert_eq!(overlay["K2Count"], 0);
+        assert_eq!(
+            overlay["K1Count"], 11,
+            "the capture's count, carried through"
+        );
+        assert_eq!(
+            overlay["K2Count"], 9,
+            "the capture's count, carried through"
+        );
         assert_eq!(overlay["Enabled"], true);
 
         // `leaderBoardMainPlayer` in the capture was all-zero with the `-1` XOR

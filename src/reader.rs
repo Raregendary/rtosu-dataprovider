@@ -186,9 +186,20 @@ impl OsuReader {
         }
 
         if self.cached_pids.is_empty() {
+            // No fabricated `client: "none"` / `state.name: "notRunning"`
+            // markers: neither is a value tosu can emit, and tosu does not
+            // answer with a packet at all when there is no game. The
+            // not-running contract is transport-level -- `500
+            // {"error":"osu is not ready/running"}` on the `/json*` routes,
+            // silence on the sockets -- and it is driven by
+            // [`OsuReader::is_attached`] rather than by anything in the body.
             let mut packet = TosuV2Packet::default();
-            packet.client = "none".to_string();
-            packet.state.name = "notRunning".to_string();
+            // `OsuStatusState` derives `Default`, so the placeholder arrives with
+            // `number: 0, name: ""` -- and `0` is `menu`
+            // (`common/enums/osu.ts:13`, where the enum starts at `menu`). Every
+            // real read sets both halves from the same number, so this is the one
+            // packet where the invariant would not otherwise hold.
+            packet.state.name = crate::v2::osu_state_name(packet.state.number).to_string();
             self.last_packet = packet.clone();
             return Ok(packet);
         }
@@ -207,7 +218,12 @@ impl OsuReader {
             Ok(packet)
         } else {
             let packet = self.solo_session.poll()?;
-            if packet.client == "none" {
+            // The session reports attachment directly. This used to sniff
+            // `packet.client == "none"`, which only worked because a sentinel had
+            // been written into the payload -- so a fabricated string was load
+            // bearing for the process cache, and removing the marker without
+            // replacing the signal would have left a dead pid cached forever.
+            if !self.solo_session.is_attached() {
                 self.cached_pids.clear();
             }
             crate::instr_scope!(PacketClone);
@@ -263,6 +279,27 @@ impl OsuReader {
         self.builder.poll_interval
     }
 
+    /// Whether an osu! process is currently attached.
+    ///
+    /// **This is the not-running signal.** tosu has no packet to serve when no
+    /// game is running, so its `/json*` routes answer `500` and its sockets stay
+    /// silent; rtosu carries the same fact here and lets the server reproduce
+    /// that, instead of putting a made-up `client` or `state.name` in the body
+    /// for a consumer to have to recognise.
+    pub fn is_attached(&self) -> bool {
+        if self.cached_pids.is_empty() {
+            return false;
+        }
+        match self.builder.mode {
+            // The tournament session aggregates several clients, so "attached"
+            // is a property of the snapshot rather than of one process.
+            OsuReaderMode::Tournament | OsuReaderMode::Auto if self.is_tournament => {
+                self.tourney_session.client_count() > 0
+            }
+            _ => self.solo_session.is_attached(),
+        }
+    }
+
     pub fn into_stream(self) -> OsuReaderStream {
         let interval = self.builder.poll_interval;
         OsuReaderStream {
@@ -280,12 +317,10 @@ pub struct OsuReaderStream {
 impl OsuReaderStream {
     pub async fn next(&mut self) -> Option<TosuV2Packet> {
         self.interval.tick().await;
-        Some(self.reader.poll().unwrap_or_else(|_| {
-            let mut packet = TosuV2Packet::default();
-            packet.client = "none".to_string();
-            packet.state.name = "notRunning".to_string();
-            packet
-        }))
+        // A failed poll yields a plain default packet. Like the empty-process
+        // case in `poll`, it carries no marker: the stream's consumer asks
+        // `reader().is_attached()`.
+        Some(self.reader.poll().unwrap_or_default())
     }
 
     pub fn reader(&self) -> &OsuReader {
@@ -540,14 +575,64 @@ pub fn ruleset_name(value: i32) -> &'static str {
     }
 }
 
+/// The osu! country code table, index 0 = id 1.
+///
+/// **Transcribed from `tosu-sourcecode/packages/common/enums/country.ts`, which
+/// has 252 contiguous members `oc = 1` … `mf = 252`. Do not hand-edit this
+/// literal.** The previous version was a whitespace-split string that had
+/// picked up a `cw` between `cv` and `cx` (osu! has no `cw` member -- it goes
+/// `cv = 52, cx = 53`) and had lost `mp` between `mo = 143` and `mq = 145`, so
+/// **143 of 252 ids resolved to the wrong country**: `53` answered `CW`, `86`
+/// answered `GN`, `144` answered `MQ`, `225` (the United States) answered `UY`,
+/// and `251` answered `MF`. Every player outside ids 1-52 and 87-143 was given
+/// somebody else's flag.
+///
+/// The regeneration is mechanical, so re-derive rather than repair:
+///
+/// ```text
+/// # from the repository root, with the tosu checkout present
+/// grep -oE '^\s+\w+ = [0-9]+' tosu-sourcecode/packages/common/enums/country.ts
+/// ```
+///
+/// The type is a fixed-size array rather than a split string so a wrong length
+/// is a compile error instead of a silent off-by-one at the tail, and so the
+/// one-based id maps to a checked index.
+const COUNTRY_CODES: [&str; 252] = [
+    "oc", "eu", "ad", "ae", "af", "ag", "ai", "al", "am", "an", "ao", "aq", "ar", "as", "at", "au",
+    "aw", "az", "ba", "bb", "bd", "be", "bf", "bg", "bh", "bi", "bj", "bm", "bn", "bo", "br", "bs",
+    "bt", "bv", "bw", "by", "bz", "ca", "cc", "cd", "cf", "cg", "ch", "ci", "ck", "cl", "cm", "cn",
+    "co", "cr", "cu", "cv", "cx", "cy", "cz", "de", "dj", "dk", "dm", "do", "dz", "ec", "ee", "eg",
+    "eh", "er", "es", "et", "fi", "fj", "fk", "fm", "fo", "fr", "fx", "ga", "gb", "gd", "ge", "gf",
+    "gh", "gi", "gl", "gm", "gn", "gp", "gq", "gr", "gs", "gt", "gu", "gw", "gy", "hk", "hm", "hn",
+    "hr", "ht", "hu", "id", "ie", "il", "in", "io", "iq", "ir", "is", "it", "jm", "jo", "jp", "ke",
+    "kg", "kh", "ki", "km", "kn", "kp", "kr", "kw", "ky", "kz", "la", "lb", "lc", "li", "lk", "lr",
+    "ls", "lt", "lu", "lv", "ly", "ma", "mc", "md", "mg", "mh", "mk", "ml", "mm", "mn", "mo", "mp",
+    "mq", "mr", "ms", "mt", "mu", "mv", "mw", "mx", "my", "mz", "na", "nc", "ne", "nf", "ng", "ni",
+    "nl", "no", "np", "nr", "nu", "nz", "om", "pa", "pe", "pf", "pg", "ph", "pk", "pl", "pm", "pn",
+    "pr", "ps", "pt", "pw", "py", "qa", "re", "ro", "ru", "rw", "sa", "sb", "sc", "sd", "se", "sg",
+    "sh", "si", "sj", "sk", "sl", "sm", "sn", "so", "sr", "st", "sv", "sy", "sz", "tc", "td", "tf",
+    "tg", "th", "tj", "tk", "tm", "tn", "to", "tl", "tr", "tt", "tv", "tw", "tz", "ua", "ug", "um",
+    "us", "uy", "uz", "va", "vc", "ve", "vg", "vi", "vn", "vu", "wf", "ws", "ye", "yt", "rs", "za",
+    "zm", "me", "zw", "xx", "a2", "o1", "ax", "gg", "im", "je", "bl", "mf",
+];
+
+/// The country code for an osu! country id, or `""` outside 1..=252.
+///
+/// tosu emits the code **uppercased** at the payload sites
+/// (`api/utils/buildResultV2.ts:319-322`), so this returns the lowercase enum
+/// name and the callers uppercase it. The empty string for an out-of-range id
+/// is tosu's own behaviour: `CountryCodes[value]` on a numeric enum is
+/// `undefined`, and `JSON.stringify` drops an undefined value, so the key
+/// disappears from the object rather than becoming `null`.
 pub fn country_name(value: i32) -> &'static str {
-    const CODES: &str = "oc eu ad ae af ag ai al am an ao aq ar as at au aw az ba bb bd be bf bg bh bi bj bm bn bo br bs bt bv bw by bz ca cc cd cf cg ch ci ck cl cm cn co cr cu cv cw cx cy cz de dj dk dm do dz ec ee eg eh er es et fi fj fk fm fo fr fx ga gb gd ge gf gh gi gl gm gn gq gr gs gt gu gw gy hk hm hn hr ht hu id ie il in io iq ir is it jm jo jp ke kg kh ki km kn kp kr kw ky kz la lb lc li lk lr ls lt lu lv ly ma mc md mg mh mk ml mm mn mo mq mr ms mt mu mv mw mx my mz na nc ne nf ng ni nl no np nr nu nz om pa pe pf pg ph pk pl pm pn pr ps pt pw py qa re ro ru rw sa sb sc sd se sg sh si sj sk sl sm sn so sr st sv sy sz tc td tf tg th tj tk tm tn to tl tr tt tv tw tz ua ug um us uy uz va vc ve vg vi vn vu wf ws ye yt rs za zm me zw xx a2 o1 ax gg im je bl mf";
-    if value < 1 {
-        return "";
-    }
-    CODES
-        .split_whitespace()
-        .nth((value - 1) as usize)
+    // `checked_sub` first, not `value - 1`: the conversion below would be handed
+    // an already-overflowed `i32` for `i32::MIN`, and arithmetic overflow panics
+    // in a debug build. The country id comes straight out of the target process,
+    // so every value in `i32` has to be answerable without panicking.
+    value
+        .checked_sub(1)
+        .and_then(|index| usize::try_from(index).ok())
+        .and_then(|index| COUNTRY_CODES.get(index).copied())
         .unwrap_or("")
 }
 
@@ -592,12 +677,39 @@ mod tests {
         assert_eq!(builder.poll_interval, Duration::from_millis(5));
     }
 
+    /// `poll()` succeeds when no osu! is running, and reports that fact through
+    /// `is_attached()` rather than through the payload.
+    ///
+    /// This test used to assert `!packet.client.is_empty()`, which was only
+    /// checking that the invented `client: "none"` marker had been written --
+    /// it had nothing to do with reading a game. The marker is gone: `client` is
+    /// `ClientType[game.client]` upstream, so `"none"` is a value no tosu build
+    /// emits for a running game and a value that means "no game" only inside
+    /// rtosu. tosu does not answer with a packet at all in this state, it answers
+    /// `500` -- so the signal belongs on the reader, where `main.rs` forwards it
+    /// as `PublishedPacket::attached`.
     #[test]
-    fn test_reader_creation_and_poll() {
+    fn poll_succeeds_without_a_game_and_reports_it_on_the_reader() {
         let mut reader = OsuReader::builder().build().expect("Reader build failed");
         let packet = reader.poll().expect("Poll failed");
-        // Even if osu is not running, poll() returns an initialized packet gracefully
-        assert!(!packet.client.is_empty());
+
+        assert!(
+            !reader.is_attached(),
+            "no osu! process in this test, so nothing is attached"
+        );
+        // No fabricated marker anywhere in the body.
+        assert_ne!(packet.client, "none", "no sentinel in the payload");
+        assert_ne!(
+            packet.state.name, "notRunning",
+            "no sentinel in the payload"
+        );
+        // And the packet is a real, if empty, one.
+        assert_eq!(packet.state.number, 0);
+        assert_eq!(
+            crate::v2::osu_state_name(packet.state.number),
+            packet.state.name,
+            "state.name follows the number, as it does everywhere else"
+        );
     }
 
     #[test]
@@ -616,5 +728,72 @@ mod tests {
         assert_eq!(country_name(1), "oc");
         assert_eq!(country_name(2), "eu");
         assert_eq!(country_name(0), "");
+    }
+
+    /// The country table, swept across its whole domain against a **separately
+    /// transcribed** copy of `common/enums/country.ts`.
+    ///
+    /// The two literals are the same data, which is the point: asserting the
+    /// table against itself proves nothing, and asserting it against rtosu's
+    /// *old* output would just pin the bug. The old table had 251 entries with a
+    /// `cw` that osu! does not have and no `mp`, so **143 of 252 ids** answered
+    /// with the wrong country -- including `225`, the United States. A sweep is
+    /// what catches that class of damage, because the head (`1..=52`) agreed
+    /// throughout and so did every spot check anyone would have reached for
+    /// first.
+    ///
+    /// The id boundaries are asserted by name as well, because those are the
+    /// entries the drift moved and the ones a reader can check against tosu's
+    /// own output without diffing 252 rows.
+    #[test]
+    fn every_country_id_resolves_to_tosus_code() {
+        /// Transcribed from `tosu-sourcecode/packages/common/enums/country.ts`:
+        /// 252 contiguous members, `oc = 1` … `mf = 252`.
+        const EXPECTED: [&str; 252] = [
+            "oc", "eu", "ad", "ae", "af", "ag", "ai", "al", "am", "an", "ao", "aq", "ar", "as",
+            "at", "au", "aw", "az", "ba", "bb", "bd", "be", "bf", "bg", "bh", "bi", "bj", "bm",
+            "bn", "bo", "br", "bs", "bt", "bv", "bw", "by", "bz", "ca", "cc", "cd", "cf", "cg",
+            "ch", "ci", "ck", "cl", "cm", "cn", "co", "cr", "cu", "cv", "cx", "cy", "cz", "de",
+            "dj", "dk", "dm", "do", "dz", "ec", "ee", "eg", "eh", "er", "es", "et", "fi", "fj",
+            "fk", "fm", "fo", "fr", "fx", "ga", "gb", "gd", "ge", "gf", "gh", "gi", "gl", "gm",
+            "gn", "gp", "gq", "gr", "gs", "gt", "gu", "gw", "gy", "hk", "hm", "hn", "hr", "ht",
+            "hu", "id", "ie", "il", "in", "io", "iq", "ir", "is", "it", "jm", "jo", "jp", "ke",
+            "kg", "kh", "ki", "km", "kn", "kp", "kr", "kw", "ky", "kz", "la", "lb", "lc", "li",
+            "lk", "lr", "ls", "lt", "lu", "lv", "ly", "ma", "mc", "md", "mg", "mh", "mk", "ml",
+            "mm", "mn", "mo", "mp", "mq", "mr", "ms", "mt", "mu", "mv", "mw", "mx", "my", "mz",
+            "na", "nc", "ne", "nf", "ng", "ni", "nl", "no", "np", "nr", "nu", "nz", "om", "pa",
+            "pe", "pf", "pg", "ph", "pk", "pl", "pm", "pn", "pr", "ps", "pt", "pw", "py", "qa",
+            "re", "ro", "ru", "rw", "sa", "sb", "sc", "sd", "se", "sg", "sh", "si", "sj", "sk",
+            "sl", "sm", "sn", "so", "sr", "st", "sv", "sy", "sz", "tc", "td", "tf", "tg", "th",
+            "tj", "tk", "tm", "tn", "to", "tl", "tr", "tt", "tv", "tw", "tz", "ua", "ug", "um",
+            "us", "uy", "uz", "va", "vc", "ve", "vg", "vi", "vn", "vu", "wf", "ws", "ye", "yt",
+            "rs", "za", "zm", "me", "zw", "xx", "a2", "o1", "ax", "gg", "im", "je", "bl", "mf",
+        ];
+
+        for (index, expected) in EXPECTED.iter().enumerate() {
+            let id = index as i32 + 1;
+            assert_eq!(
+                country_name(id),
+                *expected,
+                "country id {id} must be {expected}"
+            );
+        }
+
+        // The boundaries the drift actually moved, named rather than swept.
+        assert_eq!(country_name(52), "cv", "last id before the missing cw");
+        assert_eq!(country_name(53), "cx", "osu! has no cw member");
+        assert_eq!(country_name(86), "gp", "last id before the missing mp");
+        assert_eq!(country_name(143), "mo", "last id before mp");
+        assert_eq!(country_name(144), "mp", "mp is a real member tosu has");
+        assert_eq!(country_name(225), "us", "the United States");
+        assert_eq!(country_name(251), "bl", "second to last member");
+        assert_eq!(country_name(252), "mf", "last member, id 252");
+
+        // Outside the table there is no code at all, and tosu drops the key
+        // rather than emitting null: `CountryCodes[value]?.toUpperCase() || ''`
+        // (`buildResultV2.ts:319-322`).
+        for out_of_range in [0, -1, 253, 1000, i32::MAX, i32::MIN] {
+            assert_eq!(country_name(out_of_range), "", "id {out_of_range}");
+        }
     }
 }
