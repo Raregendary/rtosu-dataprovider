@@ -928,7 +928,7 @@ pub fn populate_beatmap_statistics_with_diff(
     snapshot.stats.bpm.min = scaled_bpm(base.min, map_bpm, clock_rate);
     snapshot.stats.bpm.max = scaled_bpm(base.max, map_bpm, clock_rate);
     snapshot.stats.stars.total = round_value(diff.stars() as f32, 2);
-    snapshot.stats.stars.live = snapshot.stats.stars.total;
+    snapshot.stats.stars.live = 0.0;
     snapshot.stats.ar.original = map.ar;
     snapshot.stats.cs.original = map.cs;
     snapshot.stats.od.original = map.od;
@@ -1523,7 +1523,7 @@ mod tests {
         assert_eq!(stars.reading, 0.14);
         assert_eq!(stars.hit_window, 28.5);
         assert_eq!(stars.total, 1.56);
-        assert_eq!(stars.live, stars.total);
+        assert_eq!(stars.live, 0.0);
         assert_eq!(snapshot.stats.hit_window.great, 28.5);
         assert_eq!(snapshot.stats.hit_window.ok, 67.5);
     }

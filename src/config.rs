@@ -87,7 +87,6 @@ pub struct FeatureConfig {
     /// Optional real-time PP calculation (requires feature 'rosu-mem' or 'pp')
     pub enable_pp: bool,
     /// Number of gradual PP chunks per beatmap (1 = full map only / no gradual, max = 250, default = 100)
-    pub gradual_pp_chunks: usize,
     /// Include hit error array in JSON packet (if false, sends [] while still calculating unstableRate)
     pub enable_hit_errors: bool,
 }
@@ -145,7 +144,6 @@ impl Default for FeatureConfig {
         Self {
             enable_chat: true,
             enable_pp: true,
-            gradual_pp_chunks: 100,
             enable_hit_errors: true,
         }
     }
@@ -216,12 +214,6 @@ impl AppConfig {
             anyhow::bail!(
                 "logging.max_log_files must be between 1 and 365 (got {})",
                 self.logging.max_log_files
-            );
-        }
-        if self.features.gradual_pp_chunks < 1 || self.features.gradual_pp_chunks > 250 {
-            anyhow::bail!(
-                "features.gradual_pp_chunks must be between 1 and 250 (got {})",
-                self.features.gradual_pp_chunks
             );
         }
         let valid_levels = ["trace", "debug", "info", "warn", "error"];
@@ -338,7 +330,6 @@ enable_pp = true
 # Range: 1 to 250
 # Default: 100
 # Set to 1 to only compute full-map difficulty (disables gradual live PP resolution for ultra-low CPU).
-gradual_pp_chunks = 100
 
 # Include the full hit error array in the JSON packet (packet.play.hitErrorArray).
 # When set to false, hitErrorArray is sent as an empty array [] to save network bandwidth

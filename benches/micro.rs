@@ -410,73 +410,162 @@ fn synthetic_osu_map(objects: usize) -> rosu_pp::Beatmap {
     rosu_pp::Beatmap::from_bytes(body.as_bytes()).expect("parse synthetic map")
 }
 
-/// Gradual-PP chunk scaling: `N = 1` (full map only) against `N = 100`.
+/// Gradual-PP scaling for the incremental cursor.
 ///
-/// Two things are measured:
+/// The question the old chunk design made this bench ask was "how long does the
+/// whole curve take, and does a worker have to be involved". That question is
+/// gone. What the poll loop now pays is proportional to the objects judged
+/// since the last tick, so the bench measures two things instead:
 ///
-/// 1. **One-shot, outside criterion**: what the poll loop actually pays on the
-///    first tick of a map with `objects` hit objects, and how long the
-///    background `GradualDifficulty` worker then takes to replace the fallback.
-///    This is the number `report.md` §6.3's 145 s stall has to be compared
-///    against, and the live harness cannot produce it because it needs a map
-///    big enough for the old synchronous path to be pathological.
-/// 2. **criterion**: `compute_chunks` at `N = 1 / 10 / 100 / 250`, which is the
-///    pure cost of the computation the worker thread runs.
+/// 1. **One-shot, outside criterion**: the cost of a *single* judgement on maps
+///    of increasing size, and what the whole walk costs. Per-judgement cost
+///    rises with the depth of the curve -- `DifficultyValues::eval` re-reads the
+///    strain peaks accumulated so far -- so these two numbers grow together and
+///    the second is what a full play ultimately pays.
+/// 2. **criterion**: a full end-to-end walk, for the result screen, which is the
+///    one place that legitimately needs the whole curve.
 #[cfg(feature = "pp")]
 fn bench_pp_chunks(c: &mut Criterion) {
     use rosu_mods::GameModsLegacy;
-    use rtosu_dataprovider::pp::calculator::{compute_chunks, get_or_compute_gradual_chunks};
+    use rtosu_dataprovider::pp::calculator::GradualCursor;
 
     let mods = GameModsLegacy::default();
 
-    for (objects, map_id) in [
-        (5_000usize, 0x5A00_0001u32),
-        (15_000, 0x5B00_0001),
-        (30_000, 0x5C00_0001),
-    ] {
+    for objects in [1_000usize, 5_000, 15_000, 30_000] {
         let map = synthetic_osu_map(objects);
-        let started = Instant::now();
-        let first = get_or_compute_gradual_chunks(map_id, &map, mods, 100);
-        let first_call_ms = started.elapsed().as_secs_f64() * 1000.0;
-        let first_chunks = first.len();
 
-        // Poll the same key until the worker has published the real chunks.
-        // This is "time until gradual PP is live", which the cumulative phase
-        // counters can only report at process exit.
-        let mut waited_ms = first_call_ms;
-        let mut chunks = first;
-        while chunks.len() <= 1 && waited_ms < 300_000.0 {
-            std::thread::sleep(Duration::from_millis(20));
-            chunks = get_or_compute_gradual_chunks(map_id, &map, mods, 100);
-            waited_ms = started.elapsed().as_secs_f64() * 1000.0;
+        // What one poll tick costs: step the cursor forward by one object from
+        // a position already established. This is the steady state, and it is
+        // the number that has to fit inside a frame.
+        let mut cursor = GradualCursor::new();
+        let warmup_ms = {
+            let started = Instant::now();
+            let _ = cursor.advance_to(0x5A00_0001, &map, mods, objects as u32 / 2);
+            started.elapsed().as_secs_f64() * 1000.0
+        };
+        let mut ticks = 0u32;
+        let tick_started = Instant::now();
+        while cursor.processed() < objects as u32 {
+            let _ = cursor.advance_to(0x5A00_0001, &map, mods, cursor.processed() + 1);
+            ticks += 1;
         }
+        let per_object_ms = tick_started.elapsed().as_secs_f64() * 1000.0 / ticks as f64;
+        let whole_ms = warmup_ms + tick_started.elapsed().as_secs_f64() * 1000.0;
+
         println!(
-            "pp_first_call objects={objects} first_call_ms={first_call_ms:.1} \
-             first_call_chunks={first_chunks} gradual_ready_ms={waited_ms:.1} \
-             gradual_chunks={} off_critical_path={:.0}x",
-            chunks.len(),
-            waited_ms / first_call_ms.max(f64::MIN_POSITIVE),
+            "pp_cursor objects={objects} per_judgement_us={:.1} \
+             to_half_ms={warmup_ms:.1} whole_map_ms={whole_ms:.1}",
+            per_object_ms * 1000.0,
         );
-        // Let the worker finish before the next size so two workers do not
-        // compete for the same core and distort both numbers.
-        std::thread::sleep(Duration::from_millis(250));
     }
 
     let map = synthetic_osu_map(5_000);
-    let mut group = c.benchmark_group("pp_chunks");
+    let mut group = c.benchmark_group("pp_cursor");
     group.sample_size(10);
     group.measurement_time(Duration::from_secs(8));
     group.throughput(Throughput::Elements(5_000));
-    for n in [1usize, 10, 100, 250] {
-        group.bench_function(format!("n{n}_5000"), |b| {
-            b.iter(|| black_box(compute_chunks(black_box(&map), mods, n)));
+    group.bench_function("full_walk_5000", |b| {
+        b.iter(|| {
+            let mut cursor = GradualCursor::new();
+            black_box(cursor.advance_to(0x5A00_0002, black_box(&map), mods, 5_000));
+        });
+    });
+    group.finish();
+}
+
+#[cfg(not(feature = "pp"))]
+fn bench_pp_chunks(_c: &mut Criterion) {}
+
+/// The two whole-map passes, which is all `rosu-pp-gemini`'s `rayon` feature can
+/// parallelise. `GradualDifficulty::next` folds exactly one object through
+/// `OsuSkills::process` and never reaches `process_all_parallel`, so the
+/// incremental cursor is untouched by the flag; what the flag moves is the
+/// one-shot `Difficulty::calculate` that `full_difficulty` and
+/// `performance_graph` each run per `(map, mods)`.
+///
+/// They are timed separately because they pay for different things: `calculate`
+/// builds the difficulty objects and evaluates the skills to attributes,
+/// `strains` does the same and additionally allocates one `f64` per skill per
+/// object to hand back the graph series. rtosu runs `strains` once to build the
+/// payload's performance graph, so it is the larger of the two in the real
+/// process.
+#[cfg(feature = "pp")]
+fn bench_pp_difficulty(c: &mut Criterion) {
+    use rosu_mods::GameModsLegacy;
+
+    let mods = GameModsLegacy::default();
+    const REPS: usize = 5;
+
+    for objects in [200usize, 1_000, 5_000, 15_000, 30_000] {
+        let map = synthetic_osu_map(objects);
+
+        let calc = |reps: usize| {
+            let mut samples = Vec::with_capacity(reps);
+            for _ in 0..reps {
+                let started = Instant::now();
+                let attrs = rosu_pp::Difficulty::new().mods(mods).calculate(&map);
+                black_box(attrs.stars());
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples
+        };
+        let strains = |reps: usize| {
+            let mut samples = Vec::with_capacity(reps);
+            for _ in 0..reps {
+                let started = Instant::now();
+                let value = rosu_pp::Difficulty::new().mods(mods).strains(&map);
+                black_box(&value);
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples
+        };
+
+        // One-shot, outside criterion, so a whole ladder of map sizes can be
+        // read off a single run in the same format `bench_pp_chunks` uses.
+        let median = |mut samples: Vec<f64>| {
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            samples[samples.len() / 2]
+        };
+        println!(
+            "pp_whole_map objects={objects} calculate_ms={:.1} strains_ms={:.1}",
+            median(calc(REPS)),
+            median(strains(REPS)),
+        );
+    }
+
+    // criterion, for a distribution on the two sizes that bracket the range:
+    // 1 000 is an ordinary map, 15 000 is where the one-shot pass is long
+    // enough for dispatch to amortise.
+    let mut group = c.benchmark_group("pp_difficulty");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(10));
+    for objects in [1_000usize, 15_000] {
+        let map = synthetic_osu_map(objects);
+        group.throughput(Throughput::Elements(objects as u64));
+        group.bench_function(format!("calculate_{objects}"), |b| {
+            b.iter(|| {
+                black_box(
+                    rosu_pp::Difficulty::new()
+                        .mods(mods)
+                        .calculate(black_box(&map)),
+                )
+            })
+        });
+        group.bench_function(format!("strains_{objects}"), |b| {
+            b.iter(|| {
+                black_box(
+                    rosu_pp::Difficulty::new()
+                        .mods(mods)
+                        .strains(black_box(&map)),
+                )
+            })
         });
     }
     group.finish();
 }
 
 #[cfg(not(feature = "pp"))]
-fn bench_pp_chunks(_c: &mut Criterion) {}
+fn bench_pp_difficulty(_c: &mut Criterion) {}
 
 criterion_group!(
     benches,
@@ -489,5 +578,6 @@ criterion_group!(
     bench_profile_parse,
     bench_beatmap_metadata,
     bench_pp_chunks,
+    bench_pp_difficulty,
 );
 criterion_main!(benches);

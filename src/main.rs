@@ -747,11 +747,8 @@ async fn run_serve_loop(
         }
     );
     println!(
-        " Features: pp_calc={}, pp_chunks={}, hit_errors={}, chat_attribution={}",
-        config.features.enable_pp,
-        config.features.gradual_pp_chunks,
-        config.features.enable_hit_errors,
-        config.features.enable_chat
+        " Features: pp_calc={}, hit_errors={}, chat_attribution={}",
+        config.features.enable_pp, config.features.enable_hit_errors, config.features.enable_chat
     );
     println!("===========================================================");
 
@@ -762,7 +759,6 @@ async fn run_serve_loop(
         .solo_profile("stable")
         .mode(mode)
         .enable_pp(config.features.enable_pp)
-        .gradual_pp_chunks(config.features.gradual_pp_chunks)
         .enable_hit_errors(config.features.enable_hit_errors)
         .enable_chat(config.features.enable_chat)
         .opt_pointer_width(pointer_width)

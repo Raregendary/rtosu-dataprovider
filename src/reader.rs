@@ -23,7 +23,6 @@ pub struct OsuReaderBuilder {
     proc_check_interval: Duration,
     mode: OsuReaderMode,
     enable_pp: bool,
-    pub gradual_pp_chunks: usize,
     enable_hit_errors: bool,
     enable_chat: bool,
 }
@@ -39,7 +38,6 @@ impl Default for OsuReaderBuilder {
             proc_check_interval: Duration::from_millis(1500),
             mode: OsuReaderMode::Auto,
             enable_pp: true,
-            gradual_pp_chunks: 100,
             enable_hit_errors: true,
             enable_chat: true,
         }
@@ -107,11 +105,6 @@ impl OsuReaderBuilder {
         self
     }
 
-    pub fn gradual_pp_chunks(mut self, chunks: usize) -> Self {
-        self.gradual_pp_chunks = chunks.clamp(1, 250);
-        self
-    }
-
     pub fn enable_hit_errors(mut self, enable: bool) -> Self {
         self.enable_hit_errors = enable;
         self
@@ -149,7 +142,6 @@ impl OsuReader {
             builder.scan_limit_bytes,
         )?;
         solo_session.enable_pp = builder.enable_pp;
-        solo_session.gradual_pp_chunks = builder.gradual_pp_chunks;
         solo_session.enable_hit_errors = builder.enable_hit_errors;
 
         let mut tourney_session = TournamentSession::new(
@@ -159,7 +151,6 @@ impl OsuReader {
         )?;
         tourney_session.enable_chat = builder.enable_chat;
         tourney_session.enable_pp = builder.enable_pp;
-        tourney_session.gradual_pp_chunks = builder.gradual_pp_chunks;
         tourney_session.enable_hit_errors = builder.enable_hit_errors;
 
         let mut reader = Self {
@@ -454,7 +445,6 @@ pub fn gameplay_to_play(gameplay: Option<&GameplayState>) -> PlayState {
             n300: g.hit_300 as i32,
             geki: g.hit_geki as i32,
             katu: g.hit_katu as i32,
-            slider_breaks: g.slider_breaks,
             ..Default::default()
         },
         hit_error_array: std::sync::Arc::clone(&g.hit_error_array),

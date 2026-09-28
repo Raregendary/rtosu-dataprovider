@@ -32,80 +32,22 @@ pub mod calculator {
     use rosu_mods::GameModsLegacy;
     use rosu_pp::any::DifficultyAttributes;
     use rosu_pp::{Beatmap, Difficulty, Performance};
-    use std::collections::{HashMap, HashSet};
+    use std::collections::HashMap;
     use std::sync::{Arc, Mutex, OnceLock};
 
-    /// In-memory cache for gradual difficulty chunks.
-    /// Key: (map_id_or_hash, mods_bits)
-    static CHUNKS_CACHE: OnceLock<Mutex<HashMap<(u64, u32), Arc<Vec<DifficultyAttributes>>>>> =
-        OnceLock::new();
-
-    static IN_PROGRESS: OnceLock<Mutex<HashSet<(u64, u32)>>> = OnceLock::new();
-
-    fn chunks_cache() -> &'static Mutex<HashMap<(u64, u32), Arc<Vec<DifficultyAttributes>>>> {
-        CHUNKS_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-    }
-
-    fn in_progress() -> &'static Mutex<HashSet<(u64, u32)>> {
-        IN_PROGRESS.get_or_init(|| Mutex::new(HashSet::new()))
-    }
-
-    /// Holds a key in `in_progress` for as long as its chunks are being built.
+    /// Whole-map difficulty attributes, keyed by `(map, mods)`.
     ///
-    /// The key is what stops two threads computing the same chunks at once, so
-    /// it has to leave on every exit path: success, a failure to spawn the
-    /// worker, and a panic inside it. A manual insert/remove pair puts that
-    /// burden on every early return, and the spawn already forgot once -- a
-    /// failed spawn left the key behind and pinned that (map, mods) to the
-    /// synchronous fallback for the life of the process. Moving the guard into
-    /// the worker closure covers the success and panic paths, and a failed
-    /// spawn drops the closure, which drops the guard.
+    /// One `Difficulty::calculate` pass, shared. The solo session keeps its own
+    /// copy in `cached_difficulty_attrs` because it has one already for the
+    /// accuracy table; this is for the paths that do not, above all the
+    /// tournament spectator loop, which holds a `&mut` borrow of the session for
+    /// the whole pass and so cannot reach a session-owned cache from inside it.
     ///
-    /// The release profile sets `panic = "abort"`, so in the shipped binary a
-    /// panic takes the process down and this never runs. It still matters in
-    /// the dev and test profiles, which unwind.
-    struct InProgressGuard {
-        key: (u64, u32),
-    }
-
-    impl InProgressGuard {
-        /// Take the key, or `None` when another thread already holds it.
-        ///
-        /// The guard is only ever constructed once the key is actually held.
-        /// Building one unconditionally and discarding it would drop it here,
-        /// while this thread still holds the same non-reentrant mutex.
-        fn acquire(key: (u64, u32)) -> Option<Self> {
-            let mut in_progress = in_progress()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if in_progress.insert(key) {
-                Some(Self { key })
-            } else {
-                None
-            }
-        }
-    }
-
-    impl Drop for InProgressGuard {
-        fn drop(&mut self) {
-            in_progress()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .remove(&self.key);
-        }
-    }
-
-    fn insert_chunks(key: (u64, u32), chunks: Arc<Vec<DifficultyAttributes>>) {
-        let mut cache = chunks_cache()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if cache.len() >= 100 && !cache.contains_key(&key) {
-            if let Some(old_key) = cache.keys().next().copied() {
-                cache.remove(&old_key);
-            }
-        }
-        cache.insert(key, chunks);
-    }
+    /// A tournament puts every client on the same map and mods, so a process-wide
+    /// cache means the pass runs once rather than once per client. The value is a
+    /// single attributes set, not a curve, so there is nothing big to keep.
+    type FullDiffCache = HashMap<(u64, u32), Arc<DifficultyAttributes>>;
+    static FULL_DIFF: OnceLock<Mutex<FullDiffCache>> = OnceLock::new();
 
     fn beatmap_cache_key(map_id: u32, map: &Beatmap) -> u64 {
         if map_id > 0 {
@@ -125,121 +67,195 @@ pub mod calculator {
         }
     }
 
-    /// Synchronously compute difficulty chunks for a given beatmap and mods.
-    pub fn compute_chunks(
-        rosu_map: &Beatmap,
-        mods: GameModsLegacy,
-        chunk_count: usize,
-    ) -> Arc<Vec<DifficultyAttributes>> {
-        let chunk_count = chunk_count.clamp(1, 250);
-        let total_objects = rosu_map.hit_objects.len();
-
-        if chunk_count <= 1 || total_objects == 0 {
-            let full = Difficulty::new().mods(mods).calculate(rosu_map);
-            return Arc::new(vec![full]);
-        }
-
-        let step = (total_objects / chunk_count).max(1);
-        let diff = Difficulty::new().mods(mods);
-        let mut iter = rosu_pp::GradualDifficulty::new(diff, rosu_map);
-        let mut chunks = Vec::with_capacity(chunk_count + 1);
-        let mut last_attrs = None;
-        let mut obj_count = 0;
-
-        while let Some(attrs) = iter.next() {
-            obj_count += 1;
-            if obj_count % step == 0 {
-                chunks.push(attrs.clone());
-            }
-            last_attrs = Some(attrs);
-        }
-
-        if let Some(attrs) = last_attrs {
-            if chunks.is_empty() || obj_count % step != 0 {
-                chunks.push(attrs);
-            }
-        }
-
-        if chunks.is_empty() {
-            let full = Difficulty::new().mods(mods).calculate(rosu_map);
-            chunks.push(full);
-        }
-
-        Arc::new(chunks)
+    /// A forward-only window onto a map's difficulty curve.
+    ///
+    /// `rosu_pp::GradualDifficulty` is an iterator: each `next()` folds exactly
+    /// one more object into the strain state and hands back the attributes for
+    /// the map considered *so far*. Holding it and stepping it as objects are
+    /// actually judged is the intended use.
+    ///
+    /// This replaces a precomputed chunk vector, which precomputed the whole
+    /// curve at map load so it could index it by hit count. That inverted the
+    /// cost in two ways. An untouched map cost as much as a finished one, and on
+    /// a big map it had to go to a worker thread because it blew the poll
+    /// budget -- and `stars.live` then reported exactly `stars.total` on every
+    /// map of 1000 objects or more, because the worker had not finished and the
+    /// placeholder was indistinguishable from a real answer. See
+    /// `the_cursor_reports_a_partial_rating_on_a_map_over_the_old_chunk_ceiling`.
+    ///
+    /// What the step costs is worth being precise about, because it is not the
+    /// constant people assume. `DifficultyValues::eval` re-reads the strain
+    /// peaks accumulated so far, so a step deep into a map costs more than one
+    /// near the start. Measured per judgement, release, on circles a tenth of a
+    /// second apart:
+    ///
+    /// | map size | per judgement | whole walk |
+    /// | -------- | ------------- | ---------- |
+    /// |  1 000   |    73 us      |   60 ms    |
+    /// |  5 000   |   251 us      |  919 ms    |
+    /// | 15 000   |   689 us      | 7.2 s      |
+    /// | 30 000   |  1 651 us     | 32.1 s     |
+    ///
+    /// So a full play costs about what the old precompute cost in total, but
+    /// spread across the objects actually judged instead of paid up front, and
+    /// the value is exact rather than quantised. On the map this was written
+    /// for -- 1035 objects, 176 judged -- that is ~5 ms of CPU for the whole run
+    /// against a 56 ms blocking stall at map load, and a correct number.
+    ///
+    /// tosu is on the same footing: `beatmapPP.currAttributes` is likewise the
+    /// gradual rating at the current position, recomputed as objects are passed.
+    /// Matching it means accepting this cost.
+    ///
+    /// The curve only moves forward, so a retried attempt (the judged count
+    /// going *backwards*) cannot be served from the state built so far.
+    /// `advance_to` rebuilds from the caller's map in that case rather than
+    /// reporting a stale rating, which is why it takes the map rather than
+    /// owning one.
+    pub struct GradualCursor {
+        /// `(map, mods)` this curve was built for. A change means a rebuild.
+        key: (u64, u32),
+        /// Objects folded into `iter` so far. The curve's current position.
+        processed: u32,
+        /// The attributes at `processed`. `next()` returns them by value, and
+        /// the caller wants a borrow it can hold across a later `advance_to`
+        /// on the same object, so the last one is kept.
+        current: Option<DifficultyAttributes>,
+        /// `None` until the first `advance_to`, and after a rebuild starts.
+        iter: Option<rosu_pp::GradualDifficulty>,
     }
 
-    /// Precompute and cache gradual difficulty attributes based on chunk_count (1..=250)
-    pub fn get_or_compute_gradual_chunks(
-        map_id: u32,
-        rosu_map: &Beatmap,
-        mods: GameModsLegacy,
-        chunk_count: usize,
-    ) -> Arc<Vec<DifficultyAttributes>> {
-        let map_key = beatmap_cache_key(map_id, rosu_map);
-        let key = (map_key, mods.bits());
-        let chunk_count = chunk_count.clamp(1, 250);
+    impl GradualCursor {
+        /// A cursor that has folded nothing. The first `advance_to` builds it.
+        pub fn new() -> Self {
+            Self {
+                key: (0, 0),
+                processed: 0,
+                current: None,
+                iter: None,
+            }
+        }
 
-        // 1. Check if already computed
-        {
-            let cache = chunks_cache()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(chunks) = cache.get(&key) {
-                if chunk_count <= 1 || chunks.len() > 1 {
-                    crate::instr_scope!(PpChunksCached);
-                    return chunks.clone();
+        /// Drop the curve. The next `advance_to` rebuilds it from scratch.
+        pub fn clear(&mut self) {
+            *self = Self::new();
+        }
+
+        /// How many objects have been folded in.
+        pub fn processed(&self) -> u32 {
+            self.processed
+        }
+
+        fn build(map: &Beatmap, mods: GameModsLegacy) -> Option<rosu_pp::GradualDifficulty> {
+            let diff = Difficulty::new().mods(mods);
+            rosu_pp::GradualDifficulty::new_with_mode(diff, map, map.mode).ok()
+        }
+
+        /// The attributes for the first `passed` objects, stepping the curve
+        /// forward to reach them.
+        ///
+        /// `passed` is clamped to the map's object count. Returns `None` for an
+        /// empty map or one the ruleset cannot convert, which is the same
+        /// "nothing to report" answer the chunk path gave.
+        pub fn advance_to(
+            &mut self,
+            map_id: u32,
+            map: &Beatmap,
+            mods: GameModsLegacy,
+            passed: u32,
+        ) -> Option<&DifficultyAttributes> {
+            let key = (beatmap_cache_key(map_id, map), mods.bits());
+            let total = map.hit_objects.len() as u32;
+            let target = passed.min(total);
+
+            // A new map, new mods, or a retried attempt all invalidate the
+            // curve: the first two change what is being folded, and the third
+            // asks for a position the curve has already passed.
+            if self.iter.is_none() || self.key != key || self.processed > target {
+                let Some(iter) = Self::build(map, mods) else {
+                    self.clear();
+                    return None;
+                };
+                self.key = key;
+                self.processed = 0;
+                self.current = None;
+                self.iter = Some(iter);
+            }
+
+            while self.processed < target {
+                let next = self.iter.as_mut().and_then(Iterator::next);
+                match next {
+                    Some(attrs) => self.current = Some(attrs),
+                    // The curve ran out before the judged count did, which means
+                    // the count came from a longer map. Nothing left to report.
+                    None => break,
                 }
+                self.processed += 1;
             }
-        }
 
-        // 2. If chunk_count == 1, calculate full map directly in ~5ms without gradual loop
-        if chunk_count <= 1 {
-            let full = Difficulty::new().mods(mods).calculate(rosu_map);
-            let chunks = Arc::new(vec![full]);
-            insert_chunks(key, chunks.clone());
-            return chunks;
+            self.current.as_ref()
         }
+    }
 
-        // 3. For small maps (< 1000 objects), computing is very fast (~20-50ms)
-        let total_objects = rosu_map.hit_objects.len();
-        if total_objects < 1000 {
-            crate::instr_scope!(PpChunksCompute);
-            let chunks = compute_chunks(rosu_map, mods, chunk_count);
-            insert_chunks(key, chunks.clone());
-            return chunks;
-        }
-
-        // 4. For larger maps (marathons, long songs):
-        // Avoid blocking the poll loop! Spawn background task to compute full gradual chunks.
-        if let Some(guard) = InProgressGuard::acquire(key) {
-            let map_clone = rosu_map.clone();
-            // A failed spawn returns the closure in the error, which drops the
-            // guard and releases the key.
-            let _ = std::thread::Builder::new()
-                .name(format!("pp-chunk-{map_id}"))
-                .spawn(move || {
-                    let _guard = guard;
-                    let chunks = compute_chunks(&map_clone, mods, chunk_count);
-                    insert_chunks(key, chunks);
-                });
-        }
-
-        // Check if cache already has a fallback entry
+    /// The difficulty of the whole map under `mods`.
+    ///
+    /// This is what the FC pp and `stats.total` are properties of. It is a
+    /// single O(objects) pass, done once per `(map, mods)`, and it is
+    /// deliberately *not* how `stars.live` is computed -- that is the gradual
+    /// rating at the objects judged so far, which is what `GradualCursor` holds.
+    pub fn full_difficulty(
+        map_id: u32,
+        map: &Beatmap,
+        mods: GameModsLegacy,
+    ) -> Arc<DifficultyAttributes> {
+        let key = (beatmap_cache_key(map_id, map), mods.bits());
+        let cache = FULL_DIFF.get_or_init(|| Mutex::new(HashMap::new()));
         {
-            let cache = chunks_cache()
+            let guard = cache
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if let Some(chunks) = cache.get(&key) {
-                return chunks.clone();
+            if let Some(cached) = guard.get(&key) {
+                return Arc::clone(cached);
             }
         }
-
-        // Temporary fallback while background thread is computing: instant full-map calculation
-        let full = Difficulty::new().mods(mods).calculate(rosu_map);
-        let fallback = Arc::new(vec![full]);
-        insert_chunks(key, fallback.clone());
-        fallback
+        let computed = Arc::new(Difficulty::new().mods(mods).calculate(map));
+        let mut guard = cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if guard.len() >= 16
+            && !guard.contains_key(&key)
+            && let Some(oldest) = guard.keys().next().copied()
+        {
+            guard.remove(&oldest);
+        }
+        guard.insert(key, Arc::clone(&computed));
+        computed
     }
+
+    impl Default for GradualCursor {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    // SAFETY: `rosu_pp::GradualDifficulty` holds `Rc<RefCell<..>>` in its taiko
+    // and mania variants, so it is neither `Send` nor `Sync`, and a struct
+    // wrapping it cannot be `Send` without this assertion. `OsuReader` is
+    // required to be `Send` (`reader::tests::the_reader_can_be_moved_to_another_thread`)
+    // and it owns both sessions, so without it the whole change is unbuildable.
+    //
+    // The assertion rests on the `Rc`s never being *shared*:
+    //
+    // * every cursor method takes `&mut self`, and a session is polled through
+    //   `&mut`, so at most one thread holds a given curve at a time;
+    // * the one place a cursor legitimately crosses a thread boundary is the
+    //   init scope in `TournamentSession::poll`, whose workers *construct* client
+    //   states and hand them to the poll thread. A freshly constructed cursor has
+    //   no curve yet, and moving a value that was never shared between threads is
+    //   sound -- it is cloning a live `Rc` across threads that is not.
+    //
+    // If a session is ever driven concurrently from two threads, this stops
+    // being true and this impl has to be replaced with real synchronisation.
+    unsafe impl Send for GradualCursor {}
 
     /// Extract aim, speed, accuracy, flashlight, and total PP into PpBreakdown
     pub fn extract_pp_breakdown(attrs: &rosu_pp::any::PerformanceAttributes) -> PpBreakdown {
@@ -325,41 +341,21 @@ pub mod calculator {
         }
     }
 
-    pub fn calc_live_pp_from_chunks(
-        chunks: &[DifficultyAttributes],
-        mods: GameModsLegacy,
-        combo: u32,
-        n300: u32,
-        n100: u32,
-        n50: u32,
-        n0: u32,
-    ) -> f32 {
-        let passed = n300 + n100 + n50 + n0;
-        if passed == 0 || chunks.is_empty() {
-            return 0.0;
-        }
-
-        let chunk_idx = ((passed.saturating_sub(1) / 10) as usize).min(chunks.len() - 1);
-        let attrs = &chunks[chunk_idx];
-
-        let pp = Performance::new(attrs.clone())
-            .mods(mods)
-            .combo(combo)
-            .n300(n300)
-            .n100(n100)
-            .n50(n50)
-            .misses(n0)
-            .passed_objects(passed)
-            .calculate()
-            .pp();
-
-        pp as f32
-    }
-
-    /// Calculate full live PP result including FC PP and detailed attribute breakdowns
+    /// Calculate full live PP result including FC PP and detailed attribute breakdowns.
+    ///
+    /// `live_attrs` is the gradual rating at the objects judged so far, from
+    /// `GradualCursor`; `full_attrs` is the whole-map difficulty the session
+    /// already caches for `beatmap.stats.stars.total` and the accuracy table.
+    /// Splitting them is what makes the FC honest: it is a property of the
+    /// entire map, so it must not be read off whatever partial rating happened
+    /// to be current.
+    ///
+    /// `live_attrs` is `None` when nothing is judged yet, which is every tick
+    /// outside a play: `current` is then 0 and the FC is still real, matching
+    /// tosu's zeroed-current-against-a-real-fc shape in song select.
     pub fn calc_detailed_live_and_fc_pp(
-        chunks: &[DifficultyAttributes],
-        total_objects: usize,
+        live_attrs: Option<&DifficultyAttributes>,
+        full_attrs: &DifficultyAttributes,
         mods: GameModsLegacy,
         combo: u32,
         n300: u32,
@@ -368,10 +364,7 @@ pub mod calculator {
         n0: u32,
     ) -> LivePpResult {
         crate::instr_scope!(PpLive);
-        let Some(last_attrs) = chunks.last() else {
-            return LivePpResult::default();
-        };
-        let fc_perf = Performance::new(last_attrs.clone())
+        let fc_perf = Performance::new(full_attrs.clone())
             .mods(mods)
             .accuracy(100.0)
             .misses(0)
@@ -380,7 +373,7 @@ pub mod calculator {
         let fc_total = crate::beatmap::round_value(fc_perf.pp() as f32, 2);
 
         let passed = n300 + n100 + n50 + n0;
-        if passed == 0 {
+        let Some(live_attrs) = live_attrs.filter(|_| passed > 0) else {
             return LivePpResult {
                 current: 0.0,
                 fc: fc_total,
@@ -391,15 +384,7 @@ pub mod calculator {
                     fc: fc_breakdown,
                 },
             };
-        }
-
-        let chunk_idx = if chunks.len() <= 1 || total_objects == 0 {
-            0
-        } else {
-            let passed_usize = passed as usize;
-            ((passed_usize * (chunks.len() - 1)) / total_objects).min(chunks.len() - 1)
         };
-        let live_attrs = &chunks[chunk_idx];
 
         let live_perf = Performance::new(live_attrs.clone())
             .mods(mods)
@@ -425,18 +410,13 @@ pub mod calculator {
         }
     }
 
-    /// Extract live star rating based on passed object count
-    pub fn live_stars_from_chunks(
-        chunks: &[DifficultyAttributes],
-        total_objects: usize,
-        passed_objects: u32,
-    ) -> f32 {
-        if chunks.is_empty() || total_objects == 0 || passed_objects == 0 {
-            return 0.0;
-        }
-        let passed_usize = passed_objects as usize;
-        let chunk_idx = ((passed_usize * (chunks.len() - 1)) / total_objects).min(chunks.len() - 1);
-        crate::beatmap::round_value(chunks[chunk_idx].stars() as f32, 2)
+    /// tosu's `beatmap.stats.stars.live` (`buildResultV2.ts:819`) is
+    /// `beatmapPP.currAttributes.stars` -- the *gradual* rating of the objects
+    /// passed so far, not the whole map. That is precisely the cursor's current
+    /// attributes, so there is nothing left to index: the value is whatever the
+    /// curve says at `passed`, to two decimals like every other star value.
+    pub fn live_stars(attrs: &DifficultyAttributes) -> f32 {
+        crate::beatmap::round_value(attrs.stars() as f32, 2)
     }
 
     /// Parse legacy bitmask into GameModsLegacy
@@ -462,49 +442,6 @@ pub mod calculator {
         use super::*;
 
         #[test]
-        fn test_zero_passed_objects_returns_zero_pp() {
-            let chunks = vec![];
-            let pp = calc_live_pp_from_chunks(&chunks, GameModsLegacy::default(), 0, 0, 0, 0, 0);
-            assert_eq!(pp, 0.0);
-        }
-
-        /// The in-progress key has to leave on every exit path, or that
-        /// `(map, mods)` is pinned to the synchronous fallback for the life of
-        /// the process. The guard is what makes that automatic, and this pins
-        /// both halves of its contract: a second acquire is refused while the
-        /// first is held, and dropping it releases the key.
-        ///
-        /// The keys are unique per test because `in_progress` is a process-wide
-        /// static and the test harness runs tests in parallel.
-        #[test]
-        fn the_in_progress_guard_releases_its_key_on_drop() {
-            let key = (0xfeed_face_0000_0001, 4);
-            let held = InProgressGuard::acquire(key).expect("first acquire takes the key");
-            assert!(
-                InProgressGuard::acquire(key).is_none(),
-                "a second acquire must be refused while the key is held"
-            );
-            drop(held);
-            assert!(
-                InProgressGuard::acquire(key).is_some(),
-                "dropping the guard must release the key"
-            );
-        }
-
-        /// The original defect: a failed `spawn` dropped the closure but not the
-        /// key, because the key was removed by hand inside the closure that
-        /// never ran. Dropping the guard from a scope that never spawns models
-        /// that path without needing the spawn to actually fail.
-        #[test]
-        fn a_worker_that_never_starts_still_releases_the_key() {
-            let key = (0xfeed_face_0000_0002, 8);
-            {
-                let _guard = InProgressGuard::acquire(key).expect("acquire takes the key");
-            }
-            assert!(InProgressGuard::acquire(key).is_some());
-        }
-
-        #[test]
         fn test_mod_parsing() {
             let hdhr = parse_legacy_mods("HDHR");
             assert!(hdhr.contains(GameModsLegacy::Hidden));
@@ -522,96 +459,51 @@ pub mod calculator {
             assert_eq!(v2.bits(), 0);
         }
 
-        #[test]
-        fn test_gradual_chunk_progression() {
+        fn circle_map(objects: usize) -> Beatmap {
             let mut map_content = String::from(
                 "osu file format v14\n\n[General]\nMode: 0\n\n[Metadata]\nTitle:Test\nArtist:Test\nCreator:Test\nVersion:Normal\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\nSliderMultiplier:1.4\nSliderTickRate:1\n\n[TimingPoints]\n0,500,4,2,0,50,1,0\n\n[HitObjects]\n",
             );
-            for i in 0..25 {
-                let time = 1000 + i * 200;
-                map_content.push_str(&format!("256,192,{},1,0,0:0:0:0:\n", time));
-            }
-
-            let beatmap = Beatmap::from_bytes(map_content.as_bytes()).expect("parse map");
-            let mods = GameModsLegacy::default();
-
-            // 1. Test chunk_count = 1 (single chunk / no gradual)
-            let chunks_single = get_or_compute_gradual_chunks(99999, &beatmap, mods, 1);
-            assert_eq!(chunks_single.len(), 1);
-
-            // 2. Test gradual chunk calculation
-            let chunks = get_or_compute_gradual_chunks(12345, &beatmap, mods, 5);
-            assert!(chunks.len() >= 4);
-
-            let detailed_0 = calc_detailed_live_and_fc_pp(&chunks, 25, mods, 0, 0, 0, 0, 0);
-            assert_eq!(detailed_0.current, 0.0);
-            assert!(detailed_0.fc > 0.0);
-            assert!(detailed_0.detailed.fc.aim > 0.0 || detailed_0.detailed.fc.accuracy > 0.0);
-
-            let detailed_25 = calc_detailed_live_and_fc_pp(&chunks, 25, mods, 25, 25, 0, 0, 0);
-            assert!(detailed_25.current > 0.0);
-            assert_eq!(detailed_25.current, detailed_25.fc);
-        }
-
-        /// The live star rating is quantised to `gradual_pp_chunks` buckets, so
-        /// early in a map it reports the difficulty of a whole bucket rather than
-        /// of the objects actually judged. That is inherent to the design, but it
-        /// has a consequence worth pinning: at a low object count the reported
-        /// value can be the *full* map rating.
-        ///
-        /// Measured live on map 2964306 with 16 of 604 objects judged, rtosu
-        /// reported `stars.live` 6.06 against tosu's 2.42 -- and 6.06 was
-        /// `stars.total` exactly, which is what a one-element chunk vector
-        /// produces. The key is `(map, mods)` and does not include the chunk
-        /// count, so a cached single-chunk result is possible in principle; the
-        /// cache read at :183 refuses a one-element entry, so this asserts the
-        /// arithmetic instead, which is the part that can silently collapse.
-        #[test]
-        fn the_live_star_rating_is_never_the_full_rating_while_objects_remain() {
-            let mut map_content = String::from(
-                "osu file format v14\n\n[General]\nMode: 0\n\n[Metadata]\nTitle:Test\nArtist:Test\nCreator:Test\nVersion:Normal\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\nSliderMultiplier:1.4\nSliderTickRate:1\n\n[TimingPoints]\n0,500,4,2,0,50,1,0\n\n[HitObjects]\n",
-            );
-            // 200 circles, a tenth of a second apart.
-            for i in 0..200 {
+            for i in 0..objects as u32 {
                 map_content.push_str(&format!("256,192,{},1,0,0:0:0:0:\n", 1000 + i * 100));
             }
+            Beatmap::from_bytes(map_content.as_bytes()).expect("parse map")
+        }
 
-            let beatmap = Beatmap::from_bytes(map_content.as_bytes()).expect("parse map");
+        #[test]
+        fn the_cursor_reports_the_rating_of_the_objects_actually_judged() {
+            let beatmap = circle_map(200);
             let mods = GameModsLegacy::default();
             let total_objects = beatmap.hit_objects.len();
             assert_eq!(total_objects, 200);
 
             let full = Difficulty::new().calculate(&beatmap).stars();
-            let chunks = compute_chunks(&beatmap, mods, 100);
-            assert!(
-                chunks.len() > 1,
-                "a 200-object map at 100 chunks must produce a real vector, got {}",
-                chunks.len()
-            );
+            assert!(full > 0.0);
 
-            // The chunk actually selected for a handful of judged objects, and
-            // the value it holds.
+            let mut cursor = GradualCursor::new();
             let judged = 16u32;
-            let chunk_idx =
-                ((judged as usize * (chunks.len() - 1)) / total_objects).min(chunks.len() - 1);
-            let selected = chunks[chunk_idx].stars();
-            let reported = live_stars_from_chunks(&chunks, total_objects, judged);
+            let at_start = cursor
+                .advance_to(7, &beatmap, mods, judged)
+                .map(live_stars)
+                .expect("attributes at 16 objects");
+            assert_eq!(cursor.processed(), judged);
 
-            assert_eq!(crate::beatmap::round_value(selected as f32, 2), reported);
-            // The point of the test: 16 of 200 objects is nowhere near the whole
-            // map, so the bucket must not be the final one.
+            let mut cursor2 = GradualCursor::new();
+            let at_half = cursor2
+                .advance_to(7, &beatmap, mods, 100)
+                .map(live_stars)
+                .expect("attributes at 100 objects");
+            let at_end = cursor2
+                .advance_to(7, &beatmap, mods, total_objects as u32)
+                .map(live_stars)
+                .expect("attributes at the last object");
+
+            // The point of this test: 16 of 200 objects is nowhere near the whole
+            // map, so the value must be the difficulty of *those* objects, not of
+            // a whole bucket and above all not of the map.
             assert!(
-                chunk_idx < chunks.len() - 1,
-                "16/200 objects selected the last chunk ({chunk_idx} of {})",
-                chunks.len()
+                at_start < full as f32,
+                "16/200 objects reported {at_start}, which is the full rating {full}"
             );
-
-            // And the live value must track progress, rising toward the full
-            // rating -- a value pinned at `full` for the whole run is the
-            // failure mode this pins.
-            let at_start = live_stars_from_chunks(&chunks, total_objects, judged);
-            let at_half = live_stars_from_chunks(&chunks, total_objects, 100);
-            let at_end = live_stars_from_chunks(&chunks, total_objects, total_objects as u32);
             assert!(at_start < at_half, "{at_start} should be below {at_half}");
             assert!(at_half < at_end, "{at_half} should be below {at_end}");
             assert!(
@@ -620,21 +512,231 @@ pub mod calculator {
             );
         }
 
-        /// `passed_objects == 0` has to read as 0 stars, not as the first chunk.
-        /// The early-return at the top of `live_stars_from_chunks` covers it, and
-        /// this pins that the guard is there -- without it a play state with
-        /// nothing judged yet would report a nonzero difficulty.
+        /// The regression this whole design exists to close.
+        ///
+        /// `get_or_compute_gradual_chunks` computed the curve synchronously
+        /// below 1000 objects and handed a one-element placeholder above it,
+        /// which `live_stars_from_chunks` could not tell from a real
+        /// single-chunk answer -- so `stars.live` collapsed to `stars.total` on
+        /// every map of 1000 objects or more, and the value latched because the
+        /// poll loop only recomputed when a judgement changed.
+        ///
+        /// Measured live on map 4390203 (1035 objects, 176 judged) with tosu on
+        /// :24050: rtosu reported `stars.live` 6.05 against tosu's 5.37, and
+        /// 6.05 was `stars.total` exactly. The same failure is on record for
+        /// map 2964306 at 6.06 vs 2.42.
+        ///
+        /// There is no size threshold left to cross, so this pins the value at
+        /// both sides of where it used to be.
+        #[test]
+        fn the_cursor_reports_a_partial_rating_on_a_map_over_the_old_chunk_ceiling() {
+            let mods = GameModsLegacy::default();
+
+            for objects in [999usize, 1035] {
+                let beatmap = circle_map(objects);
+                let full = Difficulty::new().calculate(&beatmap).stars();
+                assert!(full > 0.0);
+
+                let mut cursor = GradualCursor::new();
+                let judged = (objects as u32) / 6;
+                let partial = cursor
+                    .advance_to(4242, &beatmap, mods, judged)
+                    .map(live_stars)
+                    .unwrap_or(0.0);
+
+                assert!(
+                    partial < full as f32,
+                    "{objects} objects, {judged} judged: reported {partial}, which is \
+                     the full rating {full} -- the value collapsed"
+                );
+                assert!(
+                    partial > 0.0,
+                    "{objects} objects, {judged} judged: reported {partial}, which \
+                     claims the played objects have no difficulty at all"
+                );
+            }
+        }
+
+        /// The cursor carries its state, so a play pays for the objects it
+        /// actually judges and not for the whole map up front -- which is the
+        /// property the chunk design could not have: it had to precompute the
+        /// entire curve to be able to index it.
+        ///
+        /// Pinned behaviourally, because a timing assertion would be flaky:
+        /// stepping one object at a time has to land on exactly the same curve
+        /// as jumping straight there, which is only true if the state really is
+        /// carried rather than recomputed.
+        #[test]
+        fn the_cursor_folds_each_object_once_and_carries_its_state_forward() {
+            let beatmap = circle_map(60);
+            let mods = GameModsLegacy::default();
+            let total = beatmap.hit_objects.len() as u32;
+
+            let mut stepwise = GradualCursor::new();
+            let mut direct = GradualCursor::new();
+            for object in 1..=total {
+                let stepped = stepwise
+                    .advance_to(11, &beatmap, mods, object)
+                    .map(live_stars)
+                    .expect("stepped");
+                assert_eq!(stepwise.processed(), object);
+                let jumped = direct
+                    .advance_to(11, &beatmap, mods, object)
+                    .map(live_stars)
+                    .expect("direct");
+                assert_eq!(
+                    stepped, jumped,
+                    "stepping to {object} one at a time must equal jumping there"
+                );
+            }
+
+            // Asking for the same position again must not advance the curve, or
+            // a paused game would keep folding objects that were never judged.
+            let before = stepwise.processed();
+            let _ = stepwise.advance_to(11, &beatmap, mods, total);
+            assert_eq!(stepwise.processed(), before);
+        }
+
+        /// A retried attempt sends the judged count *backwards*, and a
+        /// forward-only curve cannot answer that from the state it has built.
+        /// It has to restart rather than report a rating for a position the play
+        /// has already left.
+        #[test]
+        fn a_retry_restarts_the_curve_instead_of_reporting_a_stale_rating() {
+            let beatmap = circle_map(80);
+            let mods = GameModsLegacy::default();
+            let full = Difficulty::new().calculate(&beatmap).stars();
+
+            let mut cursor = GradualCursor::new();
+            let deep = cursor
+                .advance_to(5, &beatmap, mods, 70)
+                .map(live_stars)
+                .expect("deep into the map");
+            assert_eq!(cursor.processed(), 70);
+            assert!(deep > 0.0);
+
+            // Retry: the count goes back to near zero.
+            let restarted = cursor
+                .advance_to(5, &beatmap, mods, 3)
+                .map(live_stars)
+                .expect("after the retry");
+            assert_eq!(cursor.processed(), 3);
+
+            // A fresh cursor at the same position must agree, or the restart
+            // silently served a rating from the abandoned attempt.
+            let mut fresh = GradualCursor::new();
+            let expected = fresh
+                .advance_to(5, &beatmap, mods, 3)
+                .map(live_stars)
+                .expect("fresh");
+            assert_eq!(restarted, expected);
+            assert_ne!(deep, restarted, "the abandoned attempt's rating survived");
+            assert!((full as f32 - restarted) > 0.0);
+        }
+
+        /// Changing mods has to invalidate the curve: the attributes it holds
+        /// are for the mods it was built with.
+        #[test]
+        fn changing_mods_rebuilds_the_curve() {
+            let beatmap = circle_map(120);
+            let nm = GameModsLegacy::default();
+            let dt = GameModsLegacy::DoubleTime;
+
+            let mut cursor = GradualCursor::new();
+            let at_nm = cursor
+                .advance_to(77, &beatmap, nm, 60)
+                .map(live_stars)
+                .expect("NM");
+            let at_dt = cursor
+                .advance_to(77, &beatmap, dt, 60)
+                .map(live_stars)
+                .expect("DT");
+            assert_ne!(at_nm, at_dt, "DoubleTime must not report the NoMod rating");
+
+            // And back again, at the same position on the same map.
+            let back_to_nm = cursor
+                .advance_to(77, &beatmap, nm, 60)
+                .map(live_stars)
+                .expect("NM again");
+            assert_eq!(back_to_nm, at_nm);
+        }
+
+        /// `passed == 0` has to read as 0 stars, not as the first object's
+        /// difficulty. Without the guard, a play state with nothing judged yet
+        /// reports a nonzero rating, and song select reports one too.
         #[test]
         fn no_objects_judged_reads_as_zero_stars() {
-            let chunks = vec![Difficulty::new().calculate(
-                &Beatmap::from_bytes(
-                    b"osu file format v14\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\n\n[TimingPoints]\n0,500,4,1,0\n\n[HitObjects]\n256,192,1000,1,0,0:0:0:0:\n"
-                )
-                .expect("parse"),
-            )];
-            assert_eq!(live_stars_from_chunks(&chunks, 1, 0), 0.0);
-            assert_eq!(live_stars_from_chunks(&[], 100, 50), 0.0);
-            assert_eq!(live_stars_from_chunks(&chunks, 0, 50), 0.0);
+            let beatmap = circle_map(50);
+            let mods = GameModsLegacy::default();
+            let mut cursor = GradualCursor::new();
+
+            assert_eq!(
+                cursor.advance_to(1, &beatmap, mods, 0).map(live_stars),
+                None
+            );
+            assert_eq!(cursor.processed(), 0);
+
+            // A map with no objects at all has no curve to walk.
+            let empty = circle_map(0);
+            let mut cursor2 = GradualCursor::new();
+            assert_eq!(
+                cursor2.advance_to(1, &empty, mods, 10).map(live_stars),
+                None
+            );
+
+            // And a judged count past the end clamps to the last object rather
+            // than running off it.
+            let mut cursor3 = GradualCursor::new();
+            let clamped = cursor3
+                .advance_to(1, &beatmap, mods, 9_999)
+                .map(live_stars)
+                .expect("clamped");
+            assert_eq!(cursor3.processed(), 50);
+            let full = Difficulty::new().calculate(&beatmap).stars();
+            assert!((clamped - full as f32).abs() < 0.01);
+        }
+
+        #[test]
+        fn the_fc_is_a_property_of_the_whole_map_not_of_the_partial_rating() {
+            let beatmap = circle_map(120);
+            let mods = GameModsLegacy::default();
+            let total_objects = beatmap.hit_objects.len();
+            let full_attrs = Difficulty::new().mods(mods).calculate(&beatmap);
+
+            let mut cursor = GradualCursor::new();
+            let live_attrs = cursor
+                .advance_to(3, &beatmap, mods, 20)
+                .expect("partial attributes");
+
+            // Nothing judged: current is zero, fc is real.
+            let nothing = calc_detailed_live_and_fc_pp(None, &full_attrs, mods, 0, 0, 0, 0, 0);
+            assert_eq!(nothing.current, 0.0);
+            assert!(nothing.fc > 0.0);
+
+            // Part way: both real, and the FC is the same number either way --
+            // it is not read off the partial rating.
+            let partial =
+                calc_detailed_live_and_fc_pp(Some(live_attrs), &full_attrs, mods, 20, 20, 0, 0, 0);
+            assert!(partial.current > 0.0);
+            assert_eq!(partial.fc, nothing.fc);
+            assert_eq!(partial.max_achievable, nothing.fc);
+
+            // Fully judged: current has caught the FC.
+            let mut cursor2 = GradualCursor::new();
+            let end_attrs = cursor2
+                .advance_to(3, &beatmap, mods, total_objects as u32)
+                .expect("final attributes");
+            let complete = calc_detailed_live_and_fc_pp(
+                Some(end_attrs),
+                &full_attrs,
+                mods,
+                total_objects as u32,
+                total_objects as u32,
+                0,
+                0,
+                0,
+            );
+            assert_eq!(complete.current, complete.fc);
         }
 
         #[test]

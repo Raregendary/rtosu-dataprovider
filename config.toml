@@ -76,14 +76,10 @@ auto_mode = true
 enable_chat = true
 
 # Enable real-time gradual PP calculation.
+# The live rating is walked incrementally as objects are judged, so this costs
+# nothing up front and there is no checkpoint count to tune.
 # Default: true
 enable_pp = true
-
-# Number of gradual PP checkpoints per beatmap.
-# Range: 1 to 250
-# Default: 100
-# Set to 1 to only compute full-map difficulty (disables gradual live PP resolution for ultra-low CPU).
-gradual_pp_chunks = 100
 
 # Include the full hit error array in the JSON packet (packet.play.hitErrorArray).
 # When set to false, hitErrorArray is sent as an empty array [] to save network bandwidth

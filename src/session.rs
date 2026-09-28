@@ -77,6 +77,12 @@ pub struct CachedClientState {
     pub cached_hit_errors: Arc<[i16]>,
     pub cached_unstable_rate: f64,
     pub cached_gameplay: Option<GameplayState>,
+    /// The live difficulty curve for this client's play. Per client, because
+    /// each one is at a different point in the same map and the curve only
+    /// moves forward: sharing one would make a client that is behind rebuild it
+    /// on every tick.
+    #[cfg(feature = "pp")]
+    pub gradual_cursor: crate::pp::calculator::GradualCursor,
     pub cached_beatmap_ptr: u64,
     /// Difficulty id of the map behind `cached_beatmap_snapshot`, so a map swap
     /// that reuses the same beatmap object is still noticed.
@@ -97,7 +103,6 @@ pub struct TournamentSession {
     last_proc_scan: Instant,
     pub enable_chat: bool,
     pub enable_pp: bool,
-    pub gradual_pp_chunks: usize,
     pub enable_hit_errors: bool,
     pub current_checksum: String,
     #[cfg(feature = "pp")]
@@ -142,7 +147,6 @@ impl TournamentSession {
             last_proc_scan: Instant::now() - std::time::Duration::from_secs(10),
             enable_chat: true,
             enable_pp: true,
-            gradual_pp_chunks: 100,
             enable_hit_errors: true,
             current_checksum: String::new(),
             #[cfg(feature = "pp")]
@@ -184,19 +188,33 @@ impl TournamentSession {
                 let next = AtomicUsize::new(0);
                 let initialized = Mutex::new(Vec::new());
 
+                // Captured by the worker closures instead of `&self`: a client
+                // state holds a `GradualCursor`, which is `Send` and not `Sync`,
+                // so `&self` in a scoped closure would fail to compile. These
+                // three are all `Sync` and are all `init_process_with` needs.
+                let profile = self.profile.clone();
+                let pointer_width = self.pointer_width;
+                let scan_limit_bytes = self.scan_limit_bytes;
+
                 std::thread::scope(|scope| {
                     for _ in 0..worker_count {
                         let next = &next;
                         let pids = &pids_to_init;
                         let initialized = &initialized;
-                        scope.spawn(|| {
+                        let profile = &profile;
+                        scope.spawn(move || {
                             loop {
                                 let idx = next.fetch_add(1, Ordering::Relaxed);
                                 if idx >= pids.len() {
                                     break;
                                 }
                                 let pid = pids[idx];
-                                match self.init_process(pid) {
+                                match TournamentSession::init_process_with(
+                                    pid,
+                                    profile,
+                                    pointer_width,
+                                    scan_limit_bytes,
+                                ) {
                                     Ok(state) => initialized
                                         .lock()
                                         .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -651,13 +669,6 @@ impl TournamentSession {
                             .as_ref()
                             .map(|g| crate::pp::calculator::parse_mods_bits(g.mods))
                             .unwrap_or_else(|| rosu_mods::GameModsLegacy::default());
-                        let total_objects = map.hit_objects.len();
-                        let chunks = crate::pp::calculator::get_or_compute_gradual_chunks(
-                            beatmap.as_ref().map_or(0, |b| b.id as u32),
-                            map,
-                            mods_legacy,
-                            self.gradual_pp_chunks,
-                        );
                         let (combo, n300, n100, n50, n0) = gameplay
                             .as_ref()
                             .map(|g| {
@@ -670,26 +681,37 @@ impl TournamentSession {
                                 )
                             })
                             .unwrap_or((0, 0, 0, 0, 0));
-                        let pp = crate::pp::calculator::calc_detailed_live_and_fc_pp(
-                            &chunks,
-                            total_objects,
+                        let total_hits = n300 + n100 + n50 + n0;
+                        let map_id = beatmap.as_ref().map_or(0, |b| b.id as u32);
+                        // `full_difficulty` rather than a session field: the loop
+                        // holds `&mut self.clients`, so a `&mut self` accessor is
+                        // unreachable from in here. The cache makes it once per
+                        // (map, mods) for the whole process, not once per client.
+                        let full = crate::pp::calculator::full_difficulty(map_id, map, mods_legacy);
+                        // The curve belongs to the client, not the session: each
+                        // one is at a different point in the same map, and a shared
+                        // forward-only cursor would make the ones that are behind
+                        // rebuild it on every tick.
+                        let live_attrs =
+                            client
+                                .gradual_cursor
+                                .advance_to(map_id, map, mods_legacy, total_hits);
+                        let live_stars = live_attrs
+                            .map(crate::pp::calculator::live_stars)
+                            .unwrap_or(0.0);
+                        if let Some(b) = beatmap.as_mut() {
+                            b.stats.stars.live = live_stars;
+                        }
+                        Some(crate::pp::calculator::calc_detailed_live_and_fc_pp(
+                            live_attrs,
+                            &full,
                             mods_legacy,
                             combo,
                             n300,
                             n100,
                             n50,
                             n0,
-                        );
-                        let total_hits = n300 + n100 + n50 + n0;
-                        let live_stars = crate::pp::calculator::live_stars_from_chunks(
-                            &chunks,
-                            total_objects,
-                            total_hits,
-                        );
-                        if let Some(b) = beatmap.as_mut() {
-                            b.stats.stars.live = live_stars;
-                        }
-                        Some(pp)
+                        ))
                     } else {
                         None
                     }
@@ -859,8 +881,26 @@ impl TournamentSession {
         })
     }
 
-    fn init_process(&self, pid: u32) -> Result<CachedClientState> {
-        let memory = ProcessMemory::open_with_pointer_size(pid, self.pointer_width)?;
+    /// Build the cached state for one tournament client process.
+    ///
+    /// An associated function taking its inputs rather than a `&self` method, and
+    /// that is the point. `TournamentSession::poll` builds client states on a
+    /// pool of scoped threads, and a scoped closure has to be `Send`, so a
+    /// `&self` capture would require `TournamentSession: Sync` -- and with it
+    /// every field. A client state carries a `GradualCursor`, which is `Send`
+    /// but deliberately not `Sync` (see the `unsafe impl` on it in
+    /// `pp::calculator`), so the session can no longer be `Sync` now that a play
+    /// can hold a live curve. Everything needed here is `Sync`, so passing it in
+    /// keeps the scope off the session entirely and the assertion down to one
+    /// `Send`.
+    #[allow(clippy::too_many_arguments)]
+    fn init_process_with(
+        pid: u32,
+        profile: &crate::profile::ClientProfile,
+        pointer_width: Option<usize>,
+        scan_limit_bytes: usize,
+    ) -> Result<CachedClientState> {
+        let memory = ProcessMemory::open_with_pointer_size(pid, pointer_width)?;
         let command_line = memory.command_line().unwrap_or_default();
         let spectate_info = parse_spectate_client_arg(&command_line);
         let ipc_id = spectate_info.map(|(id, _)| id);
@@ -869,17 +909,14 @@ impl TournamentSession {
 
         // Scan rulesets_addr pattern to find container pointer address
         let ruleset_container_addr =
-            crate::client::resolve_ruleset_container(&memory, &self.profile, self.scan_limit_bytes)
-                .ok();
+            crate::client::resolve_ruleset_container(&memory, profile, scan_limit_bytes).ok();
 
         // If spectator, scan spectating_user_ptr
         let mut spectating_user_pattern_addr = None;
         if is_spectator || !is_manager {
-            if let Ok((user_pat_src, user_pat_off)) = self.profile.pattern("spectating_user_ptr") {
+            if let Ok((user_pat_src, user_pat_off)) = profile.pattern("spectating_user_ptr") {
                 if let Ok(user_pat) = BytePattern::parse(user_pat_src) {
-                    if let Ok(matches) =
-                        memory.scan_pattern(&user_pat, None, 1, self.scan_limit_bytes)
-                    {
+                    if let Ok(matches) = memory.scan_pattern(&user_pat, None, 1, scan_limit_bytes) {
                         if let Some(&first) = matches.first() {
                             if let Ok(addr) = checked_add_signed(first, user_pat_off) {
                                 spectating_user_pattern_addr = Some(addr);
@@ -893,12 +930,9 @@ impl TournamentSession {
         // If manager, scan tournament_chat_engine
         let mut chat_engine_pattern_addr = None;
         if is_manager || !is_spectator {
-            if let Ok((chat_pat_src, chat_pat_off)) = self.profile.pattern("tournament_chat_engine")
-            {
+            if let Ok((chat_pat_src, chat_pat_off)) = profile.pattern("tournament_chat_engine") {
                 if let Ok(chat_pat) = BytePattern::parse(chat_pat_src) {
-                    if let Ok(matches) =
-                        memory.scan_pattern(&chat_pat, None, 1, self.scan_limit_bytes)
-                    {
+                    if let Ok(matches) = memory.scan_pattern(&chat_pat, None, 1, scan_limit_bytes) {
                         if let Some(&first) = matches.first() {
                             if let Ok(addr) = checked_add_signed(first, chat_pat_off) {
                                 chat_engine_pattern_addr = Some(addr);
@@ -908,55 +942,54 @@ impl TournamentSession {
                 }
             }
         }
-        let base_pattern_addr =
-            self.profile
-                .pattern("base_addr")
-                .ok()
-                .and_then(|(source, offset)| {
-                    find_pattern(&memory, source, offset, self.scan_limit_bytes).ok()
-                });
+        let base_pattern_addr = profile
+            .pattern("base_addr")
+            .ok()
+            .and_then(|(source, offset)| {
+                find_pattern(&memory, source, offset, scan_limit_bytes).ok()
+            });
         let play_time_pattern_addr =
-            self.profile
+            profile
                 .pattern("play_time_addr")
                 .ok()
                 .and_then(|(source, offset)| {
-                    find_pattern(&memory, source, offset, self.scan_limit_bytes).ok()
+                    find_pattern(&memory, source, offset, scan_limit_bytes).ok()
                 });
         let audio_length_pattern_addr =
-            self.profile
+            profile
                 .pattern("get_audio_length_ptr")
                 .ok()
                 .and_then(|(source, offset)| {
-                    find_pattern(&memory, source, offset, self.scan_limit_bytes).ok()
+                    find_pattern(&memory, source, offset, scan_limit_bytes).ok()
                 });
         let game_time_pattern_addr =
-            self.profile
+            profile
                 .pattern("game_time_ptr")
                 .ok()
                 .and_then(|(source, offset)| {
-                    find_pattern(&memory, source, offset, self.scan_limit_bytes).ok()
+                    find_pattern(&memory, source, offset, scan_limit_bytes).ok()
                 });
         let skin_pattern_addr =
-            self.profile
+            profile
                 .pattern("skin_data_addr")
                 .ok()
                 .and_then(|(source, offset)| {
-                    find_pattern(&memory, source, offset, self.scan_limit_bytes).ok()
+                    find_pattern(&memory, source, offset, scan_limit_bytes).ok()
                 });
         let user_profile_pattern_addr =
-            self.profile
+            profile
                 .pattern("user_profile_ptr")
                 .ok()
                 .and_then(|(source, offset)| {
-                    find_pattern(&memory, source, offset, self.scan_limit_bytes).ok()
+                    find_pattern(&memory, source, offset, scan_limit_bytes).ok()
                 });
-        let raw_login_status_pattern_addr = self
-            .profile
-            .pattern("raw_login_status_ptr")
-            .ok()
-            .and_then(|(source, offset)| {
-                find_pattern(&memory, source, offset, self.scan_limit_bytes).ok()
-            });
+        let raw_login_status_pattern_addr =
+            profile
+                .pattern("raw_login_status_ptr")
+                .ok()
+                .and_then(|(source, offset)| {
+                    find_pattern(&memory, source, offset, scan_limit_bytes).ok()
+                });
         let (game_folder, songs_folder) = memory
             .process_image_path()
             .ok()
@@ -995,6 +1028,8 @@ impl TournamentSession {
             cached_hit_errors: Arc::default(),
             cached_unstable_rate: 0.0,
             cached_gameplay: None,
+            #[cfg(feature = "pp")]
+            gradual_cursor: crate::pp::calculator::GradualCursor::new(),
             cached_beatmap_ptr: 0,
             cached_beatmap_id: 0,
             cached_beatmap_snapshot: None,
@@ -1055,6 +1090,7 @@ fn performance_graph(
     let mut aim_no_sliders = Vec::new();
     let mut speed = Vec::new();
     let mut flashlight = Vec::new();
+    let mut reading = Vec::new();
     let has_flashlight_mod = (mods & mod_bits::FL) != 0;
 
     let mut strain_count = 0;
@@ -1063,6 +1099,7 @@ fn performance_graph(
         aim = values.aim;
         aim_no_sliders = values.aim_no_sliders;
         speed = values.speed;
+        reading = values.reading;
         if has_flashlight_mod {
             flashlight = values.flashlight;
         }
@@ -1109,26 +1146,24 @@ fn performance_graph(
                 data: pad_series(aim_no_sliders),
             },
             crate::v2::GraphSeries {
-                // **The reading series is present and empty, and that is deliberate.**
+                // A real series as of `rosu-pp-gemini` 5.0.3, which added
+                // `OsuStrains::reading` -- the osu!std reading skill tracks fixed
+                // 400 ms sections the same way `speed` and `flashlight` do, so it
+                // indexes this x-axis without reshaping.
                 //
-                // `rosu-pp-gemini` has no `reading` strain at all -- its `OsuStrains`
-                // carries only `aim`, `aim_no_sliders`, `speed` and `flashlight`, and the
-                // desructure that would bind it discards the field -- so there is nothing
-                // to compute this from. tosu reads it from a native lazer calculator
-                // rtosu has no equivalent of, so exact parity here is structurally
-                // unreachable rather than merely unimplemented (audit-1.0.5.md `G-03`).
+                // It was `[]` before, for a good reason that no longer applies: the
+                // skill computed no sections at all, and a flat 0.0 line is a claim
+                // about the map that is indistinguishable from a real reading value.
+                // Zero-filling and cloning the aim series (the 1.0.4 defect) are
+                // both worse than either -- reading is a distinct skill, so a clone
+                // is a wrong value rather than an absent one.
                 //
-                // Zero-filling it was the previous behaviour and it is worse than empty:
-                // a flat line at 0.0 is a claim about the map's difficulty that is
-                // indistinguishable from a real reading value to anything that plots it,
-                // and it is the same shape as a map that genuinely has no reading skill.
-                // An empty array keeps the key and its position in the series list, so
-                // the payload shape still matches tosu, and reports nothing it cannot
-                // back up. Do not "fix" this by filling it with the aim series: reading
-                // is a distinct skill, and a clone is a wrong value rather than an
-                // absent one.
+                // These are rosu-pp's numbers, not tosu's: tosu reads them from its
+                // own lazer calculator fork (audit-1.0.5.md `G-08`). The shape,
+                // section count and magnitude should agree; the values will not be
+                // identical.
                 name: "reading".to_string(),
-                data: Vec::new(),
+                data: pad_series(reading),
             },
             crate::v2::GraphSeries {
                 name: "flashlight".to_string(),
@@ -1282,6 +1317,11 @@ pub struct SoloSession {
     /// recalculated when the map or mods change.
     #[cfg(feature = "pp")]
     cached_idle_pp_key: Option<(u32, u32)>,
+    /// The live difficulty curve for the current play, carried across ticks so
+    /// each judgement only folds the objects it just passed. Rebuilt by itself
+    /// when the map, the mods, or the direction of play changes.
+    #[cfg(feature = "pp")]
+    gradual_cursor: crate::pp::calculator::GradualCursor,
     cached_beatmap_metadata: crate::beatmap::BeatmapSnapshot,
     #[cfg(feature = "pp")]
     cached_stats: crate::beatmap::BeatmapStats,
@@ -1294,11 +1334,16 @@ pub struct SoloSession {
     last_scan_attempt: Instant,
     pub cached_packet: crate::v2::TosuV2Packet,
     pub enable_pp: bool,
-    pub gradual_pp_chunks: usize,
     pub enable_hit_errors: bool,
     cached_hit_errors_total_hits: u32,
     cached_hit_errors: Arc<[i16]>,
     cached_unstable_rate: f64,
+    /// tosu's slider-break inference (`states/gameplay.ts:242-249`). `prev_combo`,
+    /// `prev_miss` and `prev_max_combo` are the previous poll's values, not memory reads.
+    prev_combo: i32,
+    prev_miss: i32,
+    prev_max_combo: i32,
+    slider_breaks: i32,
     /// tosu's `gameplay.isDefaultState` latch: set once a play or a results
     /// screen has actually been read, so the exit clear runs once and never
     /// fires for a client that was never in a map.
@@ -1392,6 +1437,39 @@ fn note_file_load_failure(state: &mut Option<(u64, Instant, Duration)>, beatmap_
     *state = Some((beatmap_addr, Instant::now() + delay, delay));
 }
 
+/// tosu's slider-break inference (`states/gameplay.ts:242-249`). A combo drop
+/// that is not accompanied by a miss increment is inferred as a slider break.
+/// Preceded by a guard (`gameplay.ts:239-241`) catching retried attempts where
+/// max combo drops.
+pub(crate) fn infer_slider_breaks(
+    prev_combo: &mut i32,
+    prev_miss: &mut i32,
+    prev_max_combo: &mut i32,
+    slider_breaks: &mut i32,
+    combo: i16,
+    max_combo: i16,
+    miss: i16,
+) -> i32 {
+    let current_combo = combo as i32;
+    let current_max_combo = max_combo as i32;
+    let current_miss = miss as i32;
+
+    if current_max_combo < *prev_max_combo {
+        *prev_combo = 0;
+        *slider_breaks = 0;
+    }
+    if *prev_combo > current_max_combo {
+        *prev_combo = 0;
+    }
+    if current_combo < *prev_combo && current_miss == *prev_miss {
+        *slider_breaks += 1;
+    }
+    *prev_combo = current_combo;
+    *prev_miss = current_miss;
+    *prev_max_combo = current_max_combo;
+    *slider_breaks
+}
+
 impl SoloSession {
     pub fn new(
         profile_name: &str,
@@ -1443,6 +1521,8 @@ impl SoloSession {
             cached_results_pp: None,
             #[cfg(feature = "pp")]
             cached_idle_pp_key: None,
+            #[cfg(feature = "pp")]
+            gradual_cursor: crate::pp::calculator::GradualCursor::new(),
             cached_beatmap_metadata: crate::beatmap::BeatmapSnapshot::default(),
             #[cfg(feature = "pp")]
             cached_stats: crate::beatmap::BeatmapStats::default(),
@@ -1456,11 +1536,14 @@ impl SoloSession {
                 ..Default::default()
             },
             enable_pp: true,
-            gradual_pp_chunks: 100,
             enable_hit_errors: true,
             cached_hit_errors_total_hits: 0,
             cached_hit_errors: Arc::default(),
             cached_unstable_rate: 0.0,
+            prev_combo: 0,
+            prev_miss: 0,
+            prev_max_combo: 0,
+            slider_breaks: 0,
             play_state_dirty: false,
             previous_play_time: None,
             attached: false,
@@ -1481,6 +1564,10 @@ impl SoloSession {
     fn mark_not_running(&mut self) {
         self.attached = false;
         clear_play_state_for_new_map(&mut self.cached_packet);
+        self.slider_breaks = 0;
+        self.prev_combo = 0;
+        self.prev_miss = 0;
+        self.prev_max_combo = 0;
     }
 
     /// Whether an osu! process is currently attached. Drives the not-running
@@ -1717,6 +1804,10 @@ impl SoloSession {
             self.cached_hit_errors = Arc::default();
             self.cached_hit_errors_total_hits = 0;
             self.cached_unstable_rate = 0.0;
+            self.slider_breaks = 0;
+            self.prev_combo = 0;
+            self.prev_miss = 0;
+            self.prev_max_combo = 0;
             #[cfg(feature = "pp")]
             {
                 self.cached_gameplay_hits = (0, 0, 0, 0, 0, 0);
@@ -1730,6 +1821,13 @@ impl SoloSession {
                 // against a real fc for the highlighted map.
                 self.cached_idle_pp_key = None;
             }
+        }
+
+        if state_changed && current_state_num == 2 {
+            self.slider_breaks = 0;
+            self.prev_combo = 0;
+            self.prev_miss = 0;
+            self.prev_max_combo = 0;
         }
 
         // 2. Throttled Skin & Profile reads (on state change or low-frequency heartbeat)
@@ -1894,6 +1992,10 @@ impl SoloSession {
                                     self.cached_hit_errors = Arc::default();
                                     self.cached_hit_errors_total_hits = 0;
                                     self.cached_unstable_rate = 0.0;
+                                    self.slider_breaks = 0;
+                                    self.prev_combo = 0;
+                                    self.prev_miss = 0;
+                                    self.prev_max_combo = 0;
                                     #[cfg(feature = "pp")]
                                     {
                                         self.cached_gameplay_hits = (0, 0, 0, 0, 0, 0);
@@ -2056,6 +2158,14 @@ impl SoloSession {
                                             self.cached_accuracy.clone();
                                         self.cached_packet.performance.graph =
                                             self.cached_graph.clone();
+                                        // Same coupling as the mods path: the
+                                        // builder above zeroed `stars.live`, and
+                                        // the live pair has to be rebuilt. On a
+                                        // fresh map the judged count is usually 0
+                                        // and therefore already equal to the
+                                        // cached tuple, so nothing downstream
+                                        // would notice on its own.
+                                        self.cached_live_pp = None;
                                     }
 
                                     self.cached_packet.folders.game = self.game_folder.clone();
@@ -2111,6 +2221,18 @@ impl SoloSession {
                                     self.cached_accuracy.clone();
                                 self.cached_packet.performance.graph = self.cached_graph.clone();
                             }
+
+                            // `populate_beatmap_statistics_with_diff` resets
+                            // `stars.live` to its "no live play" default of 0, and
+                            // `stars.live` and `play.pp` are two outputs of the
+                            // same cursor step below. The live guard only reopens
+                            // when the judged counts or `g.mods` change, and this
+                            // path is keyed on the *menu* mods, so a play that is
+                            // paused -- or simply not judging anything this tick --
+                            // would keep a zeroed live rating and a stale pp for as
+                            // long as the counts stayed put. Invalidate next to
+                            // the write that forces it.
+                            self.cached_live_pp = None;
                         }
 
                         if self.cached_packet.beatmap.time.mp3_length == 0 {
@@ -2194,7 +2316,15 @@ impl SoloSession {
                     self.cached_packet.play.hits.n0 = g.hit_miss as i32;
                     self.cached_packet.play.hits.geki = g.hit_geki as i32;
                     self.cached_packet.play.hits.katu = g.hit_katu as i32;
-                    self.cached_packet.play.hits.slider_breaks = g.slider_breaks;
+                    self.cached_packet.play.hits.slider_breaks = infer_slider_breaks(
+                        &mut self.prev_combo,
+                        &mut self.prev_miss,
+                        &mut self.prev_max_combo,
+                        &mut self.slider_breaks,
+                        g.combo,
+                        g.max_combo,
+                        g.hit_miss,
+                    );
                     self.cached_packet.play.health_bar.normal = g.player_hp / 2.0;
                     self.cached_packet.play.health_bar.smooth = g.player_hp_smooth / 2.0;
                     self.cached_packet.play.hit_error_array = g.hit_error_array;
@@ -2239,30 +2369,45 @@ impl SoloSession {
                             {
                                 self.cached_gameplay_hits = current_hits;
                                 let mods_legacy = crate::pp::calculator::parse_mods_bits(g.mods);
-                                let total_objects = map.hit_objects.len();
-                                let chunks = crate::pp::calculator::get_or_compute_gradual_chunks(
-                                    self.cached_packet.beatmap.id as u32,
-                                    map,
-                                    mods_legacy,
-                                    self.gradual_pp_chunks,
-                                );
-                                let live_pp = crate::pp::calculator::calc_detailed_live_and_fc_pp(
-                                    &chunks,
-                                    total_objects,
-                                    mods_legacy,
-                                    g.combo as u32,
-                                    g.hit_300 as u32,
-                                    g.hit_100 as u32,
-                                    g.hit_50 as u32,
-                                    g.hit_miss as u32,
-                                );
-                                let live_stars = crate::pp::calculator::live_stars_from_chunks(
-                                    &chunks,
-                                    total_objects,
-                                    total_hits,
-                                );
+                                // The cursor only folds the objects judged
+                                // *since the last time this ran*, so a tick that
+                                // saw no judgement costs nothing and a tick that
+                                // saw a few pays for those few. `stars.live` and
+                                // `play.pp` come out of the same step, which is
+                                // what keeps them agreeing.
+                                //
+                                // Scoped so the cursor's borrow ends before the
+                                // packet is written: the two are separate fields,
+                                // but the borrow has to be over by the time
+                                // `self.cached_live_pp` is assigned.
+                                let (live_stars, live_pp) = {
+                                    let live_attrs = self.gradual_cursor.advance_to(
+                                        self.cached_packet.beatmap.id as u32,
+                                        map,
+                                        mods_legacy,
+                                        total_hits,
+                                    );
+                                    let stars = live_attrs
+                                        .map(crate::pp::calculator::live_stars)
+                                        .unwrap_or(0.0);
+                                    let pp = self.cached_difficulty_attrs.as_ref().map(|full| {
+                                        crate::pp::calculator::calc_detailed_live_and_fc_pp(
+                                            live_attrs,
+                                            full,
+                                            mods_legacy,
+                                            g.combo as u32,
+                                            g.hit_300 as u32,
+                                            g.hit_100 as u32,
+                                            g.hit_50 as u32,
+                                            g.hit_miss as u32,
+                                        )
+                                    });
+                                    (stars, pp)
+                                };
                                 self.cached_packet.beatmap.stats.stars.live = live_stars;
-                                self.cached_live_pp = Some(live_pp);
+                                if let Some(pp) = live_pp {
+                                    self.cached_live_pp = Some(pp);
+                                }
                             }
                             if let Some(pp) = &self.cached_live_pp {
                                 self.cached_packet.play.pp = pp.clone();
@@ -2372,6 +2517,8 @@ impl SoloSession {
                                 &diff,
                                 res.mods,
                             );
+                            self.cached_packet.beatmap.stats.stars.live =
+                                self.cached_packet.beatmap.stats.stars.total;
                             self.cached_stats = self.cached_packet.beatmap.stats.clone();
                             self.cached_accuracy =
                                 crate::pp::calculator::calc_accuracy_table_from_diff(&diff);
@@ -2421,16 +2568,31 @@ impl SoloSession {
                             {
                                 self.cached_results_hits = results_hits;
                                 let mods_legacy = crate::pp::calculator::parse_mods_bits(res.mods);
-                                let total_objects = map.hit_objects.len();
-                                let chunks = crate::pp::calculator::get_or_compute_gradual_chunks(
+                                // A finished play, so the curve is walked to the
+                                // end once and thrown away -- there is no next
+                                // judgement to make it incremental for. It is
+                                // still the real curve, so `results_screen.pp.current`
+                                // is the rating of the objects actually played rather
+                                // than whichever chunk the hit count landed in.
+                                let judged = res.hit_300 as u32
+                                    + res.hit_100 as u32
+                                    + res.hit_50 as u32
+                                    + res.hit_miss as u32;
+                                let mut cursor = crate::pp::calculator::GradualCursor::new();
+                                let live_attrs = cursor.advance_to(
                                     self.cached_packet.beatmap.id as u32,
                                     map,
                                     mods_legacy,
-                                    self.gradual_pp_chunks,
+                                    judged,
+                                );
+                                let full = crate::pp::calculator::full_difficulty(
+                                    self.cached_packet.beatmap.id as u32,
+                                    map,
+                                    mods_legacy,
                                 );
                                 let live_res = crate::pp::calculator::calc_detailed_live_and_fc_pp(
-                                    &chunks,
-                                    total_objects,
+                                    live_attrs,
+                                    &full,
                                     mods_legacy,
                                     res.max_combo as u32,
                                     res.hit_300 as u32,
@@ -2466,27 +2628,22 @@ impl SoloSession {
 
             if self.cached_idle_pp_key != Some((beatmap_id, mods_bits)) {
                 let mods_legacy = crate::pp::calculator::parse_mods_bits(mods_bits);
-                let chunks = crate::pp::calculator::get_or_compute_gradual_chunks(
-                    beatmap_id,
-                    map,
+                let full = crate::pp::calculator::full_difficulty(beatmap_id, map, mods_legacy);
+                // No objects judged outside gameplay, so `live_attrs` is `None`:
+                // current and maxAchieved stay 0 while fc is the real value. The
+                // whole-map rating is the only thing asked for here, so the curve
+                // is not walked at all.
+                let idle_pp = crate::pp::calculator::calc_detailed_live_and_fc_pp(
+                    None,
+                    &full,
                     mods_legacy,
-                    self.gradual_pp_chunks,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
                 );
-                if !chunks.is_empty() {
-                    // No objects judged outside gameplay, so current and
-                    // maxAchieved stay 0 while fc is the real value.
-                    let idle_pp = crate::pp::calculator::calc_detailed_live_and_fc_pp(
-                        &chunks,
-                        map.hit_objects.len(),
-                        mods_legacy,
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                    );
-                    self.cached_packet.play.pp = idle_pp;
-                }
+                self.cached_packet.play.pp = idle_pp;
                 self.cached_idle_pp_key = Some((beatmap_id, mods_bits));
             }
         }
@@ -3166,36 +3323,62 @@ mod tests {
         assert!(!target.is_convert);
     }
 
-    /// The `reading` graph series is **present and empty**, and that is the
-    /// decision rather than an accident of the calculator.
+    /// The `reading` graph series is **populated**, and is not one of the three
+    /// shapes it has previously been.
     ///
-    /// `rosu-pp-gemini` exposes no `reading` strain at all, so there is nothing
-    /// to compute the series from; the question this pins is only what the key
-    /// should carry. tosu builds five series for osu!std
-    /// (`states/beatmap.ts:727-734`: `aim, aimNoSliders, reading, flashlight,
-    /// speed`), so dropping the key would make rtosu's list four long and change
-    /// the shape for every consumer that indexes by name or position.
+    /// `rosu-pp-gemini` 5.0.3 added `OsuStrains::reading`; before that the skill
+    /// computed no sections, so rtosu emitted `[]` and pinned it. The series is
+    /// now real data, and the properties worth pinning are the ones that survived
+    /// every earlier mistake:
     ///
-    /// Three earlier behaviours are all rejected here, and the assertions are
-    /// written so each one fails rather than merely differing:
-    ///
-    /// * **zeros** (what rtosu did until this pass) -- passes a "not the aim
-    ///   series" check, so it needs its own: a flat 0.0 line is a claim about the
-    ///   map that is indistinguishable from a real reading value.
-    /// * **a clone of the aim series** (1.0.4's defect) -- caught by the
-    ///   length and content comparison against `aim`.
-    /// * **omission** -- caught by the name list, which is the whole point of
-    ///   keeping the key.
+    /// * **populated** -- a real non-zero value exists on a map with real reading
+    ///   content, so the old empty array now *fails*.
+    /// * **section-shaped** -- it has one entry per 400 ms section, the same count
+    ///   as `speed` and `flashlight`. This is why it indexes the shared x-axis
+    ///   without reshaping. `aim` deliberately is not the comparison: its sections
+    ///   are variable-length in the crate, so its length is not a fixed 400 ms grid.
+    /// * **not the aim series** -- the 1.0.4 defect, where an overlay drawing the
+    ///   reading graph was drawing the aim graph under the wrong name.
+    /// * **not flat zeros** -- the 1.0.5 behaviour. A flat 0.0 line passes an
+    ///   "is it aim?" check, so it needs its own: it is a claim about the map
+    ///   indistinguishable from a genuinely 0-strain map.
+    /// * **still present** -- tosu builds five series for osu!std
+    ///   (`states/beatmap.ts:727-734`: `aim, aimNoSliders, reading, flashlight,
+    ///   speed`), so dropping the key would change the shape for every consumer
+    ///   that indexes by name or position.
     #[test]
     #[cfg(feature = "pp")]
-    fn the_reading_series_is_present_and_empty_rather_than_faked() {
+    fn the_reading_series_is_populated_and_is_neither_an_aim_clone_nor_flat_zeros() {
         use rosu_pp::Beatmap;
 
+        // The fixture has to be a map with something to *read*, or the assertion
+        // below is vacuous. Two properties of the reading evaluator decide it:
+        //
+        // * `velocity` is `lazy_jump_dist / delta_time` floored at 1.0, so circles
+        //   that never move contribute the floor and nothing more;
+        // * `get_constant_angle_nerf_factor` collapses to its 0.2 floor for a
+        //   pattern that keeps the same angle -- a straight, evenly spaced stream
+        //   of circles at one position is the most heavily nerfed shape there is.
+        //
+        // So: scattered positions and irregular deltas, from a seeded LCG so the
+        // fixture is the same map on every run.
+        let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as u32
+        };
+
         let mut content = String::from(
-            "osu file format v14\n\n[General]\nMode: 0\n\n[Metadata]\nTitle:Test\nArtist:Test\nCreator:Test\nVersion:Normal\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\nSliderMultiplier:1.4\nSliderTickRate:1\n\n[TimingPoints]\n0,500,4,2,0,50,1,0\n\n[HitObjects]\n",
+            "osu file format v14\n\n[General]\nMode: 0\n\n[Metadata]\nTitle:Test\nArtist:Test\nCreator:Test\nVersion:Normal\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:9\nApproachRate:9\nSliderMultiplier:1.4\nSliderTickRate:1\n\n[TimingPoints]\n0,500,4,2,0,50,1,0\n\n[HitObjects]\n",
         );
-        for i in 0..200 {
-            content.push_str(&format!("256,192,{},1,0,0:0:0:0:\n", 1000 + i * 100));
+        let mut time = 1000u32;
+        for _ in 0..300 {
+            let x = 64 + next() % 384;
+            let y = 64 + next() % 256;
+            content.push_str(&format!("{x},{y},{time},1,0,0:0:0:0:\n"));
+            time += 130 + next() % 200;
         }
         let map = Beatmap::from_bytes(content.as_bytes()).expect("parse map");
 
@@ -3210,24 +3393,206 @@ mod tests {
             "the five osu!std series and their order are tosu's (beatmap.ts:727-734)"
         );
 
-        let reading = &graph
-            .series
-            .iter()
-            .find(|s| s.name == "reading")
-            .expect("the reading key is present")
-            .data;
-        assert!(
-            reading.is_empty(),
-            "reading carries no samples it cannot compute, got {reading:?}"
+        let series = |name: &str| -> Vec<f64> {
+            graph
+                .series
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("the {name} key is present"))
+                .data
+                .clone()
+        };
+        let reading = series("reading");
+        let speed = series("speed");
+        let aim = series("aim");
+
+        // Populated, and padded to the shared x-axis like every other series.
+        assert_eq!(
+            reading.len(),
+            graph.xaxis.len(),
+            "every series must index the same x-axis, got {} vs {}",
+            reading.len(),
+            graph.xaxis.len()
         );
 
-        // The aim series on the same graph is real, so "empty" is a decision
-        // about reading and not a graph that failed to build at all.
-        let aim = &graph.series[0].data;
-        assert!(!aim.is_empty(), "aim is populated on the same graph");
+        // Section-shaped: one entry per 400 ms, matching the other fixed-grid
+        // skill. `aim` is excluded on purpose -- its sections are variable-length
+        // in the crate, so its length is not a fixed grid to compare against.
+        assert_eq!(
+            reading.len(),
+            speed.len(),
+            "reading and speed are both fixed 400 ms sections"
+        );
+
+        // Not empty, and not a flat line. Both were real past behaviours.
+        let unpadded = reading
+            .iter()
+            .copied()
+            .filter(|&v| v != -100.0)
+            .collect::<Vec<f64>>();
+        assert!(
+            !unpadded.is_empty(),
+            "the old empty array must now fail: reading carries no samples"
+        );
+        assert!(
+            unpadded.iter().any(|&v| v > 0.0),
+            "a flat 0.0 line is a claim about the map indistinguishable from a \
+             genuinely 0-strain one; got {unpadded:?}"
+        );
 
         // And it is not the aim series wearing the wrong name, which is the
         // defect 1.0.4 found here.
         assert_ne!(reading, aim, "reading must never be an aim clone");
+    }
+
+    /// The live evidence for a counter that is not a hard 0, modelled on what
+    /// was actually measured on map 4390203: tosu on :24050 reported 3 slider
+    /// breaks against rtosu's 0, and rtosu had attached 176 objects into the map
+    /// (combo 7, max combo 124, 3 misses).
+    ///
+    /// The 3 were unreachable -- osu!stable keeps no slider-break statistic, so
+    /// there is nothing in memory to read and the counts are not on a common
+    /// scale (176 judged vs a max combo of 124, because the hit counters include
+    /// slider ticks and the combo counter does not). What *is* in reach is
+    /// everything after the attach, and this walks it.
+    #[test]
+    fn the_counter_starts_counting_from_the_moment_of_attach() {
+        let (mut breaks, mut prev_combo, mut prev_miss, mut prev_max_combo) =
+            (0i32, 0i32, 0i32, 0i32);
+        let mut step = |combo: i16, max_combo: i16, miss: i16| {
+            super::infer_slider_breaks(
+                &mut prev_combo,
+                &mut prev_miss,
+                &mut prev_max_combo,
+                &mut breaks,
+                combo,
+                max_combo,
+                miss,
+            )
+        };
+
+        // The first poll after attaching mid-map. Whatever happened before this
+        // is gone, and the counter is honest about it: 0, not a guess.
+        assert_eq!(step(7, 124, 3), 0);
+
+        // A real slider break: combo drops, misses do not move.
+        assert_eq!(step(0, 124, 3), 1);
+
+        // Combo rebuilds across several polls. A counter that latched after one
+        // drop, or one that counted a drop per poll, would not survive this.
+        assert_eq!(step(3, 124, 3), 1);
+        assert_eq!(step(18, 124, 3), 1);
+        assert_eq!(step(40, 124, 3), 1);
+
+        // A second break.
+        assert_eq!(step(0, 124, 3), 2);
+
+        // A miss also zeroes the combo, and must not be mistaken for a break.
+        assert_eq!(step(0, 124, 4), 2);
+        assert_eq!(step(12, 124, 4), 2);
+    }
+
+    /// A combo threshold is a *divergence* from tosu, not a safety improvement.
+    ///
+    /// `updateSliderBreaks` has no threshold, so a slider break at combo 15 in
+    /// the opening seconds of a map is counted by tosu. Requiring the pre-drop
+    /// combo to be above some bound would report 0 where tosu reports 1, turning
+    /// today's single structural gap into a second, avoidable one. Pinned so
+    /// the trade-off is a decision rather than a later surprise.
+    #[test]
+    fn a_break_below_any_combo_threshold_still_counts() {
+        let (mut breaks, mut prev_combo, mut prev_miss, mut prev_max_combo) =
+            (0i32, 0i32, 0i32, 0i32);
+        let mut step = |combo: i16, max_combo: i16, miss: i16| {
+            super::infer_slider_breaks(
+                &mut prev_combo,
+                &mut prev_miss,
+                &mut prev_max_combo,
+                &mut breaks,
+                combo,
+                max_combo,
+                miss,
+            )
+        };
+
+        // Combo 8 -> 0 with no miss. Early in a map, and tosu counts it.
+        assert_eq!(step(8, 8, 0), 0);
+        assert_eq!(step(0, 8, 0), 1);
+    }
+
+    #[test]
+    fn slider_breaks_are_inferred_from_combo_drop_without_miss_and_reset_on_retry() {
+        // Driven through the free function rather than a session method, which
+        // is how the poll path calls it. A method that existed only for these
+        // assertions would be dead code in every build that is not a test.
+        let (mut breaks, mut prev_combo, mut prev_miss, mut prev_max_combo) =
+            (0i32, 0i32, 0i32, 0i32);
+        let mut step = |combo: i16, max_combo: i16, miss: i16| {
+            super::infer_slider_breaks(
+                &mut prev_combo,
+                &mut prev_miss,
+                &mut prev_max_combo,
+                &mut breaks,
+                combo,
+                max_combo,
+                miss,
+            )
+        };
+
+        // 1. Initially 0 breaks
+        assert_eq!(step(0, 0, 0), 0);
+
+        // 2. Combo increases cleanly -> 0 breaks
+        assert_eq!(step(10, 10, 0), 0);
+        assert_eq!(step(50, 50, 0), 0);
+
+        // 3. Repeated polls with identical state must not double count
+        assert_eq!(step(50, 50, 0), 0);
+        assert_eq!(step(50, 50, 0), 0);
+
+        // 4. Combo drop without miss -> 1 slider break
+        assert_eq!(step(0, 50, 0), 1);
+
+        // 5. Subsequent poll while still at 0 combo must not count again
+        assert_eq!(step(0, 50, 0), 1);
+
+        // 6. Combo builds back up -> still 1 break
+        assert_eq!(step(20, 50, 0), 1);
+
+        // 7. Combo drop accompanied by a miss -> NOT a slider break (still 1)
+        assert_eq!(step(0, 50, 1), 1);
+
+        // 8. Combo builds up to 15 -> still 1
+        assert_eq!(step(15, 50, 1), 1);
+
+        // 9. Second slider break: combo drops from 15 to 0 while miss remains 1
+        assert_eq!(step(0, 50, 1), 2);
+
+        // 10. Retry: max combo drops -> slider breaks reset to 0
+        assert_eq!(step(0, 0, 0), 0);
+        assert_eq!(step(5, 5, 0), 0);
+    }
+
+    #[test]
+    #[cfg(feature = "pp")]
+    fn beatmap_stats_builder_zeroes_live_stars_while_preserving_total() {
+        use rosu_pp::Beatmap;
+
+        let mut content = String::from(
+            "osu file format v14\n\n[General]\nMode: 0\n\n[Metadata]\nTitle:Test\nArtist:Test\nCreator:Test\nVersion:Normal\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\nSliderMultiplier:1.4\nSliderTickRate:1\n\n[TimingPoints]\n0,500,4,2,0,50,1,0\n\n[HitObjects]\n",
+        );
+        for i in 0..50 {
+            content.push_str(&format!("256,192,{},1,0,0:0:0:0:\n", 1000 + i * 100));
+        }
+        let map = Beatmap::from_bytes(content.as_bytes()).expect("parse map");
+        let mods_legacy = crate::pp::calculator::parse_mods_bits(0);
+        let diff = rosu_pp::Difficulty::new().mods(mods_legacy).calculate(&map);
+
+        let mut snapshot = crate::beatmap::BeatmapSnapshot::default();
+        crate::beatmap::populate_beatmap_statistics_with_diff(&mut snapshot, &map, &diff, 0);
+
+        assert!(snapshot.stats.stars.total > 0.0);
+        assert_eq!(snapshot.stats.stars.live, 0.0);
+        assert_ne!(snapshot.stats.stars.live, snapshot.stats.stars.total);
     }
 }
