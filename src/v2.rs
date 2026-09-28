@@ -381,6 +381,19 @@ pub struct PrecomputedGraph {
     /// Never on the wire, and never part of equality: it is a cache of `raw`, so
     /// two graphs with the same bytes are equal whether or not either is decoded.
     decoded: Option<Arc<PerformanceGraph>>,
+    /// `decoded`'s first series' data, hoisted behind its own `Arc`.
+    ///
+    /// **Why this exists:** v1's `menu.pp.strains` is exactly this slice -- the
+    /// primary skill series -- and it used to reach it with
+    /// `series[0].data.clone()`, a full copy of the longest series in the graph
+    /// on every `/json` request and every `/ws` frame. With the decoded graph
+    /// already shared, the copy was pure waste, so the slice is published once
+    /// here and every consumer of a poll refcount-bumps it instead.
+    ///
+    /// `None` exactly when `decoded` is `None`: the shared-static default has no
+    /// series to hoist, and materialising a fresh `Arc` per caller would defeat
+    /// the point. `primary_series()` supplies the empty slice for it.
+    primary: Option<Arc<Vec<f64>>>,
 }
 
 impl PrecomputedGraph {
@@ -392,12 +405,19 @@ impl PrecomputedGraph {
             .ok()
             .and_then(|json| serde_json::value::RawValue::from_string(json).ok())
         {
-            Some(raw) => Self {
-                raw: Arc::from(raw),
-                // Decoded from the same bytes the payload carries, so the two
-                // can never disagree about the graph's contents.
-                decoded: Some(Arc::new(graph.clone())),
-            },
+            Some(raw) => {
+                // Hoisted from the same clone `decoded` hands out, so
+                // `primary_series()` cannot disagree with it.
+                let decoded = Arc::new(graph.clone());
+                let primary = decoded.series.first().map(|s| Arc::new(s.data.clone()));
+                Self {
+                    raw: Arc::from(raw),
+                    // Decoded from the same bytes the payload carries, so the two
+                    // can never disagree about the graph's contents.
+                    decoded: Some(decoded),
+                    primary,
+                }
+            }
             None => Self::default(),
         }
     }
@@ -415,17 +435,30 @@ impl PrecomputedGraph {
             .unwrap_or_else(|| Arc::new(PerformanceGraph::default()))
     }
 
+    /// The first series' data, or an empty slice.
+    ///
+    /// Never fails, and never copies per consumer: the slice is published once
+    /// by [`Self::new`] / [`Self::from_raw_json`] and shared from there. A graph
+    /// with no series -- the empty default, or a non-osu!std ruleset, which
+    /// rtosu emits with no series at all -- yields the empty slice, which is
+    /// exactly what the consumer produced before this hoist existed.
+    pub fn primary_series(&self) -> Arc<Vec<f64>> {
+        self.primary.clone().unwrap_or_else(|| Arc::new(Vec::new()))
+    }
+
     pub fn from_raw_json(json: String) -> Result<Self, serde_json::Error> {
         let raw: Arc<serde_json::value::RawValue> =
             Arc::from(serde_json::value::RawValue::from_string(json)?);
+        // Decoded here for the same reason `new` does it. This constructor is
+        // the deserialisation path, so without it a packet rebuilt from the
+        // wire would silently lose the cache and every consumer would fall
+        // back to the empty graph.
+        let decoded: Arc<PerformanceGraph> =
+            Arc::new(serde_json::from_str(raw.get()).unwrap_or_default());
+        let primary = decoded.series.first().map(|s| Arc::new(s.data.clone()));
         Ok(Self {
-            // Decoded here for the same reason `new` does it. This constructor is
-            // the deserialisation path, so without it a packet rebuilt from the
-            // wire would silently lose the cache and every consumer would fall
-            // back to the empty graph.
-            decoded: Some(Arc::new(
-                serde_json::from_str(raw.get()).unwrap_or_default(),
-            )),
+            primary,
+            decoded: Some(decoded),
             raw,
         })
     }
@@ -448,6 +481,8 @@ impl Default for PrecomputedGraph {
             // `decoded()` materialises one per caller, which is only reached when
             // nothing built a real graph.
             decoded: None,
+            // Likewise nothing to hoist from.
+            primary: None,
         }
     }
 }
@@ -474,14 +509,16 @@ impl<'de> Deserialize<'de> for PrecomputedGraph {
     {
         let raw_box = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
         let raw: Arc<serde_json::value::RawValue> = Arc::from(raw_box);
+        // Decoded here as well as in `from_raw_json`, because this is the path
+        // a packet rebuilt from the wire takes, and a consumer asking for the
+        // parsed series must get the graph that was actually sent rather than
+        // the empty fallback.
+        let decoded: Arc<PerformanceGraph> =
+            Arc::new(serde_json::from_str(raw.get()).unwrap_or_default());
+        let primary = decoded.series.first().map(|s| Arc::new(s.data.clone()));
         Ok(PrecomputedGraph {
-            // Decoded here as well as in `from_raw_json`, because this is the path
-            // a packet rebuilt from the wire takes, and a consumer asking for the
-            // parsed series must get the graph that was actually sent rather than
-            // the empty fallback.
-            decoded: Some(Arc::new(
-                serde_json::from_str(raw.get()).unwrap_or_default(),
-            )),
+            decoded: Some(decoded),
+            primary,
             raw,
         })
     }
@@ -1062,6 +1099,55 @@ mod tests {
         // documented fallback rather than a panic.
         let empty = PrecomputedGraph::default();
         assert!(empty.decoded().series.is_empty());
+    }
+
+    /// The primary series is v1's `menu.pp.strains`, and it used to be reached
+    /// with a `clone()` of the longest series in the graph on every request and
+    /// every socket frame. It is published once per graph instead, so the whole
+    /// point is that the consumers share one buffer rather than each making
+    /// their own.
+    #[test]
+    fn the_primary_series_is_shared_rather_than_copied_per_consumer() {
+        let graph = PerformanceGraph {
+            series: vec![
+                GraphSeries {
+                    name: "aim".to_string(),
+                    data: vec![1.0, 2.0, 3.0],
+                },
+                GraphSeries {
+                    name: "speed".to_string(),
+                    data: vec![4.0, 5.0],
+                },
+            ],
+            xaxis: vec![0.0, 400.0, 800.0],
+        };
+        let precomputed = PrecomputedGraph::new(&graph);
+
+        let first = precomputed.primary_series();
+        let second = precomputed.primary_series();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "two consumers of one graph must share the series, not each copy it"
+        );
+        // It is the *first* series -- tosu's osu!std primary skill is aim -- and
+        // not the whole graph or a later series.
+        assert_eq!(*first, vec![1.0, 2.0, 3.0]);
+        // And it agrees with the decoded graph it was hoisted from.
+        assert_eq!(
+            *precomputed.primary_series(),
+            precomputed.decoded().series[0].data
+        );
+
+        // The wire path hoists too, otherwise a packet rebuilt from JSON would
+        // silently start copying again.
+        let text = serde_json::to_string(&precomputed).expect("serialize");
+        let parsed: PrecomputedGraph = serde_json::from_str(&text).expect("deserialize");
+        assert_eq!(*parsed.primary_series(), vec![1.0, 2.0, 3.0]);
+
+        // A graph with no series is the documented empty answer, not a panic --
+        // this is the non-osu!std case, where rtosu emits no series at all.
+        let empty = PrecomputedGraph::default();
+        assert!(empty.primary_series().is_empty());
     }
 
     #[test]

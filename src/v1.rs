@@ -206,15 +206,61 @@ pub struct V1MenuPp {
     pub n100: f32,
     /// The mode's primary skill series, zero padded. tosu's `beatmapPP.strains`;
     /// for osu!std that is the aim series.
-    pub strains: Vec<f64>,
+    ///
+    /// Shared rather than owned: this is `graph.series[0].data`, and the graph is
+    /// already an `Arc` that every consumer of the same poll shares, so this used
+    /// to deep-copy the longest series in the graph on every `/json` request and
+    /// every `/ws` frame. `PrecomputedGraph::primary_series` publishes it once
+    /// per graph instead.
+    pub strains: Arc<Vec<f64>>,
     #[serde(rename = "strainsAll")]
     pub strains_all: V1StrainsAll,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+/// The whole graph, as a borrow of the packet's own decoded graph.
+///
+/// This is a newtype rather than a pair of `Vec`s because the graph is already
+/// shared: holding `Arc<PerformanceGraph>` and emitting its two fields on
+/// serialization means building `strainsAll` costs a refcount bump instead of
+/// copying five series and the x-axis. The wire shape is unchanged --
+/// `{"series": [...], "xaxis": [...]}` -- and the field order still comes from
+/// [`crate::v2::PerformanceGraph`]'s own declaration.
+#[derive(Debug, Clone, PartialEq)]
 pub struct V1StrainsAll {
-    pub series: Vec<crate::v2::GraphSeries>,
-    pub xaxis: Vec<f64>,
+    graph: Arc<crate::v2::PerformanceGraph>,
+}
+
+impl V1StrainsAll {
+    /// Borrow an already-shared graph. Does not copy it.
+    pub fn new(graph: Arc<crate::v2::PerformanceGraph>) -> Self {
+        Self { graph }
+    }
+
+    /// Whether two of these are views of the *same* graph.
+    ///
+    /// Two graphs with equal contents are not the same graph, and this is how a
+    /// caller (and a test) tells sharing apart from a value that merely happens
+    /// to match: `PartialEq` cannot, and this is the property the sharing is
+    /// actually for.
+    pub fn is_same_graph(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.graph, &other.graph)
+    }
+}
+
+impl Serialize for V1StrainsAll {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Delegates to the graph, so the two cannot drift apart in key order or
+        // naming; the newtype exists only to avoid the copy.
+        self.graph.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for V1StrainsAll {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        crate::v2::PerformanceGraph::deserialize(deserializer).map(|graph| Self {
+            graph: Arc::new(graph),
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -608,27 +654,22 @@ impl GosuCompatibleApi {
         // either. `strains_all` is the whole graph object and `strains` is its
         // first series, so one shared decode serves both.
         //
-        // The clone here is of the `Arc`, not of the graph: this used to be
-        // `graph.series.clone()` and `graph.xaxis.clone()` on an owned local that
-        // was never used again, which is two full deep copies of a ~250 KB
-        // structure per `/json` request and per `/ws` frame.
+        // Neither one copies the graph. This used to be `graph.series.clone()`
+        // and `graph.xaxis.clone()` on an owned local that was never used again,
+        // which is two full deep copies of a ~250 KB structure per `/json`
+        // request and per `/ws` frame, plus a third for `strains`. The decoded
+        // graph is already an `Arc` that every consumer of this poll shares, so
+        // the copies only moved the cost from the parse to the clone.
         let graph = packet.performance.graph.decoded();
-        let strains_all = V1StrainsAll {
-            series: graph.series.to_vec(),
-            xaxis: graph.xaxis.to_vec(),
-        };
+        let strains_all = V1StrainsAll::new(graph);
         // tosu's `beatmapPP.strains` is the mode's primary skill, zero padded. For
         // osu!std that is the aim series, which is what `series[0]` holds; for any
         // other mode rtosu emits no series at all, so this is empty rather than
         // wrong. See the BLOCKED note on the reading strain in audit-1.0.5.md G-03.
         //
-        // Out of the same `Vec` the `strains_all` copy came from, so this is a
-        // slice copy rather than a second descent into the graph.
-        let strains = strains_all
-            .series
-            .first()
-            .map(|s| s.data.clone())
-            .unwrap_or_default();
+        // Hoisted once per graph by `PrecomputedGraph`, so this is a refcount bump
+        // rather than a second descent into the graph.
+        let strains = packet.performance.graph.primary_series();
 
         Self {
             client: packet.client.clone(),
@@ -1014,6 +1055,62 @@ mod tests {
         let v1 = GosuCompatibleApi::from_v2(&TosuV2Packet::default());
         let order = key_order(&serde_json::to_string(&v1.gameplay.hits).unwrap());
         assert_eq!(order, EXPECTED_HITS_KEYS, "gameplay.hits wire order");
+    }
+
+    /// `strains` and `strainsAll` are now borrows of the packet's shared graph
+    /// rather than copies of it. Sharing is only allowed to be invisible, so
+    /// this pins the two things a borrow could plausibly break: that the wire
+    /// shape is unchanged, and that two consumers of one packet share rather
+    /// than each get their own copy.
+    #[test]
+    fn the_strain_blocks_are_shared_but_still_serialize_the_whole_graph() {
+        let mut packet = TosuV2Packet::default();
+        packet.performance.graph = crate::v2::PrecomputedGraph::new(&crate::v2::PerformanceGraph {
+            series: vec![
+                crate::v2::GraphSeries {
+                    name: "aim".to_string(),
+                    data: vec![1.0, 2.0, 3.0],
+                },
+                crate::v2::GraphSeries {
+                    name: "speed".to_string(),
+                    data: vec![4.0, 5.0],
+                },
+            ],
+            xaxis: vec![0.0, 400.0, 800.0],
+        });
+
+        let v1 = GosuCompatibleApi::from_v2(&packet);
+
+        // Shared, not copied: two conversions of one packet hand out the same
+        // buffers. This is the property the optimisation exists for.
+        let again = GosuCompatibleApi::from_v2(&packet);
+        assert!(
+            Arc::ptr_eq(&v1.menu.pp.strains, &again.menu.pp.strains),
+            "menu.pp.strains must be shared, not rebuilt per consumer"
+        );
+        assert!(
+            v1.menu
+                .pp
+                .strains_all
+                .is_same_graph(&again.menu.pp.strains_all),
+            "menu.pp.strainsAll must be shared, not rebuilt per consumer"
+        );
+
+        // And invisible on the wire: `strainsAll` is still the whole graph, both
+        // keys, in `PerformanceGraph`'s own order -- this is the shape a v1
+        // consumer parses, so a newtype that dropped or renamed a key would be
+        // a silent break.
+        let strains_all = serde_json::to_value(&v1.menu.pp.strains_all).unwrap();
+        assert_eq!(key_order(&strains_all.to_string()), vec!["series", "xaxis"]);
+        assert_eq!(strains_all["xaxis"], serde_json::json!([0.0, 400.0, 800.0]));
+        assert_eq!(strains_all["series"].as_array().map(Vec::len), Some(2));
+        // `strains` is the first series, matching `strainsAll.series[0].data`.
+        assert_eq!(*v1.menu.pp.strains, vec![1.0, 2.0, 3.0]);
+
+        // Round-trips: a v1 payload rebuilt from the wire is the same value.
+        let text = serde_json::to_string(&v1.menu.pp.strains_all).expect("serialize");
+        let back: V1StrainsAll = serde_json::from_str(&text).expect("deserialize");
+        assert_eq!(back, v1.menu.pp.strains_all);
     }
 
     #[test]

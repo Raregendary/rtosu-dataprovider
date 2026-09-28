@@ -551,7 +551,16 @@ fn execute(
             let host = host.unwrap_or(config.server.host.clone());
             let port = port.unwrap_or(config.server.port);
             let poll_hz = poll_rate.unwrap_or(config.poll.poll_rate_hz as u64);
-            let rt = tokio::runtime::Runtime::new()?;
+            // Capped rather than left at the default. `Runtime::new()` sizes the
+            // worker pool to the logical core count, and this process serves a
+            // handful of localhost clients: one worker runs the poll loop and
+            // the other drains the sockets. The poll itself is a blocking
+            // `reader.poll()` on this thread, so extra workers buy nothing and
+            // cost a thread stack and TLS block each.
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .build()?;
             rt.block_on(run_serve_loop(&host, port, poll_hz, pointer_width, config))?;
         }
     }

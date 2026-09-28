@@ -18,10 +18,21 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(feature = "pp")]
 use crate::client::mod_bits;
 
-/// How many consecutive ticks a map is re-read for while its title is still
-/// unreadable, before the reader accepts the partial result. At the default
-/// 60 Hz that is about half a second of retrying, which covers osu! assembling
-/// a beatmap, without costing a full memory read every tick indefinitely.
+/// How often the in-game score list is re-walked during a play.
+///
+/// The list only changes when a score is actually submitted or the player's own
+/// row moves, so reading it on the poll tick spends kernel transitions on data
+/// that has not changed. A second is well inside what an overlay can show.
+const LEADERBOARD_INTERVAL: Duration = Duration::from_secs(1);
+
+/// The inputs a tournament client's live PP was computed from: the raw mod bits,
+/// the five judgement numbers, and the hit total the difficulty curve is
+/// advanced by.
+///
+/// Named because it appears in [`CachedClientState::cached_live_pp`], where
+/// spelling the tuple out is unreadable.
+#[cfg(feature = "pp")]
+type LivePpKey = (u32, u32, u32, u32, u32, u32, u32);
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TournamentClientView {
@@ -74,6 +85,25 @@ pub struct CachedClientState {
     #[cfg(feature = "pp")]
     pub cached_beatmap: Option<rosu_pp::Beatmap>,
     pub cached_total_hits: u32,
+    /// The live PP last computed for this client, and the judgement counts it
+    /// was computed from.
+    ///
+    /// **Why this exists:** the rating is a pure function of (map, mods, combo,
+    /// hit counts), and the hit counts only move when a note is judged. Without
+    /// this, every client paid two `rosu_pp::Performance` evaluations on every
+    /// tick whether or not anything had been hit -- at 60 Hz with 16 clients
+    /// that is the per-tick cost of a full PP recalculation times 16, for a
+    /// value that was usually identical to the one already published.
+    ///
+    /// Per client, not per session: each client is at a different point in the
+    /// same map, so they legitimately differ. The `gradual_cursor` already made
+    /// the *curve* incremental; this makes the *evaluation* conditional.
+    ///
+    /// The stored counts are the raw mod bits plus the five judgement numbers
+    /// and their total, so a mod change, a retry or a new judgement all
+    /// recompute rather than reusing a rating from a different situation.
+    #[cfg(feature = "pp")]
+    pub cached_live_pp: Option<(LivePpKey, crate::pp::LivePpResult)>,
     pub cached_hit_errors: Arc<[i16]>,
     pub cached_unstable_rate: f64,
     pub cached_gameplay: Option<GameplayState>,
@@ -365,6 +395,14 @@ impl TournamentSession {
                     client.cached_total_hits = 0;
                     client.cached_hit_errors = Arc::default();
                     client.cached_unstable_rate = 0.0;
+                    // The rating is for the old map. `cached_total_hits` is
+                    // already back to zero, so a fresh play that has not hit
+                    // anything yet would otherwise find the pre-change key
+                    // waiting for it and republish the previous map's numbers.
+                    #[cfg(feature = "pp")]
+                    {
+                        client.cached_live_pp = None;
+                    }
                 }
                 if beatmap_ref.checksum != self.current_checksum && !beatmap_ref.checksum.is_empty()
                 {
@@ -665,10 +703,12 @@ impl TournamentSession {
                 #[cfg(feature = "pp")]
                 let live_pp = if self.enable_pp {
                     if let Some(map) = self.cached_beatmap.as_ref() {
-                        let mods_legacy = gameplay
-                            .as_ref()
-                            .map(|g| crate::pp::calculator::parse_mods_bits(g.mods))
-                            .unwrap_or_else(|| rosu_mods::GameModsLegacy::default());
+                        // The raw mod bits, kept alongside the parsed form: the
+                        // rating depends on the mods, so they belong in the
+                        // cache key below. `parse_mods_bits(0)` is the default,
+                        // so the no-gameplay case needs no separate arm.
+                        let mods_bits = gameplay.as_ref().map(|g| g.mods).unwrap_or(0);
+                        let mods_legacy = crate::pp::calculator::parse_mods_bits(mods_bits);
                         let (combo, n300, n100, n50, n0) = gameplay
                             .as_ref()
                             .map(|g| {
@@ -683,35 +723,68 @@ impl TournamentSession {
                             .unwrap_or((0, 0, 0, 0, 0));
                         let total_hits = n300 + n100 + n50 + n0;
                         let map_id = beatmap.as_ref().map_or(0, |b| b.id as u32);
-                        // `full_difficulty` rather than a session field: the loop
-                        // holds `&mut self.clients`, so a `&mut self` accessor is
-                        // unreachable from in here. The cache makes it once per
-                        // (map, mods) for the whole process, not once per client.
-                        let full = crate::pp::calculator::full_difficulty(map_id, map, mods_legacy);
-                        // The curve belongs to the client, not the session: each
-                        // one is at a different point in the same map, and a shared
-                        // forward-only cursor would make the ones that are behind
-                        // rebuild it on every tick.
-                        let live_attrs =
-                            client
-                                .gradual_cursor
-                                .advance_to(map_id, map, mods_legacy, total_hits);
-                        let live_stars = live_attrs
-                            .map(crate::pp::calculator::live_stars)
-                            .unwrap_or(0.0);
-                        if let Some(b) = beatmap.as_mut() {
-                            b.stats.stars.live = live_stars;
-                        }
-                        Some(crate::pp::calculator::calc_detailed_live_and_fc_pp(
-                            live_attrs,
-                            &full,
-                            mods_legacy,
-                            combo,
-                            n300,
-                            n100,
-                            n50,
-                            n0,
-                        ))
+                        // The gate. The rating depends only on the map, the mods
+                        // and the six judgement numbers, so a tick that saw no new
+                        // judgement cannot change it -- and a tick that is not a
+                        // play at all (the client is in the lobby) is the common
+                        // case, where all six are zero and the answer is the
+                        // same zeroed rating every time.
+                        //
+                        // The tuple carries the hit total as well, because that is
+                        // what the cursor is advanced by: a set of counts that
+                        // summed differently would mean a different point on the
+                        // curve even if the individual numbers matched. The raw
+                        // mod bits are in it for the same reason -- a mod change
+                        // alters the rating without altering a single counter, so
+                        // keying on the judgements alone would serve a rating
+                        // computed under different mods.
+                        let pp_key = (mods_bits, combo, n300, n100, n50, n0, total_hits);
+                        let cached = client.cached_live_pp.as_ref();
+                        let live_pp = match cached {
+                            Some((key, pp)) if *key == pp_key => Some(pp.clone()),
+                            _ => {
+                                // `full_difficulty` rather than a session field:
+                                // the loop holds `&mut self.clients`, so a
+                                // `&mut self` accessor is unreachable from in here.
+                                // The cache makes it once per (map, mods) for the
+                                // whole process, not once per client.
+                                let full = crate::pp::calculator::full_difficulty(
+                                    map_id,
+                                    map,
+                                    mods_legacy,
+                                );
+                                // The curve belongs to the client, not the
+                                // session: each one is at a different point in the
+                                // same map, and a shared forward-only cursor would
+                                // make the ones that are behind rebuild it on
+                                // every tick.
+                                let live_attrs = client.gradual_cursor.advance_to(
+                                    map_id,
+                                    map,
+                                    mods_legacy,
+                                    total_hits,
+                                );
+                                let live_stars = live_attrs
+                                    .map(crate::pp::calculator::live_stars)
+                                    .unwrap_or(0.0);
+                                if let Some(b) = beatmap.as_mut() {
+                                    b.stats.stars.live = live_stars;
+                                }
+                                let pp = crate::pp::calculator::calc_detailed_live_and_fc_pp(
+                                    live_attrs,
+                                    &full,
+                                    mods_legacy,
+                                    combo,
+                                    n300,
+                                    n100,
+                                    n50,
+                                    n0,
+                                );
+                                client.cached_live_pp = Some((pp_key, pp.clone()));
+                                Some(pp)
+                            }
+                        };
+                        live_pp
                     } else {
                         None
                     }
@@ -1025,6 +1098,8 @@ impl TournamentSession {
             #[cfg(feature = "pp")]
             cached_beatmap: None,
             cached_total_hits: 0,
+            #[cfg(feature = "pp")]
+            cached_live_pp: None,
             cached_hit_errors: Arc::default(),
             cached_unstable_rate: 0.0,
             cached_gameplay: None,
@@ -1332,6 +1407,8 @@ pub struct SoloSession {
     last_skin_read: Instant,
     last_profile_read: Instant,
     last_scan_attempt: Instant,
+    /// When the score list was last walked. See the read site in `poll`.
+    last_leaderboard_read: Instant,
     pub cached_packet: crate::v2::TosuV2Packet,
     pub enable_pp: bool,
     pub enable_hit_errors: bool,
@@ -1531,6 +1608,9 @@ impl SoloSession {
             last_skin_read: Instant::now() - Duration::from_secs(10),
             last_profile_read: Instant::now() - Duration::from_secs(10),
             last_scan_attempt: Instant::now() - Duration::from_secs(10),
+            // Backdated so the first tick in a play reads the list immediately
+            // rather than waiting out the interval on an empty leaderboard.
+            last_leaderboard_read: Instant::now() - Duration::from_secs(10),
             cached_packet: crate::v2::TosuV2Packet {
                 profile: guest_profile_state(),
                 ..Default::default()
@@ -1808,6 +1888,10 @@ impl SoloSession {
             self.prev_combo = 0;
             self.prev_miss = 0;
             self.prev_max_combo = 0;
+            // The cached list went with the rest of the play state, so the next
+            // play must not have to wait out the leaderboard interval to refill it.
+            // (`Instant::now()` rather than the loop's `now`, which is bound later.)
+            self.last_leaderboard_read = Instant::now() - LEADERBOARD_INTERVAL;
             #[cfg(feature = "pp")]
             {
                 self.cached_gameplay_hits = (0, 0, 0, 0, 0, 0);
@@ -1996,6 +2080,10 @@ impl SoloSession {
                                     self.prev_combo = 0;
                                     self.prev_miss = 0;
                                     self.prev_max_combo = 0;
+                                    // As above: a freshly loaded map starts with an
+                                    // empty leaderboard, so read it on the first tick.
+                                    self.last_leaderboard_read =
+                                        Instant::now() - LEADERBOARD_INTERVAL;
                                     #[cfg(feature = "pp")]
                                     {
                                         self.cached_gameplay_hits = (0, 0, 0, 0, 0, 0);
@@ -2345,8 +2433,20 @@ impl SoloSession {
                     // a play, so the play-state read is the one place it is live.
                     // tosu reads it under the same gate: `updateLeaderboard()` is
                     // called from `gameplay.ts:253`, inside the play branch.
-                    self.cached_packet.leaderboard =
-                        crate::client::read_leaderboard(memory, ruleset_addr, g.mode);
+                    //
+                    // Rate-limited to 1 Hz. Walking the list costs a handful of
+                    // `ReadProcessMemory` calls per row on top of the three
+                    // pointer hops, and at the 60 Hz poll rate that is tens of
+                    // thousands of kernel transitions a second for a list whose
+                    // contents only move when someone finishes or passes a score.
+                    // A new map is not on that clock -- `clear_play_state_for_new_map`
+                    // empties the cached list, so the timer is backdated there and
+                    // the first tick of a new play reads it immediately.
+                    if now.duration_since(self.last_leaderboard_read) >= LEADERBOARD_INTERVAL {
+                        self.last_leaderboard_read = now;
+                        self.cached_packet.leaderboard =
+                            crate::client::read_leaderboard(memory, ruleset_addr, g.mode);
+                    }
                     if self.cached_packet.play.mods.number != g.mods {
                         self.cached_packet.play.mods =
                             crate::v2::create_mods_state(g.mods, &g.mods_str);
@@ -2839,11 +2939,36 @@ mod tests {
     #[cfg(feature = "pp")]
     use super::performance_graph;
     use super::{
-        FILE_RETRY_INITIAL, FILE_RETRY_MAX, clear_play_state_for_new_map, file_attempt_due,
-        is_paused, note_file_load_failure, restore_beatmap_ruleset, should_clear_play_state,
+        FILE_RETRY_INITIAL, FILE_RETRY_MAX, LEADERBOARD_INTERVAL, clear_play_state_for_new_map,
+        file_attempt_due, is_paused, note_file_load_failure, restore_beatmap_ruleset,
+        should_clear_play_state,
     };
     use crate::v2::TosuV2Packet;
     use std::time::{Duration, Instant};
+
+    /// The score list is walked on a 1 Hz timer rather than on every tick.
+    ///
+    /// This is a rate limit, not a cache of a fixed size, so the property worth
+    /// pinning is the interval itself: a second is long enough to collapse the
+    /// 60 reads a second into one, and short enough that a score moving up the
+    /// board is not visibly stale. A regression to "every tick" (the bug this
+    /// replaced) or to something coarser than a second would both be wrong.
+    #[test]
+    fn the_leaderboard_is_re_read_on_a_one_second_timer() {
+        assert_eq!(
+            LEADERBOARD_INTERVAL,
+            Duration::from_secs(1),
+            "the score list is re-walked at 1 Hz"
+        );
+        // The backdating the two reset sites rely on: subtracting the interval
+        // must make the very next read due, or a freshly loaded map would sit
+        // with an empty leaderboard for up to a second.
+        let just_reset = Instant::now() - LEADERBOARD_INTERVAL;
+        assert!(
+            just_reset.elapsed() >= LEADERBOARD_INTERVAL,
+            "a reset must leave the next read immediately due"
+        );
+    }
 
     /// A finished attempt, as the provider would hold it between plays.
     fn played_packet() -> TosuV2Packet {
