@@ -62,6 +62,7 @@ A lightweight native Rust data provider emitting **[tosu](https://github.com/Kot
   - Automatic detection of tournament client processes via 32-bit PEB inspection.
   - Auto-sorting by `ipc_id` (0..n) and team assignment (`left` / `right`).
   - Team score aggregation, star counts, and match status.
+  - Optional **per-mod score weighting** (`[scoring]`): rate a play by the mods it was set on, with `tourney.totalScore` recomputed from the weighted per-player scores.
   - `#multiplayer` tournament chat extraction with team attribution.
 - **Performance Engine**:
   - Built-in PP calculation powered by `rosu-pp`.
@@ -143,11 +144,44 @@ enable_pp = true          # Real-time gradual PP calculation
 gradual_pp_chunks = 100   # Number of gradual PP checkpoints per beatmap (1-250)
 enable_hit_errors = true  # Include full hit error array in JSON packet
 
+[scoring]
+enable_mod_multipliers = false  # Weight reported scores by mods (off: in-game scores)
+mod_multipliers = { "NM" = 1.0, "NF" = 1.0, "EZ" = 1.0, ... }  # Every mod, at 1.0 by default
+
 [logging]
 level = "info"            # "trace", "debug", "info", "warn", "error"
 log_to_file = true        # Save logs to daily rolling files
 max_log_files = 7         # Maximum daily log files to retain before pruning
 ```
+
+### Per-Mod Score Multipliers
+
+`[scoring] mod_multipliers` weights the score a play reports, for tournaments
+that rate a play by the mods it was set on. It ships listing **every** mod at
+`1.0`, so the in-game score is what you get until you change a value:
+
+```toml
+[scoring]
+enable_mod_multipliers = true
+mod_multipliers = { "NM" = 1.0, "NF" = 0.5, "EZ" = 1.8, "HD" = 1.05, "HR" = 1.1, "DT/NC" = 1.1 }
+```
+
+* While enabled, `play.score`, `resultsScreen.score` and every
+  `tourney.clients[].play.score` are multiplied, and `tourney.totalScore` becomes
+  the sum of those weighted scores — the tournament manager's own total is a sum
+  of *unweighted* scores and cannot be rescaled once one client carries a
+  different factor than another. Tournament overlays should read
+  `tourney.totalScore` rather than adding up client scores themselves.
+* Accuracy, rank, pp, `profile.*` and `leaderboard[].score` are never weighted.
+* Factors of different mods **multiply**: HDHR with `{ "HD" = 1.05, "HR" = 1.1 }`
+  scores 1.155x.
+* Keys that name more than one acronym are the mods osu! sets in a single slot
+  (Nightcore sets the DoubleTime bit too), so `"DT/NC"` is one factor rather than
+  two; writing `"DT"` or `"NC"` alone sets the same slot. The other such slots
+  are `"SD/PF"` and `"AT/CN"`. `"NM"` is a play with no mods.
+* Keys are case-insensitive, and an unknown acronym is a **config error** rather
+  than a silently ignored entry — `rtosu-dataprovider config validate` names the
+  offending key. Factors must be between `0.01` and `100.0`.
 
 ---
 
@@ -217,6 +251,28 @@ fn main() -> anyhow::Result<()> {
     }
 }
 ```
+
+### Weighting a Play by Its Mods
+
+The library path takes the same table `[scoring]` does, so a consumer can weight
+scores without a config file. `identity()` means "report the in-game score":
+
+```rust
+use rtosu_dataprovider::{OsuReader, scoring::ModMultipliers};
+
+let table = std::collections::HashMap::from([
+    ("EZ".to_string(), 1.8),
+    ("NF".to_string(), 0.5),
+    ("NM".to_string(), 1.0),
+]);
+let mut reader = OsuReader::builder()
+    .mod_multipliers(ModMultipliers::new(&table)?)
+    .build()?;
+```
+
+Keys are validated by `ModMultipliers::new` (`"DT/NC"` names one osu! slot, an
+unknown acronym is an error), and the weighted score is `round(score x factor)`
+saturated to `i32::MAX`.
 
 ### Async Tokio Stream
 For async applications, convert the reader into a `Stream`:

@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
 
@@ -18,6 +19,7 @@ pub struct AppConfig {
     pub server: ServerConfig,
     pub poll: PollConfig,
     pub features: FeatureConfig,
+    pub scoring: ScoringConfig,
     pub logging: LoggingConfig,
 }
 
@@ -93,6 +95,26 @@ pub struct FeatureConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct ScoringConfig {
+    /// Weight the reported score by the mods the play was set on.
+    ///
+    /// Off by default: a data provider that silently reports numbers the game
+    /// did not is worse than one that does not have the feature. While off, the
+    /// table below is parsed and validated but never applied, which is what
+    /// makes it safe to edit before turning this on.
+    pub enable_mod_multipliers: bool,
+    /// Mod acronym -> score factor, multiplied together across the mods a play
+    /// has (see [`crate::scoring`]).
+    ///
+    /// Keys are the acronyms `play.mods.name` reports, plus `"NM"` for a
+    /// modless play, and a key may name one osu! slot as a group (`"DT/NC"`,
+    /// because Nightcore sets the DoubleTime bit too). The default lists every
+    /// slot at 1.0: the in-game score, unchanged, but visible.
+    pub mod_multipliers: HashMap<String, f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LoggingConfig {
     /// Logging verbosity level ("trace", "debug", "info", "warn", "error")
     pub level: String,
@@ -108,6 +130,7 @@ impl Default for AppConfig {
             server: ServerConfig::default(),
             poll: PollConfig::default(),
             features: FeatureConfig::default(),
+            scoring: ScoringConfig::default(),
             logging: LoggingConfig::default(),
         }
     }
@@ -146,6 +169,37 @@ impl Default for FeatureConfig {
             enable_pp: true,
             enable_hit_errors: true,
         }
+    }
+}
+
+impl Default for ScoringConfig {
+    fn default() -> Self {
+        Self {
+            enable_mod_multipliers: false,
+            // Every mod the game can report, at 1.0. See `scoring.rs`: the table
+            // is the documentation of which keys exist.
+            mod_multipliers: crate::scoring::default_multipliers(),
+        }
+    }
+}
+
+impl ScoringConfig {
+    /// The multipliers the reader should use: the configured table when the
+    /// feature is on, and an identity table when it is off.
+    ///
+    /// This is where `enable_mod_multipliers` is applied, so the reader never
+    /// has to carry both the flag and the table and ask about them separately.
+    /// The table was validated by [`AppConfig::validate`] before anything could
+    /// reach here, so a parse failure at this point is a programming error and
+    /// is treated as one.
+    pub fn resolved_multipliers(&self) -> Result<crate::scoring::ModMultipliers> {
+        if !self.enable_mod_multipliers {
+            return Ok(crate::scoring::ModMultipliers::identity());
+        }
+        crate::scoring::ModMultipliers::new(&self.mod_multipliers).with_context(|| {
+            "scoring.mod_multipliers is invalid; run `config validate` for the exact key"
+                .to_string()
+        })
     }
 }
 
@@ -221,6 +275,16 @@ impl AppConfig {
             anyhow::bail!(
                 "logging.level must be one of: trace, debug, info, warn, error (got '{}')",
                 self.logging.level
+            );
+        }
+        // The table is validated whether or not the feature is on: a config that
+        // only fails once the switch is flipped is a trap, and the whole point
+        // of shipping every mod at 1.0 is that an operator edits the table first
+        // and enables it afterwards.
+        let multipliers = crate::scoring::ModMultipliers::new(&self.scoring.mod_multipliers)?;
+        if self.scoring.enable_mod_multipliers && multipliers.is_empty() {
+            tracing::warn!(
+                "scoring.enable_mod_multipliers is on but scoring.mod_multipliers is empty; every score is reported unchanged. Add an entry such as \"EZ\" = 1.8, or delete the table to silence this."
             );
         }
         Ok(())
@@ -337,6 +401,30 @@ enable_pp = true
 # Default: true
 enable_hit_errors = true
 
+[scoring]
+# Weight a play's reported score by the mods it was set on.
+# While this is true, the reported play.score, resultsScreen.score, every
+# tourney.clients[].play.score, and tourney.totalScore.left/right (which becomes
+# the sum of the weighted client scores) carry the factor below. Accuracy, rank,
+# pp and the leaderboard are never weighted.
+# Default: false
+enable_mod_multipliers = false
+
+# Mod acronym -> score factor. The keys are the acronyms reported in
+# packet.play.mods.name, plus "NM" for a play with no mods; every key below is
+# listed at 1.0, which leaves the in-game score unchanged. Change a value to
+# weight that mod, e.g. "EZ" = 1.8 or "NF" = 0.5.
+# A key naming more than one acronym is a mod osu! sets in one slot (Nightcore
+# sets the DoubleTime bit as well), so "DT/NC" is a single factor rather than
+# two; writing either acronym alone sets the same slot.
+# Factors of different mods multiply, so HDHR with { "HD" = 1.05, "HR" = 1.1 }
+# reports x1.155.
+# Range per factor: 0.01 to 100.0
+# Default: every mod at 1.0
+mod_multipliers = { "NM" = 1.0, "NF" = 1.0, "EZ" = 1.0, "TD" = 1.0, "HD" = 1.0, "HR" = 1.0, "SD/PF" = 1.0, "DT/NC" = 1.0, "RX" = 1.0, "HT" = 1.0, "FL" = 1.0, "AT/CN" = 1.0, "SO" = 1.0, "AP" = 1.0, "4K" = 1.0, "5K" = 1.0, "6K" = 1.0, "7K" = 1.0, "8K" = 1.0, "FI" = 1.0, "RD" = 1.0, "TG" = 1.0, "9K" = 1.0, "10K" = 1.0, "1K" = 1.0, "3K" = 1.0, "2K" = 1.0, "v2" = 1.0, "MR" = 1.0 }
+
+
+
 
 [logging]
 # Logging verbosity level.
@@ -394,5 +482,118 @@ mod tests {
                 "the message should name the range, got: {error}"
             );
         }
+    }
+
+    /// The shipped template's `[scoring]` table is the Rust default, key for
+    /// key.
+    ///
+    /// This is the assertion that keeps the two halves of "the default is every
+    /// mod at 1.0" honest. [`crate::scoring::default_multipliers`] builds the
+    /// table from the slot list, while the template spells it out for a human
+    /// to read; a new slot in one and not the other would be a key the file
+    /// documents as absent or a value the file never shows.
+    #[test]
+    fn the_documented_template_lists_every_mod_at_one() {
+        let template = AppConfig::generate_documented_template();
+        assert!(
+            template.contains("mod_multipliers = { \"NM\" = 1.0"),
+            "the template must show the table, not an empty one"
+        );
+
+        let parsed: AppConfig = toml::from_str(template).expect("the shipped template must parse");
+        parsed
+            .validate()
+            .expect("the shipped template must validate");
+
+        assert!(
+            !parsed.scoring.enable_mod_multipliers,
+            "the feature ships off"
+        );
+        assert_eq!(
+            parsed.scoring.mod_multipliers,
+            crate::scoring::default_multipliers(),
+            "the template and the Rust default must name the same keys"
+        );
+    }
+
+    /// The `config.toml` committed at the repository root carries the same
+    /// table, because it is the file an operator reads first.
+    ///
+    /// It is outside the crate, so nothing else would notice it drifting: a
+    /// removed key would silently stop weighting a mod for anyone who copied
+    /// that file.
+    #[test]
+    fn the_repository_config_carries_the_default_multiplier_table() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("config.toml");
+        let raw = std::fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("reading {}: {error}", path.display()));
+        let parsed: AppConfig = toml::from_str(&raw).expect("the repository config must parse");
+        parsed
+            .validate()
+            .expect("the repository config must validate");
+
+        assert_eq!(
+            parsed.scoring.mod_multipliers,
+            crate::scoring::default_multipliers(),
+            "{} must list every mod at 1.0",
+            path.display()
+        );
+        assert!(!parsed.scoring.enable_mod_multipliers);
+    }
+
+    /// A bad table fails `config validate`, whether or not the feature is on.
+    #[test]
+    fn an_invalid_multiplier_table_fails_validation() {
+        let mut config = AppConfig::default();
+        config
+            .scoring
+            .mod_multipliers
+            .insert("DTNC".to_string(), 2.0);
+        let error = config
+            .validate()
+            .expect_err("an unknown acronym must be rejected");
+        assert!(
+            error.to_string().contains("unknown mod acronym 'DTNC'"),
+            "got: {error}"
+        );
+
+        // Rejecting it while the feature is off is the point: a config that only
+        // fails once a switch is flipped is a trap, and the shipped default
+        // invites editing the table before enabling it.
+        config.scoring.enable_mod_multipliers = false;
+        config
+            .validate()
+            .expect_err("validation does not depend on the enable flag");
+
+        // And a valid table resolves to the identity table while disabled.
+        let config = AppConfig::default();
+        assert!(
+            config
+                .scoring
+                .resolved_multipliers()
+                .expect("the default table is valid")
+                .is_identity(),
+            "disabled means identity, whatever the table says"
+        );
+    }
+
+    /// Enabling the feature with a weighted table produces a table whose factor
+    /// reaches the reader.
+    #[test]
+    fn an_enabled_table_resolves_to_its_factors() {
+        let mut config = AppConfig::default();
+        config.scoring.enable_mod_multipliers = true;
+        config.scoring.mod_multipliers.insert("EZ".to_string(), 1.8);
+        config.validate().expect("1.8 is in range");
+
+        let multipliers = config
+            .scoring
+            .resolved_multipliers()
+            .expect("the table resolves");
+        assert_eq!(
+            multipliers.apply(crate::client::mod_bits::EZ, 1_000_000),
+            1_800_000
+        );
+        assert!(!multipliers.is_identity());
     }
 }

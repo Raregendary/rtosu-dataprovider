@@ -88,6 +88,29 @@ enable_pp = true
 enable_hit_errors = true
 
 
+[scoring]
+# Weight a play's reported score by the mods it was set on.
+# While this is true, the reported play.score, resultsScreen.score, every
+# tourney.clients[].play.score, and tourney.totalScore.left/right (which becomes
+# the sum of the weighted client scores) carry the factor below. Accuracy, rank,
+# pp and the leaderboard are never weighted.
+# Default: false
+enable_mod_multipliers = false
+
+# Mod acronym -> score factor. The keys are the acronyms reported in
+# packet.play.mods.name, plus "NM" for a play with no mods; every key below is
+# listed at 1.0, which leaves the in-game score unchanged. Change a value to
+# weight that mod, e.g. "EZ" = 1.8 or "NF" = 0.5.
+# A key naming more than one acronym is a mod osu! sets in one slot (Nightcore
+# sets the DoubleTime bit as well), so "DT/NC" is a single factor rather than
+# two; writing either acronym alone sets the same slot.
+# Factors of different mods multiply, so HDHR with { "HD" = 1.05, "HR" = 1.1 }
+# reports x1.155.
+# Range per factor: 0.01 to 100.0
+# Default: every mod at 1.0
+mod_multipliers = { "NM" = 1.0, "NF" = 1.0, "EZ" = 1.0, "TD" = 1.0, "HD" = 1.0, "HR" = 1.0, "SD/PF" = 1.0, "DT/NC" = 1.0, "RX" = 1.0, "HT" = 1.0, "FL" = 1.0, "AT/CN" = 1.0, "SO" = 1.0, "AP" = 1.0, "4K" = 1.0, "5K" = 1.0, "6K" = 1.0, "7K" = 1.0, "8K" = 1.0, "FI" = 1.0, "RD" = 1.0, "TG" = 1.0, "9K" = 1.0, "10K" = 1.0, "1K" = 1.0, "3K" = 1.0, "2K" = 1.0, "v2" = 1.0, "MR" = 1.0 }
+
+
 [logging]
 # Logging verbosity level.
 # Options: "trace", "debug", "info", "warn", "error"

@@ -746,6 +746,8 @@ async fn run_serve_loop(
         rtosu_dataprovider::OsuReaderMode::Solo
     };
 
+    let mod_multipliers = config.scoring.resolved_multipliers()?;
+
     println!(
         " Mode: {}",
         match mode {
@@ -759,6 +761,25 @@ async fn run_serve_loop(
         " Features: pp_calc={}, hit_errors={}, chat_attribution={}",
         config.features.enable_pp, config.features.enable_hit_errors, config.features.enable_chat
     );
+    println!(
+        " Scoring:  mod_multipliers={} ({})",
+        if config.scoring.enable_mod_multipliers {
+            "on"
+        } else {
+            "off"
+        },
+        if mod_multipliers.is_identity() {
+            "every mod at 1.0x, scores unchanged".to_string()
+        } else {
+            let weighted = config
+                .scoring
+                .mod_multipliers
+                .iter()
+                .filter(|(_, factor)| **factor != 1.0)
+                .count();
+            format!("{weighted} weighted mod key(s)")
+        }
+    );
     println!("===========================================================");
 
     let interval = Duration::from_millis(1000 / poll_rate_hz.max(1));
@@ -770,6 +791,7 @@ async fn run_serve_loop(
         .enable_pp(config.features.enable_pp)
         .enable_hit_errors(config.features.enable_hit_errors)
         .enable_chat(config.features.enable_chat)
+        .mod_multipliers(mod_multipliers)
         .opt_pointer_width(pointer_width)
         .scan_limit_bytes(limit)
         .poll_interval(interval)

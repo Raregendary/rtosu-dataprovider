@@ -21,11 +21,17 @@ The 1.0.8 line. Design and implementation detail live in `1.0.8-updateplan.md`.
 ### Added
 
 * **Mod score multipliers** (`[scoring]`): per-mod score weights, so a tournament can rate a
-  play by its mods (`{ "EZ" = 1.8, "NF" = 0.5 }`). While enabled, `play.score`,
-  `resultsScreen.score`, and each `tourney.clients[].play.score` are weighted, and
+  play by its mods. While enabled, `play.score`, `resultsScreen.score`, and each
+  `tourney.clients[].play.score` are multiplied by the factors of the mods the play carries
+  (`{ "EZ" = 1.8, "NF" = 0.5 }`, and factors of different mods multiply), and
   `tourney.totalScore.left/right` becomes the sum of the weighted client scores — the
   tournament manager's own total is a sum of *unweighted* scores and cannot be rescaled once
-  any client carries a different weight. Off by default.
+  any client carries a different weight. Off by default, and the shipped table lists **every**
+  mod at `1.0`, so the file itself shows which keys exist and nothing moves until one is
+  edited. A key may name an osu! slot as a group (`"DT/NC"`, because Nightcore sets the
+  DoubleTime bit as well, as do `"SD/PF"` and `"AT/CN"`), which is counted once rather than
+  twice. An unknown acronym is rejected by `config validate` instead of being ignored.
+  Accuracy, rank, pp and the leaderboard are never weighted.
 * **Settings landing page** at `http://127.0.0.1:24050/`: view and edit the configuration
   from a browser, with the same overlay list the `/overlays` dashboard shows. Backed by
   `GET /api/settings` and `POST /api/settings` (a flat patch of dot-path keys, validated by
@@ -44,6 +50,11 @@ The 1.0.8 line. Design and implementation detail live in `1.0.8-updateplan.md`.
 
 ### Changed
 
+* `reader::format_tourney_packet` takes the score-multiplier table as a third
+  argument (`&scoring::ModMultipliers`). Library consumers that call it directly
+  can pass `&ModMultipliers::identity()` for the previous behaviour, or
+  `scoring::ModMultipliers::new(&table)?` to weight; `OsuReaderBuilder`'s
+  `mod_multipliers(...)` is the same setting for the builder path.
 * Development notes, release specs, and audit records no longer sit in the repository root.
   They live in the ignored `validations/notes/`, `validations/audits/`, and
   `validations/scratch/` directories, and `.gitignore` matches them by pattern.

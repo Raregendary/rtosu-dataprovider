@@ -25,6 +25,7 @@ pub struct OsuReaderBuilder {
     enable_pp: bool,
     enable_hit_errors: bool,
     enable_chat: bool,
+    mod_multipliers: crate::scoring::ModMultipliers,
 }
 
 impl Default for OsuReaderBuilder {
@@ -40,6 +41,9 @@ impl Default for OsuReaderBuilder {
             enable_pp: true,
             enable_hit_errors: true,
             enable_chat: true,
+            // A library consumer that never sets a table gets the in-game
+            // scores, which is the same contract `[scoring]` ships under.
+            mod_multipliers: crate::scoring::ModMultipliers::identity(),
         }
     }
 }
@@ -115,6 +119,17 @@ impl OsuReaderBuilder {
         self
     }
 
+    /// Weight submitted scores by the mods they were played with.
+    ///
+    /// Takes a parsed table rather than a config path so the crate's
+    /// `[scoring]` section and a library consumer's own numbers reach the
+    /// reader the same way. [`crate::scoring::ModMultipliers::identity`] is the
+    /// "no weighting" value, and is what the builder starts with.
+    pub fn mod_multipliers(mut self, multipliers: crate::scoring::ModMultipliers) -> Self {
+        self.mod_multipliers = multipliers;
+        self
+    }
+
     pub fn build(self) -> Result<OsuReader> {
         OsuReader::from_builder(self)
     }
@@ -143,6 +158,7 @@ impl OsuReader {
         )?;
         solo_session.enable_pp = builder.enable_pp;
         solo_session.enable_hit_errors = builder.enable_hit_errors;
+        solo_session.mod_multipliers = builder.mod_multipliers.clone();
 
         let mut tourney_session = TournamentSession::new(
             &builder.tournament_profile,
@@ -152,6 +168,7 @@ impl OsuReader {
         tourney_session.enable_chat = builder.enable_chat;
         tourney_session.enable_pp = builder.enable_pp;
         tourney_session.enable_hit_errors = builder.enable_hit_errors;
+        tourney_session.mod_multipliers = builder.mod_multipliers.clone();
 
         let mut reader = Self {
             builder,
@@ -203,7 +220,11 @@ impl OsuReader {
 
         if is_tourney {
             let snap = self.tourney_session.poll()?;
-            let packet = format_tourney_packet(&snap, self.tourney_session.enable_hit_errors);
+            let packet = format_tourney_packet(
+                &snap,
+                self.tourney_session.enable_hit_errors,
+                &self.tourney_session.mod_multipliers,
+            );
             crate::instr_scope!(PacketClone);
             self.last_packet = packet.clone();
             Ok(packet)
@@ -323,7 +344,11 @@ impl OsuReaderStream {
     }
 }
 
-pub fn format_tourney_packet(snap: &TournamentSnapshot, enable_hit_errors: bool) -> TosuV2Packet {
+pub fn format_tourney_packet(
+    snap: &TournamentSnapshot,
+    enable_hit_errors: bool,
+    scoring: &crate::scoring::ModMultipliers,
+) -> TosuV2Packet {
     let mut packet = TosuV2Packet {
         client: "stable".to_string(),
         server: "ppy.sh".to_string(),
@@ -391,6 +416,11 @@ pub fn format_tourney_packet(snap: &TournamentSnapshot, enable_hit_errors: bool)
         if !enable_hit_errors {
             play.hit_error_array = std::sync::Arc::default();
         }
+        // Weighted here rather than inside `gameplay_to_play`, which is a pure
+        // mapping shared with the solo path's own reshaping: a table applied in
+        // both places would apply twice. `play.mods.number` is the same mod
+        // field the reshape read, so the factor matches the mods in the packet.
+        play.score = scoring.apply(play.mods.number, play.score);
         // An empty rank means gameplay state could not be read at all. Leave it
         // empty rather than inventing a grade: a fabricated "XH" reports a
         // silver perfect on every client, including ones that are merely idle
@@ -418,7 +448,58 @@ pub fn format_tourney_packet(snap: &TournamentSnapshot, enable_hit_errors: bool)
         });
     }
 
+    apply_weighted_total_score(&mut packet, scoring);
+
     packet
+}
+
+/// Replace the manager's team totals with the sum of the weighted client
+/// scores, when there is any weighting to apply.
+///
+/// **Why this is not just leave-it-alone.** `tourney.totalScore` is the
+/// tournament manager's own number, and the manager sums the *unweighted*
+/// per-client scores -- it has no idea what factor this provider applied. Once
+/// one client carries a factor other than 1.0, the two disagree, and an overlay
+/// that draws the total bar beside per-player rows shows a bar that does not
+/// equal its own rows. So the total is recomputed here from what the packet
+/// actually reports.
+///
+/// Three cases keep the manager's value instead, each deliberate:
+///
+/// * an identity table (the feature off, or every factor at 1.0), where the
+///   recomputed sum would be the same number;
+/// * a packet whose clients are all still at 0, which is what a manager looks
+///   like between maps, where its own total is the only real one;
+/// * a client whose team is neither `left` nor `right`, which
+///   `TournamentSession` does not produce -- dropping it is the honest answer,
+///   and it can only ever lose a client the packet could not attribute anyway.
+fn apply_weighted_total_score(packet: &mut TosuV2Packet, scoring: &crate::scoring::ModMultipliers) {
+    if scoring.is_identity() {
+        return;
+    }
+
+    let mut left: i64 = 0;
+    let mut right: i64 = 0;
+    for client in &packet.tourney.clients {
+        if client.team == "left" {
+            left += i64::from(client.play.score);
+        } else if client.team == "right" {
+            right += i64::from(client.play.score);
+        }
+    }
+    if left == 0 && right == 0 {
+        return;
+    }
+
+    if packet.tourney.total_score.left != left || packet.tourney.total_score.right != right {
+        tracing::debug!(
+            "tourney.totalScore recomputed from weighted client scores: {} (left) / {} (right)",
+            left,
+            right
+        );
+    }
+    packet.tourney.total_score.left = left;
+    packet.tourney.total_score.right = right;
 }
 
 pub fn gameplay_to_play(gameplay: Option<&GameplayState>) -> PlayState {
@@ -833,5 +914,183 @@ mod tests {
         for out_of_range in [0, -1, 253, 1000, i32::MAX, i32::MIN] {
             assert_eq!(country_name(out_of_range), "", "id {out_of_range}");
         }
+    }
+
+    /// A tourney client with a readable gameplay state, so the reshape has
+    /// something to weight.
+    fn tourney_client(
+        ipc_id: usize,
+        team: &str,
+        mods: u32,
+        score: i32,
+    ) -> crate::session::TournamentClientView {
+        let mut gameplay = crate::client::GameplayState::default();
+        gameplay.mods = mods;
+        gameplay.mods_str = crate::client::format_mods(mods);
+        gameplay.score = score;
+        crate::session::TournamentClientView {
+            pid: 0,
+            ipc_id,
+            team: team.to_string(),
+            user: None,
+            gameplay: Some(gameplay),
+            beatmap: None,
+            pp: None,
+            error: None,
+        }
+    }
+
+    /// The manager's read, as the tournament session would have read it: the
+    /// sum of the *unweighted* client scores.
+    fn manager(left_score: i32, right_score: i32) -> crate::tournament::TournamentState {
+        crate::tournament::TournamentState {
+            ruleset_address: 0,
+            left_team_address: 0,
+            right_team_address: 0,
+            ipc_state: 2,
+            is_tourney: true,
+            best_of: 0,
+            left_score,
+            right_score,
+            left_stars: 0,
+            right_stars: 0,
+            first_team_name: String::new(),
+            second_team_name: String::new(),
+            stars_visible: false,
+            score_visible: false,
+            finalized: false,
+            chat: Vec::new(),
+        }
+    }
+
+    fn tourney_snapshot(
+        clients: Vec<crate::session::TournamentClientView>,
+        manager: crate::tournament::TournamentState,
+    ) -> crate::session::TournamentSnapshot {
+        crate::session::TournamentSnapshot {
+            captured_at_ms: 0,
+            poll_duration_us: 0,
+            manager: Some(manager),
+            profile: None,
+            beatmap: None,
+            game_folder: String::new(),
+            songs_folder: String::new(),
+            skin_folder: String::new(),
+            game_time: 0,
+            clients,
+            performance: Default::default(),
+            focused: false,
+        }
+    }
+
+    fn multipliers(entries: &[(&str, f64)]) -> crate::scoring::ModMultipliers {
+        let raw = entries
+            .iter()
+            .map(|(key, factor)| (key.to_string(), *factor))
+            .collect();
+        crate::scoring::ModMultipliers::new(&raw).expect("the test table must be valid")
+    }
+
+    /// With the feature off, the packet is the one rtosu served before it
+    /// existed: the clients' in-game scores and the manager's own totals.
+    ///
+    /// This is the parity guard. Every tournament overlay that exists today
+    /// reads these fields, and the tosu diff runs with the default config, so
+    /// the unweighted path has to stay byte-identical.
+    #[test]
+    fn an_identity_table_leaves_the_tournament_packet_untouched() {
+        let clients = vec![
+            tourney_client(0, "left", crate::client::mod_bits::EZ, 1_000_000),
+            tourney_client(1, "right", 0, 2_000_000),
+        ];
+        let packet = format_tourney_packet(
+            &tourney_snapshot(clients, manager(1_000_000, 2_000_000)),
+            true,
+            &crate::scoring::ModMultipliers::identity(),
+        );
+
+        assert_eq!(packet.tourney.clients[0].play.score, 1_000_000);
+        assert_eq!(packet.tourney.clients[1].play.score, 2_000_000);
+        assert_eq!(
+            packet.tourney.total_score.left, 1_000_000,
+            "the manager's read is already the right answer with no weighting"
+        );
+        assert_eq!(packet.tourney.total_score.right, 2_000_000);
+    }
+
+    /// With the feature on, each client's score is weighted exactly once and
+    /// `totalScore` becomes the sum of those weighted scores, because the
+    /// manager's own total cannot be rescaled per team: two clients on the same
+    /// team can carry different mods.
+    #[test]
+    fn weighted_client_scores_are_summed_into_the_team_totals() {
+        let clients = vec![
+            tourney_client(0, "left", crate::client::mod_bits::EZ, 1_000_000),
+            tourney_client(1, "left", 0, 500_000),
+            tourney_client(
+                2,
+                "right",
+                crate::client::mod_bits::DT | crate::client::mod_bits::NC,
+                2_000_000,
+            ),
+        ];
+        let packet = format_tourney_packet(
+            &tourney_snapshot(clients, manager(1_500_000, 2_000_000)),
+            true,
+            &multipliers(&[("EZ", 1.8), ("NM", 1.0), ("DT/NC", 1.5)]),
+        );
+
+        assert_eq!(
+            packet.tourney.clients[0].play.score, 1_800_000,
+            "1.8x, applied once"
+        );
+        assert_eq!(packet.tourney.clients[1].play.score, 500_000);
+        assert_eq!(
+            packet.tourney.clients[2].play.score, 3_000_000,
+            "Nightcore is one slot, so 1.5x rather than 2.25x"
+        );
+
+        assert_eq!(packet.tourney.total_score.left, 2_300_000);
+        assert_eq!(
+            packet.tourney.total_score.right, 3_000_000,
+            "the manager's 2_000_000 is not what the packet reports per client"
+        );
+    }
+
+    /// A scoreline that has not started yet keeps the manager's read, so the
+    /// score bar does not blank out during a map load or a retry.
+    #[test]
+    fn an_all_zero_scoreline_keeps_the_managers_totals() {
+        let clients = vec![
+            tourney_client(0, "left", crate::client::mod_bits::EZ, 0),
+            tourney_client(1, "right", crate::client::mod_bits::EZ, 0),
+        ];
+        let packet = format_tourney_packet(
+            &tourney_snapshot(clients, manager(3_000_000, 4_000_000)),
+            true,
+            &multipliers(&[("EZ", 1.8)]),
+        );
+
+        assert_eq!(packet.tourney.total_score.left, 3_000_000);
+        assert_eq!(packet.tourney.total_score.right, 4_000_000);
+    }
+
+    /// A client whose gameplay state could not be read contributes its 0 like
+    /// any other client, so an unreadable client cannot make a weighted team
+    /// total disagree with the rows printed beside it.
+    #[test]
+    fn an_unreadable_client_contributes_zero() {
+        let mut unreadable = tourney_client(0, "left", crate::client::mod_bits::EZ, 0);
+        unreadable.gameplay = None;
+        let clients = vec![unreadable, tourney_client(1, "right", 0, 1_000_000)];
+        let packet = format_tourney_packet(
+            &tourney_snapshot(clients, manager(0, 1_000_000)),
+            true,
+            &multipliers(&[("EZ", 1.8)]),
+        );
+
+        assert_eq!(packet.tourney.clients[0].play.score, 0);
+        assert_eq!(packet.tourney.total_score.left, 0);
+        assert_eq!(packet.tourney.total_score.right, 1_000_000);
     }
 }

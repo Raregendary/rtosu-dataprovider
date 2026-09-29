@@ -141,6 +141,14 @@ consequences worth knowing before you rely on it:
 Reading the real match type would need a new memory offset for the lobby
 settings, which is not implemented.
 
+**Use `tourney.totalScore`, not a sum of `clients[].play.score`.** The server
+reads the manager's own team totals, and while `[scoring] enable_mod_multipliers`
+is off those totals are exactly the sum of the clients. With it on, each
+`clients[].play.score` is weighted by that client's mods — two players on one
+team can carry different factors — and the provider replaces `totalScore` with
+the sum of the *weighted* scores. An overlay that adds the client rows up itself
+would show a bar beside rows that do not add up to it.
+
 If you would rather address the provider directly, the shim exposes it:
 
 ```js

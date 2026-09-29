@@ -134,6 +134,10 @@ pub struct TournamentSession {
     pub enable_chat: bool,
     pub enable_pp: bool,
     pub enable_hit_errors: bool,
+    /// The `[scoring] mod_multipliers` table the tournament path weights each
+    /// client's score with. An identity table means the manager's own
+    /// `totalScore` is left alone (see `format_tourney_packet`).
+    pub mod_multipliers: crate::scoring::ModMultipliers,
     pub current_checksum: String,
     #[cfg(feature = "pp")]
     pub cached_beatmap: Option<rosu_pp::Beatmap>,
@@ -178,6 +182,7 @@ impl TournamentSession {
             enable_chat: true,
             enable_pp: true,
             enable_hit_errors: true,
+            mod_multipliers: crate::scoring::ModMultipliers::identity(),
             current_checksum: String::new(),
             #[cfg(feature = "pp")]
             cached_beatmap: None,
@@ -1412,6 +1417,11 @@ pub struct SoloSession {
     pub cached_packet: crate::v2::TosuV2Packet,
     pub enable_pp: bool,
     pub enable_hit_errors: bool,
+    /// The `[scoring] mod_multipliers` table every score this session reports is
+    /// weighted with. Applied at each assignment rather than to the packet on
+    /// the way out, because v1, the precise payload and StreamCompanion all
+    /// reshape this same cached packet and must see the weighted number.
+    pub mod_multipliers: crate::scoring::ModMultipliers,
     cached_hit_errors_total_hits: u32,
     cached_hit_errors: Arc<[i16]>,
     cached_unstable_rate: f64,
@@ -1617,6 +1627,7 @@ impl SoloSession {
             },
             enable_pp: true,
             enable_hit_errors: true,
+            mod_multipliers: crate::scoring::ModMultipliers::identity(),
             cached_hit_errors_total_hits: 0,
             cached_hit_errors: Arc::default(),
             cached_unstable_rate: 0.0,
@@ -2394,7 +2405,11 @@ impl SoloSession {
                         number: g.mode,
                         name: ruleset_name(g.mode).to_string(),
                     };
-                    self.cached_packet.play.score = g.score;
+                    // The mods and the score are read together here, so the
+                    // factor comes from the same `g` the mod list in the packet
+                    // does. Weighting the packet later would have to assume the
+                    // two still agreed.
+                    self.cached_packet.play.score = self.mod_multipliers.apply(g.mods, g.score);
                     self.cached_packet.play.accuracy = g.accuracy;
                     self.cached_packet.play.combo.current = g.combo as i32;
                     self.cached_packet.play.combo.max = g.max_combo as i32;
@@ -2534,7 +2549,7 @@ impl SoloSession {
                         number: g.mode,
                         name: ruleset_name(g.mode).to_string(),
                     };
-                    self.cached_packet.play.score = g.score;
+                    self.cached_packet.play.score = self.mod_multipliers.apply(g.mods, g.score);
                     self.cached_packet.play.accuracy = g.accuracy;
                     self.cached_packet.play.combo.current = g.combo as i32;
                     self.cached_packet.play.combo.max = g.max_combo as i32;
@@ -2573,7 +2588,8 @@ impl SoloSession {
                         number: res.mode,
                         name: ruleset_name(res.mode).to_string(),
                     };
-                    self.cached_packet.results_screen.score = res.score;
+                    self.cached_packet.results_screen.score =
+                        self.mod_multipliers.apply(res.mods, res.score);
                     self.cached_packet.results_screen.accuracy = res.accuracy;
                     self.cached_packet.results_screen.max_combo = res.max_combo as i32;
                     self.cached_packet.results_screen.rank = res.grade.clone();
@@ -2591,7 +2607,7 @@ impl SoloSession {
                         number: res.mode,
                         name: ruleset_name(res.mode).to_string(),
                     };
-                    self.cached_packet.play.score = res.score;
+                    self.cached_packet.play.score = self.mod_multipliers.apply(res.mods, res.score);
                     self.cached_packet.play.accuracy = res.accuracy;
                     self.cached_packet.play.combo.current = res.max_combo as i32;
                     self.cached_packet.play.combo.max = res.max_combo as i32;
