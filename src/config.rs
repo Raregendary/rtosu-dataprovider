@@ -88,6 +88,13 @@ pub struct FeatureConfig {
     pub enable_chat: bool,
     /// Optional real-time PP calculation (requires feature 'rosu-mem' or 'pp')
     pub enable_pp: bool,
+    /// Compute PP as if the NoFail mod were not on the play.
+    ///
+    /// For tournaments that force NF on everybody and want the rating the play
+    /// would have been worth without it. `play.mods` still reports NF, and star
+    /// rating, accuracy, hits and rank do not move -- only the pp family.
+    /// No-op on osu!taiko, whose calculator applies no NF penalty.
+    pub ignore_nf_for_pp: bool,
     /// Number of gradual PP chunks per beatmap (1 = full map only / no gradual, max = 250, default = 100)
     /// Include hit error array in JSON packet (if false, sends [] while still calculating unstableRate)
     pub enable_hit_errors: bool,
@@ -167,6 +174,7 @@ impl Default for FeatureConfig {
         Self {
             enable_chat: true,
             enable_pp: true,
+            ignore_nf_for_pp: false,
             enable_hit_errors: true,
         }
     }
@@ -394,6 +402,14 @@ enable_pp = true
 # Range: 1 to 250
 # Default: 100
 # Set to 1 to only compute full-map difficulty (disables gradual live PP resolution for ultra-low CPU).
+
+# Compute PP as if the NoFail mod were not on the play.
+# For tournaments that force NF on every player and want the pp the play would
+# have been worth without it. play.mods still reports NF, and star rating,
+# accuracy, hits and rank are untouched -- only the pp values change.
+# No-op on osu!taiko, where our calculator applies no NF penalty.
+# Default: false
+ignore_nf_for_pp = false
 
 # Include the full hit error array in the JSON packet (packet.play.hitErrorArray).
 # When set to false, hitErrorArray is sent as an empty array [] to save network bandwidth

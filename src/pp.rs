@@ -424,6 +424,31 @@ pub mod calculator {
         GameModsLegacy::from_bits(mods_bits)
     }
 
+    /// The bits a **performance** calculation should see.
+    ///
+    /// `ignore_nf` drops NoFail before the performance calculator ever sees it,
+    /// which is how `features.ignore_nf_for_pp` produces the rating the play
+    /// would have earned without a mod the tournament forced on everybody.
+    ///
+    /// **Only pp.** NoFail is read by the performance calculator and by nothing
+    /// else in the library -- the difficulty calculator never looks at it -- so
+    /// stripping it here cannot move a star rating, a hit window, or a BPM. It
+    /// does move anything that reaches `Performance::mods`, which is why every
+    /// pp path goes through this and every difficulty path does not.
+    pub fn pp_mods_bits(mods_bits: u32, ignore_nf: bool) -> u32 {
+        if ignore_nf {
+            mods_bits & !crate::client::mod_bits::NF
+        } else {
+            mods_bits
+        }
+    }
+
+    /// [`parse_mods_bits`] for a performance calculation: see
+    /// [`pp_mods_bits`] for what `ignore_nf` does and why it is pp-only.
+    pub fn pp_mods(mods_bits: u32, ignore_nf: bool) -> GameModsLegacy {
+        parse_mods_bits(pp_mods_bits(mods_bits, ignore_nf))
+    }
+
     /// Parse legacy mod string (e.g. "HDHR", "DT") into GameModsLegacy
     pub fn parse_legacy_mods(mod_str: &str) -> GameModsLegacy {
         let clean = mod_str.trim().to_uppercase();
@@ -760,12 +785,223 @@ pub mod calculator {
             // Submitted maps use their ID directly
             assert_eq!(beatmap_cache_key(12345, &b1), 12345);
         }
+
+        fn mania_map(objects: usize) -> Beatmap {
+            let mut map_content = String::from(
+                "osu file format v14\n\n[General]\nMode: 3\n\n[Metadata]\nTitle:Test\nArtist:Test\nCreator:Test\nVersion:Normal\n\n[Difficulty]\nHPDrainRate:5\nCircleSize:4\nOverallDifficulty:8\nApproachRate:9\nSliderMultiplier:1.4\nSliderTickRate:1\n\n[TimingPoints]\n0,500,4,2,0,50,1,0\n\n[HitObjects]\n",
+            );
+            for i in 0..objects as u32 {
+                let column = (i % 4) * 64;
+                map_content.push_str(&format!("{column},192,{},1,0,0:0:0:0:\n", 1000 + i * 100));
+            }
+            Beatmap::from_bytes(map_content.as_bytes()).expect("parse mania map")
+        }
+
+        /// `pp_mods` strips NoFail and nothing else, in both toggle states.
+        ///
+        /// The bit that matters is the *others*: a play under `NF|HD` must reach
+        /// the performance calculator as `HD`, not as `NM`, or the toggle would
+        /// quietly discard the mods it was not asked to touch.
+        #[test]
+        fn pp_mods_drops_only_the_no_fail_bit() {
+            use crate::client::mod_bits;
+
+            let nf_hd = mod_bits::NF | mod_bits::HD;
+
+            assert_eq!(pp_mods(nf_hd, true).bits(), mod_bits::HD);
+            assert_eq!(pp_mods(nf_hd, false).bits(), nf_hd);
+            assert_eq!(pp_mods_bits(nf_hd, true), mod_bits::HD);
+            assert_eq!(pp_mods_bits(nf_hd, false), nf_hd);
+
+            assert_eq!(pp_mods(0, true).bits(), 0, "NM stays NM");
+            assert_eq!(pp_mods(0, false).bits(), 0);
+            assert_eq!(
+                pp_mods(mod_bits::NF, true).bits(),
+                0,
+                "NF alone becomes a modless play"
+            );
+
+            // Every other bit survives, which is what keeps this a pp-only
+            // concern: the difficulty inputs are the same either way.
+            let everything = mod_bits::NF
+                | mod_bits::HD
+                | mod_bits::HR
+                | mod_bits::DT
+                | mod_bits::FL
+                | mod_bits::SCORE_V2;
+            assert_eq!(pp_mods(everything, true).bits(), everything & !mod_bits::NF);
+        }
+
+        /// osu!mania pays a flat 25 % for NoFail, so the toggle is measurable
+        /// there on any scoreline -- unlike osu!standard, where the penalty is
+        /// miss-driven (see the test below).
+        ///
+        /// The numbers are the contract: with the toggle off the reported rating
+        /// is the one osu! would submit (x0.75); with it on it is exactly the
+        /// modless rating, because the difficulty source is the same and the
+        /// `nf()` term is the only difference rosu-pp makes.
+        #[test]
+        fn ignoring_nf_returns_manias_flat_penalty() {
+            let map = mania_map(200);
+            let mods_for = |bits| pp_mods(bits, false);
+            let read_pp = |bits| {
+                let attrs = Difficulty::new().mods(mods_for(bits)).calculate(&map);
+                let fc = calc_detailed_live_and_fc_pp(None, &attrs, mods_for(bits), 0, 0, 0, 0, 0);
+                let live = calc_detailed_live_and_fc_pp(
+                    Some(&attrs),
+                    &attrs,
+                    mods_for(bits),
+                    195,
+                    195,
+                    0,
+                    0,
+                    5,
+                );
+                (attrs.stars(), fc.fc, live.current)
+            };
+            let read_ignored = |bits| {
+                let mods = pp_mods(bits, true);
+                let attrs = Difficulty::new().mods(mods).calculate(&map);
+                let fc = calc_detailed_live_and_fc_pp(None, &attrs, mods, 0, 0, 0, 0, 0);
+                let live =
+                    calc_detailed_live_and_fc_pp(Some(&attrs), &attrs, mods, 195, 195, 0, 0, 5);
+                (attrs.stars(), fc.fc, live.current)
+            };
+
+            let nf = crate::client::mod_bits::NF;
+            let (nm_stars, nm_fc, nm_live) = read_pp(0);
+            let (nf_stars, nf_fc, nf_live) = read_pp(nf);
+
+            assert_eq!(nf_stars, nm_stars, "NoFail is not a difficulty mod");
+            assert_eq!(
+                nf_fc,
+                crate::beatmap::round_value(nm_fc * 0.75, 2),
+                "the value osu! would submit, NoFail's 25 % included"
+            );
+            assert_eq!(nf_live, crate::beatmap::round_value(nm_live * 0.75, 2));
+
+            let (ignored_stars, ignored_fc, ignored_live) = read_ignored(nf);
+            assert_eq!(ignored_stars, nm_stars);
+            assert_eq!(ignored_fc, nm_fc, "exactly, not approximately");
+            assert_eq!(ignored_live, nm_live);
+            assert!(ignored_fc > nf_fc, "the toggle has to move something");
+        }
+
+        /// osu!standard's NoFail penalty is miss-driven, and the formula's floor
+        /// is what makes it observable: `(1 - 0.02 * misses).max(0.9)` is 1.0 on
+        /// a missless play and 0.9 from five misses up.
+        ///
+        /// Both halves are pinned, because both are surprising. A test written
+        /// against "NF costs 10 %" would pass on the five-miss play and fail on
+        /// the FC; the feature is only visible on the scoreline where the penalty
+        /// exists, and the fc value of an NF play is legitimately unchanged.
+        #[test]
+        fn ignoring_nf_standard_takes_the_miss_penalty_back() {
+            let map = circle_map(100);
+            let nf = crate::client::mod_bits::NF;
+
+            let attrs_kept = Difficulty::new().mods(pp_mods(nf, false)).calculate(&map);
+            let attrs_nm = Difficulty::new().mods(pp_mods(0, false)).calculate(&map);
+            let attrs_ignored = Difficulty::new().mods(pp_mods(nf, true)).calculate(&map);
+            assert_eq!(
+                attrs_kept.stars(),
+                attrs_nm.stars(),
+                "NoFail is not a difficulty mod, so the toggle cannot move stars"
+            );
+            assert_eq!(attrs_ignored.stars(), attrs_nm.stars());
+
+            let missless =
+                |mods| calc_detailed_live_and_fc_pp(None, &attrs_kept, mods, 0, 0, 0, 0, 0).fc;
+            assert_eq!(
+                missless(pp_mods(nf, false)),
+                missless(pp_mods(0, false)),
+                "no misses means the multiplier is 1.0, so nothing to ignore"
+            );
+
+            let with_misses = |mods| {
+                calc_detailed_live_and_fc_pp(Some(&attrs_kept), &attrs_kept, mods, 95, 95, 0, 0, 5)
+                    .current
+            };
+            let nm_live = with_misses(pp_mods(0, false));
+            let nf_live = with_misses(pp_mods(nf, false));
+            assert_eq!(
+                nf_live,
+                crate::beatmap::round_value(nm_live * 0.9, 2),
+                "five misses reach the 0.9 floor"
+            );
+
+            // The toggle, applied to the same play, returns the NM rating
+            // exactly -- the difficulty attributes are the same object, and the
+            // `nf()` term is the only thing that was subtracted.
+            let ignored_live = calc_detailed_live_and_fc_pp(
+                Some(&attrs_ignored),
+                &attrs_ignored,
+                pp_mods(nf, true),
+                95,
+                95,
+                0,
+                0,
+                5,
+            )
+            .current;
+            assert_eq!(ignored_live, nm_live);
+            assert!(ignored_live > nf_live);
+        }
+
+        /// With the toggle on, an NF play and a modless play share one difficulty
+        /// pass, because the cache is keyed by the bits the calculator actually
+        /// sees.
+        ///
+        /// That sharing is the design, not a collision: NoFail changes no
+        /// difficulty number, so the attributes are the same object, and the pp
+        /// difference lives in the performance calculator's `nf()` term. This
+        /// test is the one that fails if someone "fixes" the key back to the raw
+        /// bits, which would double the work and change nothing else.
+        #[test]
+        fn an_nf_play_shares_the_modless_difficulty_entry_when_nf_is_ignored() {
+            let map = circle_map(37);
+            let nf = crate::client::mod_bits::NF;
+
+            let shared = full_difficulty(0, &map, pp_mods(nf, true));
+            let modless = full_difficulty(0, &map, pp_mods(0, false));
+            assert!(
+                Arc::ptr_eq(&shared, &modless),
+                "ignoring NF must key the cache on the stripped bits"
+            );
+
+            let kept = full_difficulty(0, &map, pp_mods(nf, false));
+            assert!(
+                !Arc::ptr_eq(&kept, &modless),
+                "with the toggle off it is a different rating input"
+            );
+            assert_eq!(
+                kept.stars(),
+                modless.stars(),
+                "different cache rows, identical difficulty"
+            );
+        }
     }
 }
-
 #[cfg(not(feature = "pp"))]
 pub mod calculator {
     pub fn parse_mods_bits(_mods_bits: u32) -> u32 {
         _mods_bits
+    }
+
+    /// The bits a performance calculation would see. Same signature as the real
+    /// `pp_mods_bits`; `pp_mods` below returns bits rather than a
+    /// `GameModsLegacy`, because the type only exists with the `pp` feature and
+    /// nothing on this build can call a performance calculator anyway.
+    pub fn pp_mods_bits(mods_bits: u32, ignore_nf: bool) -> u32 {
+        if ignore_nf {
+            mods_bits & !crate::client::mod_bits::NF
+        } else {
+            mods_bits
+        }
+    }
+
+    /// See [`pp_mods_bits`].
+    pub fn pp_mods(mods_bits: u32, ignore_nf: bool) -> u32 {
+        pp_mods_bits(mods_bits, ignore_nf)
     }
 }

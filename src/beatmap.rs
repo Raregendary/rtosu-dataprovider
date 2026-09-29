@@ -792,11 +792,12 @@ pub fn populate_beatmap_statistics(
     snapshot: &mut BeatmapSnapshot,
     map: &rosu_pp::Beatmap,
     mods: u32,
+    ignore_nf_for_pp: bool,
 ) {
     crate::instr_scope!(BeatmapDifficulty);
     let mods_legacy = crate::pp::calculator::parse_mods_bits(mods);
     let diff = rosu_pp::Difficulty::new().mods(mods_legacy).calculate(map);
-    populate_beatmap_statistics_with_diff(snapshot, map, &diff, mods);
+    populate_beatmap_statistics_with_diff(snapshot, map, &diff, mods, ignore_nf_for_pp);
 }
 
 /// Fill the difficulty-derived statistics onto an already-read snapshot.
@@ -850,14 +851,23 @@ pub fn populate_beatmap_statistics(
 /// `reading` or the four hit windows. Mapping osu!standard numbers onto them
 /// would report difficulty the calculation never produced, which is worse than
 /// a zero that reads as "not available".
+/// Fill in the difficulty-derived half of a snapshot: converted AR/CS/OD/HP,
+/// the per-skill star breakdown, and the `pp` block.
+///
+/// `mods` is the play's raw bitmask and drives everything the player sees; the
+/// difficulty pass has already happened by the time this runs (hence `diff`).
+/// `ignore_nf_for_pp` applies to **only** the `pp` values computed here: NoFail
+/// is read by the performance calculator and by nothing else, so dropping it
+/// moves no star, no hit window and no BPM.
 #[cfg(feature = "pp")]
 pub fn populate_beatmap_statistics_with_diff(
     snapshot: &mut BeatmapSnapshot,
     map: &rosu_pp::Beatmap,
     diff: &rosu_pp::any::DifficultyAttributes,
     mods: u32,
+    ignore_nf_for_pp: bool,
 ) {
-    let mods_legacy = crate::pp::calculator::parse_mods_bits(mods);
+    let mods_legacy = crate::pp::calculator::pp_mods(mods, ignore_nf_for_pp);
     let mut circles = 0;
     let mut sliders = 0;
     let mut spinners = 0;
@@ -1327,6 +1337,7 @@ mod tests {
                 &map,
                 &bpm_fixture_diff(&map, mod_bits::DT),
                 mod_bits::DT,
+                false,
             );
             assert_eq!(snapshot.stats.bpm.common, 180.0, "call {call}");
             assert_eq!(snapshot.stats.bpm.realtime, 180.0, "call {call}");
@@ -1352,9 +1363,16 @@ mod tests {
             &map,
             &bpm_fixture_diff(&map, mod_bits::DT),
             mod_bits::DT,
+            false,
         );
 
-        populate_beatmap_statistics_with_diff(&mut snapshot, &map, &bpm_fixture_diff(&map, 0), 0);
+        populate_beatmap_statistics_with_diff(
+            &mut snapshot,
+            &map,
+            &bpm_fixture_diff(&map, 0),
+            0,
+            false,
+        );
 
         assert_eq!(snapshot.stats.bpm.common, 120.0);
         assert_eq!(snapshot.stats.bpm.realtime, 120.0);
@@ -1376,6 +1394,7 @@ mod tests {
                 &map,
                 &bpm_fixture_diff(&map, mod_bits::HT),
                 mod_bits::HT,
+                false,
             );
             assert_eq!(snapshot.stats.bpm.common, 90.0, "call {call}");
             assert_eq!(snapshot.stats.bpm.realtime, 90.0, "call {call}");
@@ -1400,6 +1419,7 @@ mod tests {
                 &map,
                 &bpm_fixture_diff(&map, mod_bits::DT),
                 mod_bits::DT,
+                false,
             );
             assert_eq!(snapshot.stats.bpm.common, 180.0, "call {call}");
             assert_eq!(snapshot.stats.bpm.realtime, 180.0, "call {call}");
@@ -1505,7 +1525,7 @@ mod tests {
     fn taiko_populates_its_own_skills_and_hit_windows() {
         let (map, diff) = mode_fixture_diff(1);
         let mut snapshot = BeatmapSnapshot::default();
-        populate_beatmap_statistics_with_diff(&mut snapshot, &map, &diff, 0);
+        populate_beatmap_statistics_with_diff(&mut snapshot, &map, &diff, 0, false);
 
         let stars = &snapshot.stats.stars;
         assert!(stars.stamina.expect("taiko stamina is populated") > 0.0);
@@ -1540,7 +1560,7 @@ mod tests {
     fn taiko_leaves_flashlight_and_the_meh_and_miss_windows_alone() {
         let (map, diff) = mode_fixture_diff(1);
         let mut snapshot = BeatmapSnapshot::default();
-        populate_beatmap_statistics_with_diff(&mut snapshot, &map, &diff, 0);
+        populate_beatmap_statistics_with_diff(&mut snapshot, &map, &diff, 0, false);
 
         assert_eq!(snapshot.stats.stars.flashlight, None);
         assert_eq!(snapshot.stats.stars.slider_factor, 0.0);
@@ -1581,6 +1601,7 @@ mod tests {
             &map,
             &bpm_fixture_diff(&map, mod_bits::DT),
             mod_bits::DT,
+            false,
         );
 
         assert_eq!(snapshot.stats.hit_window.great, 19.0);
@@ -1605,7 +1626,7 @@ mod tests {
         for mode in [2u8, 3] {
             let (map, diff) = mode_fixture_diff(mode);
             let mut snapshot = BeatmapSnapshot::default();
-            populate_beatmap_statistics_with_diff(&mut snapshot, &map, &diff, 0);
+            populate_beatmap_statistics_with_diff(&mut snapshot, &map, &diff, 0, false);
 
             assert!(
                 snapshot.stats.stars.total > 0.0,
@@ -1634,7 +1655,7 @@ mod tests {
 
         let (map, diff) = mode_fixture_diff(0);
         let mut snapshot = BeatmapSnapshot::default();
-        populate_beatmap_statistics_with_diff(&mut snapshot, &map, &diff, 0);
+        populate_beatmap_statistics_with_diff(&mut snapshot, &map, &diff, 0, false);
         assert_eq!(snapshot.stats.stars.aim, 2.16);
         assert_eq!(snapshot.stats.stars.speed, 1.29);
         assert_eq!(snapshot.stats.stars.reading, 1.09);
@@ -2061,5 +2082,58 @@ mod tests {
         assert!(parsed.breaks.is_empty());
         assert!(parsed.timing_points.is_empty());
         assert_eq!(parsed.preview_time, None);
+    }
+
+    /// `ignore_nf_for_pp` is a **pp-only** switch on this function, and this is
+    /// the plumbing test for the flag the sessions pass down.
+    ///
+    /// osu!mania applies a flat 25 % for NoFail, so the two runs have to differ
+    /// in `stats.pp` by exactly that and in nothing else: the difficulty inputs
+    /// here are the raw mods, which is what keeps `stats.stars`, the converted
+    /// AR/CS/OD/HP, the object counts and the max combo identical. A regression
+    /// that stripped NF from the *difficulty* mods would be invisible in tosu's
+    /// numbers, so it is asserted rather than assumed.
+    #[test]
+    #[cfg(feature = "pp")]
+    fn the_nf_toggle_moves_only_the_pp_block() {
+        let (map, _) = mode_fixture_diff(3);
+        let nf = mod_bits::NF;
+        let stats_with = |ignore_nf_for_pp: bool| {
+            let diff = bpm_fixture_diff(&map, nf);
+            let mut snapshot = BeatmapSnapshot::default();
+            populate_beatmap_statistics_with_diff(&mut snapshot, &map, &diff, nf, ignore_nf_for_pp);
+            snapshot.stats
+        };
+
+        let kept = stats_with(false);
+        let ignored = stats_with(true);
+
+        assert!(
+            kept.pp.ss > 0.0 && kept.pp.fc > 0.0,
+            "the fixture has to score pp or this proves nothing"
+        );
+        // `stats.pp` holds the calculator's own `f64`-derived value without a
+        // rounding step, so the 25 % is compared with a tolerance rather than
+        // through `round_value`: the factor is exact, the f32 is not.
+        for (label, kept_pp, ignored_pp) in [
+            ("ss", kept.pp.ss, ignored.pp.ss),
+            ("fc", kept.pp.fc, ignored.pp.fc),
+        ] {
+            let ratio = f64::from(kept_pp) / f64::from(ignored_pp);
+            assert!(
+                (ratio - 0.75).abs() < 1e-4,
+                "{label}: NoFail has to cost osu!mania 25 %, got {kept_pp} against {ignored_pp}"
+            );
+        }
+
+        assert_eq!(ignored.stars, kept.stars, "NoFail is not a difficulty mod");
+        assert_eq!(ignored.ar, kept.ar);
+        assert_eq!(ignored.cs, kept.cs);
+        assert_eq!(ignored.od, kept.od);
+        assert_eq!(ignored.hp, kept.hp);
+        assert_eq!(ignored.bpm, kept.bpm);
+        assert_eq!(ignored.objects, kept.objects);
+        assert_eq!(ignored.max_combo, kept.max_combo);
+        assert_eq!(ignored.hit_window, kept.hit_window);
     }
 }

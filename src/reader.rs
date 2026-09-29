@@ -26,6 +26,7 @@ pub struct OsuReaderBuilder {
     enable_hit_errors: bool,
     enable_chat: bool,
     mod_multipliers: crate::scoring::ModMultipliers,
+    ignore_nf_for_pp: bool,
 }
 
 impl Default for OsuReaderBuilder {
@@ -44,6 +45,9 @@ impl Default for OsuReaderBuilder {
             // A library consumer that never sets a table gets the in-game
             // scores, which is the same contract `[scoring]` ships under.
             mod_multipliers: crate::scoring::ModMultipliers::identity(),
+            // Off by default: the pp the game would submit is the honest answer
+            // unless a tournament asks for the other one.
+            ignore_nf_for_pp: false,
         }
     }
 }
@@ -130,6 +134,16 @@ impl OsuReaderBuilder {
         self
     }
 
+    /// Compute PP as if NoFail were not on the play.
+    ///
+    /// Scoped to the pp family: `packet.play.mods` still reports NoFail, and
+    /// star rating, accuracy, hit counts and rank are untouched. No-op on
+    /// osu!taiko, whose calculator applies no NF penalty.
+    pub fn ignore_nf_for_pp(mut self, ignore: bool) -> Self {
+        self.ignore_nf_for_pp = ignore;
+        self
+    }
+
     pub fn build(self) -> Result<OsuReader> {
         OsuReader::from_builder(self)
     }
@@ -159,6 +173,7 @@ impl OsuReader {
         solo_session.enable_pp = builder.enable_pp;
         solo_session.enable_hit_errors = builder.enable_hit_errors;
         solo_session.mod_multipliers = builder.mod_multipliers.clone();
+        solo_session.ignore_nf_for_pp = builder.ignore_nf_for_pp;
 
         let mut tourney_session = TournamentSession::new(
             &builder.tournament_profile,
@@ -169,6 +184,7 @@ impl OsuReader {
         tourney_session.enable_pp = builder.enable_pp;
         tourney_session.enable_hit_errors = builder.enable_hit_errors;
         tourney_session.mod_multipliers = builder.mod_multipliers.clone();
+        tourney_session.ignore_nf_for_pp = builder.ignore_nf_for_pp;
 
         let mut reader = Self {
             builder,
@@ -778,6 +794,28 @@ mod tests {
         assert_eq!(builder.solo_profile, "stable");
         assert_eq!(builder.pointer_width, 4);
         assert_eq!(builder.mode, OsuReaderMode::Auto);
+    }
+
+    /// The pp toggle has to reach **both** sessions.
+    ///
+    /// The solo and tournament paths compute pp in different functions, so a
+    /// field wired into one of them would leave half a tournament reporting
+    /// NoFail's penalty while the other half did not -- the kind of divergence
+    /// that only shows up mid-match, on a scoreline that has misses.
+    #[test]
+    fn the_ignore_nf_toggle_reaches_both_sessions() {
+        let reader = OsuReader::builder()
+            .ignore_nf_for_pp(true)
+            .build()
+            .expect("Reader build failed");
+        assert!(reader.solo_session.ignore_nf_for_pp);
+        assert!(reader.tourney_session.ignore_nf_for_pp);
+
+        let reader = OsuReader::builder().build().expect("Reader build failed");
+        assert!(
+            !reader.solo_session.ignore_nf_for_pp && !reader.tourney_session.ignore_nf_for_pp,
+            "the default is the pp osu! would submit"
+        );
     }
 
     #[test]

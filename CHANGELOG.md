@@ -43,9 +43,14 @@ The 1.0.8 line. Design and implementation detail live in `1.0.8-updateplan.md`.
   the settings. This is a convenience guard, not authentication.
 * `features.ignore_nf_for_pp` (default `false`): compute PP as if the NoFail mod were not
   present, for tournaments that force NF on every player. `play.mods` still reports NF and
-  star rating, accuracy, and rank are untouched — only the PP family moves (×1.111 on
-  osu!std/catch, ×1.333 on osu!mania, no-op on osu!taiko, where our calculator applies no NF
-  penalty).
+  star rating, accuracy, hits, combo and rank are untouched — only the PP family moves
+  (`play.pp`, `resultsScreen.pp`, `beatmap.stats.pp`, and the pp derived for tournament
+  clients), so a lobby that is forced onto NF is rated on the play's own merit. What the
+  toggle gives back depends on the ruleset and the scoreline, because that is what osu! takes
+  away: osu!mania pays a flat ~33 % more (the calculator's ×0.75), osu!standard and osu!catch
+  pay `(1 - 0.02 × misses).max(0.9)`, so a missless FC is unchanged and a play with five or
+  more misses gains ~11 %, and osu!taiko is a no-op because our calculator applies no NF
+  penalty there.
 * This changelog.
 
 ### Changed

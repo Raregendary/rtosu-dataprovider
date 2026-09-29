@@ -138,6 +138,10 @@ pub struct TournamentSession {
     /// client's score with. An identity table means the manager's own
     /// `totalScore` is left alone (see `format_tourney_packet`).
     pub mod_multipliers: crate::scoring::ModMultipliers,
+    /// Compute each client's PP as if NoFail were not on the play
+    /// (`features.ignore_nf_for_pp`). Applies to the pp values only; the mods
+    /// reported in the packet still include NF.
+    pub ignore_nf_for_pp: bool,
     pub current_checksum: String,
     #[cfg(feature = "pp")]
     pub cached_beatmap: Option<rosu_pp::Beatmap>,
@@ -183,6 +187,7 @@ impl TournamentSession {
             enable_pp: true,
             enable_hit_errors: true,
             mod_multipliers: crate::scoring::ModMultipliers::identity(),
+            ignore_nf_for_pp: false,
             current_checksum: String::new(),
             #[cfg(feature = "pp")]
             cached_beatmap: None,
@@ -434,6 +439,7 @@ impl TournamentSession {
                                 &map,
                                 &diff,
                                 0,
+                                self.ignore_nf_for_pp,
                             );
                             temp_snap.stats.stars.live = 0.0;
                             self.cached_stats = temp_snap.stats;
@@ -689,6 +695,15 @@ impl TournamentSession {
                         gameplay.as_ref(),
                     ) {
                         let diff_mods = g.mods & !mod_bits::SCORE_V2;
+                        // The cached entry carries `stats.pp`, and the toggle
+                        // changes what that pp is, so the stripped bits are part
+                        // of the key rather than only of the calculation: an
+                        // entry built with NF dropped is not the entry a raw-NF
+                        // lookup asked for. (Stars are the same either way --
+                        // NoFail is not a difficulty mod -- so sharing the row is
+                        // correct, and the two never share a key.)
+                        let diff_mods =
+                            crate::pp::calculator::pp_mods_bits(diff_mods, self.ignore_nf_for_pp);
                         if diff_mods == 0 {
                             beatmap.stats = self.cached_stats.clone();
                         } else if let Some(stats) = self.cached_stats_by_mods.get(&diff_mods) {
@@ -698,7 +713,12 @@ impl TournamentSession {
                                 .cached_metadata
                                 .clone()
                                 .unwrap_or_else(|| beatmap.clone());
-                            crate::beatmap::populate_beatmap_statistics(&mut temp, map, diff_mods);
+                            crate::beatmap::populate_beatmap_statistics(
+                                &mut temp,
+                                map,
+                                diff_mods,
+                                self.ignore_nf_for_pp,
+                            );
                             let stats = temp.stats;
                             self.cached_stats_by_mods.insert(diff_mods, stats.clone());
                             beatmap.stats = stats;
@@ -710,10 +730,17 @@ impl TournamentSession {
                     if let Some(map) = self.cached_beatmap.as_ref() {
                         // The raw mod bits, kept alongside the parsed form: the
                         // rating depends on the mods, so they belong in the
-                        // cache key below. `parse_mods_bits(0)` is the default,
-                        // so the no-gameplay case needs no separate arm.
+                        // cache key below. `pp_mods(0, ..)` is the default, so
+                        // the no-gameplay case needs no separate arm.
+                        //
+                        // The parsed form is the *pp* form: with
+                        // `ignore_nf_for_pp` on it is the mods without NoFail, so
+                        // the rating is the one the play would have earned
+                        // without a mod the tournament forced on the lobby. The
+                        // raw bits above stay raw for the packet.
                         let mods_bits = gameplay.as_ref().map(|g| g.mods).unwrap_or(0);
-                        let mods_legacy = crate::pp::calculator::parse_mods_bits(mods_bits);
+                        let mods_legacy =
+                            crate::pp::calculator::pp_mods(mods_bits, self.ignore_nf_for_pp);
                         let (combo, n300, n100, n50, n0) = gameplay
                             .as_ref()
                             .map(|g| {
@@ -738,12 +765,17 @@ impl TournamentSession {
                         // The tuple carries the hit total as well, because that is
                         // what the cursor is advanced by: a set of counts that
                         // summed differently would mean a different point on the
-                        // curve even if the individual numbers matched. The raw
-                        // mod bits are in it for the same reason -- a mod change
+                        // curve even if the individual numbers matched. The mod
+                        // bits are in it for the same reason -- a mod change
                         // alters the rating without altering a single counter, so
                         // keying on the judgements alone would serve a rating
                         // computed under different mods.
-                        let pp_key = (mods_bits, combo, n300, n100, n50, n0, total_hits);
+                        //
+                        // The **parsed** bits, not the raw ones: they are what the
+                        // rating is a function of, so `ignore_nf_for_pp` flipping
+                        // mid-play invalidates the entry instead of serving the
+                        // other toggle's number.
+                        let pp_key = (mods_legacy.bits(), combo, n300, n100, n50, n0, total_hits);
                         let cached = client.cached_live_pp.as_ref();
                         let live_pp = match cached {
                             Some((key, pp)) if *key == pp_key => Some(pp.clone()),
@@ -1422,6 +1454,10 @@ pub struct SoloSession {
     /// the way out, because v1, the precise payload and StreamCompanion all
     /// reshape this same cached packet and must see the weighted number.
     pub mod_multipliers: crate::scoring::ModMultipliers,
+    /// Compute PP as if NoFail were not on the play
+    /// (`features.ignore_nf_for_pp`). Applies to the pp values only, and never
+    /// to the star rating or the mods the packet reports.
+    pub ignore_nf_for_pp: bool,
     cached_hit_errors_total_hits: u32,
     cached_hit_errors: Arc<[i16]>,
     cached_unstable_rate: f64,
@@ -1628,6 +1664,7 @@ impl SoloSession {
             enable_pp: true,
             enable_hit_errors: true,
             mod_multipliers: crate::scoring::ModMultipliers::identity(),
+            ignore_nf_for_pp: false,
             cached_hit_errors_total_hits: 0,
             cached_hit_errors: Arc::default(),
             cached_unstable_rate: 0.0,
@@ -2236,6 +2273,7 @@ impl SoloSession {
                                             map,
                                             &diff,
                                             active_mods,
+                                            self.ignore_nf_for_pp,
                                         );
                                         self.cached_stats = bm.stats.clone();
                                         self.cached_beatmap_metadata.time.last_object =
@@ -2303,6 +2341,7 @@ impl SoloSession {
                                     map,
                                     &diff,
                                     active_mods,
+                                    self.ignore_nf_for_pp,
                                 );
                                 self.cached_stats = self.cached_packet.beatmap.stats.clone();
                                 self.cached_accuracy =
@@ -2477,13 +2516,23 @@ impl SoloSession {
                                 g.hit_100 as u32,
                                 g.hit_50 as u32,
                                 g.hit_miss as u32,
-                                g.mods,
+                                // The pp form of the mods, not the raw bits, so a
+                                // change of `ignore_nf_for_pp` counts as a change
+                                // of input and the cached rating is recomputed.
+                                // The packet's own mod list is built from `g.mods`
+                                // above and still reports NoFail.
+                                crate::pp::calculator::pp_mods_bits(g.mods, self.ignore_nf_for_pp),
                             );
                             if self.cached_gameplay_hits != current_hits
                                 || self.cached_live_pp.is_none()
                             {
                                 self.cached_gameplay_hits = current_hits;
-                                let mods_legacy = crate::pp::calculator::parse_mods_bits(g.mods);
+                                // The pp form of the mods: `ignore_nf_for_pp`
+                                // drops NoFail here and nowhere else, so the
+                                // rating is the one the play would have earned
+                                // without it while the packet keeps reporting it.
+                                let mods_legacy =
+                                    crate::pp::calculator::pp_mods(g.mods, self.ignore_nf_for_pp);
                                 // The cursor only folds the objects judged
                                 // *since the last time this ran*, so a tick that
                                 // saw no judgement costs nothing and a tick that
@@ -2632,6 +2681,7 @@ impl SoloSession {
                                 map,
                                 &diff,
                                 res.mods,
+                                self.ignore_nf_for_pp,
                             );
                             self.cached_packet.beatmap.stats.stars.live =
                                 self.cached_packet.beatmap.stats.stars.total;
@@ -2677,13 +2727,20 @@ impl SoloSession {
                                 res.hit_100 as u32,
                                 res.hit_50 as u32,
                                 res.hit_miss as u32,
-                                res.mods,
+                                // The pp form of the mods, so flipping
+                                // `ignore_nf_for_pp` invalidates this cache entry
+                                // rather than serving the other toggle's rating.
+                                crate::pp::calculator::pp_mods_bits(
+                                    res.mods,
+                                    self.ignore_nf_for_pp,
+                                ),
                             );
                             if self.cached_results_hits != results_hits
                                 || self.cached_results_pp.is_none()
                             {
                                 self.cached_results_hits = results_hits;
-                                let mods_legacy = crate::pp::calculator::parse_mods_bits(res.mods);
+                                let mods_legacy =
+                                    crate::pp::calculator::pp_mods(res.mods, self.ignore_nf_for_pp);
                                 // A finished play, so the curve is walked to the
                                 // end once and thrown away -- there is no next
                                 // judgement to make it incremental for. It is
@@ -2741,9 +2798,13 @@ impl SoloSession {
         {
             let beatmap_id = self.cached_packet.beatmap.id as u32;
             let mods_bits = self.cached_packet.play.mods.number;
+            // Keyed on the pp form of the mods: `ignore_nf_for_pp` changes what
+            // this rating is, so it has to be part of the cache key rather than
+            // only of the calculation.
+            let pp_bits = crate::pp::calculator::pp_mods_bits(mods_bits, self.ignore_nf_for_pp);
 
-            if self.cached_idle_pp_key != Some((beatmap_id, mods_bits)) {
-                let mods_legacy = crate::pp::calculator::parse_mods_bits(mods_bits);
+            if self.cached_idle_pp_key != Some((beatmap_id, pp_bits)) {
+                let mods_legacy = crate::pp::calculator::pp_mods(mods_bits, self.ignore_nf_for_pp);
                 let full = crate::pp::calculator::full_difficulty(beatmap_id, map, mods_legacy);
                 // No objects judged outside gameplay, so `live_attrs` is `None`:
                 // current and maxAchieved stay 0 while fc is the real value. The
@@ -2760,7 +2821,7 @@ impl SoloSession {
                     0,
                 );
                 self.cached_packet.play.pp = idle_pp;
-                self.cached_idle_pp_key = Some((beatmap_id, mods_bits));
+                self.cached_idle_pp_key = Some((beatmap_id, pp_bits));
             }
         }
         // Entering gameplay or the results screen must not leave a stale menu
@@ -3730,7 +3791,7 @@ mod tests {
         let diff = rosu_pp::Difficulty::new().mods(mods_legacy).calculate(&map);
 
         let mut snapshot = crate::beatmap::BeatmapSnapshot::default();
-        crate::beatmap::populate_beatmap_statistics_with_diff(&mut snapshot, &map, &diff, 0);
+        crate::beatmap::populate_beatmap_statistics_with_diff(&mut snapshot, &map, &diff, 0, false);
 
         assert!(snapshot.stats.stars.total > 0.0);
         assert_eq!(snapshot.stats.stars.live, 0.0);

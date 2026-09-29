@@ -758,8 +758,11 @@ async fn run_serve_loop(
         }
     );
     println!(
-        " Features: pp_calc={}, hit_errors={}, chat_attribution={}",
-        config.features.enable_pp, config.features.enable_hit_errors, config.features.enable_chat
+        " Features: pp_calc={}, hit_errors={}, chat_attribution={}, ignore_nf_for_pp={}",
+        config.features.enable_pp,
+        config.features.enable_hit_errors,
+        config.features.enable_chat,
+        config.features.ignore_nf_for_pp
     );
     println!(
         " Scoring:  mod_multipliers={} ({})",
@@ -791,6 +794,7 @@ async fn run_serve_loop(
         .enable_pp(config.features.enable_pp)
         .enable_hit_errors(config.features.enable_hit_errors)
         .enable_chat(config.features.enable_chat)
+        .ignore_nf_for_pp(config.features.ignore_nf_for_pp)
         .mod_multipliers(mod_multipliers)
         .opt_pointer_width(pointer_width)
         .scan_limit_bytes(limit)

@@ -81,6 +81,14 @@ enable_chat = true
 # Default: true
 enable_pp = true
 
+# Compute PP as if the NoFail mod were not on the play.
+# For tournaments that force NF on every player and want the pp the play would
+# have been worth without it. play.mods still reports NF, and star rating,
+# accuracy, hits and rank are untouched -- only the pp values change.
+# No-op on osu!taiko, where our calculator applies no NF penalty.
+# Default: false
+ignore_nf_for_pp = false
+
 # Include the full hit error array in the JSON packet (packet.play.hitErrorArray).
 # When set to false, hitErrorArray is sent as an empty array [] to save network bandwidth
 # and JSON serialization overhead, while unstableRate is still accurately calculated and sent.

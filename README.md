@@ -68,6 +68,7 @@ A lightweight native Rust data provider emitting **[tosu](https://github.com/Kot
   - Built-in PP calculation powered by `rosu-pp`.
   - 10-object stepping gradual PP calculation.
   - Precalculated 90%–100% accuracy table and strain graph generation.
+  - Optional NoFail-exempt PP (`features.ignore_nf_for_pp`), for tournaments that force NF on the whole lobby.
 - **Production Architecture**:
   - **Zero-Port Bypass**: Disable HTTP or WebSocket independently; if both are disabled, no TCP socket is bound.
   - **Structured Logging**: `tracing`-based structured logging respecting configured level with daily rolling file logging (`logs/rtosu-YYYY-MM-DD.log`).
@@ -141,6 +142,7 @@ auto_mode = true          # Auto-detect tournament vs single-player mode
 [features]
 enable_chat = true        # Attributed multiplayer tournament chat
 enable_pp = true          # Real-time gradual PP calculation
+ignore_nf_for_pp = false  # Rate NF plays as if NoFail were not on them
 gradual_pp_chunks = 100   # Number of gradual PP checkpoints per beatmap (1-250)
 enable_hit_errors = true  # Include full hit error array in JSON packet
 
@@ -182,6 +184,28 @@ mod_multipliers = { "NM" = 1.0, "NF" = 0.5, "EZ" = 1.8, "HD" = 1.05, "HR" = 1.1,
 * Keys are case-insensitive, and an unknown acronym is a **config error** rather
   than a silently ignored entry — `rtosu-dataprovider config validate` names the
   offending key. Factors must be between `0.01` and `100.0`.
+
+### Rating NoFail Plays Without the NoFail Penalty
+
+`features.ignore_nf_for_pp` (default `false`) computes PP as if the NoFail mod
+were not on the play, for tournaments that force NF on every player:
+
+```toml
+[features]
+enable_pp = true
+ignore_nf_for_pp = true
+```
+
+* `play.mods` still reports NF, and star rating, accuracy, hits, combo and rank
+  are untouched — only the pp family moves: `play.pp`, `resultsScreen.pp`,
+  `beatmap.stats.pp`, and the pp served for each `tourney.clients[]`.
+* How much comes back depends on the ruleset and the scoreline, because that is
+  what osu! takes away. osu!mania pays a flat **×0.75**; osu!standard and
+  osu!catch pay `(1 - 0.02 × misses)` floored at `0.9`, so a **missless FC is
+  unchanged** and a play with five or more misses gains about 11 %; osu!taiko is
+  a no-op, because the calculator applies no NF penalty there.
+* The reported value is therefore *not* what osu! would submit, and not what the
+  osu! website shows — that is the point of the setting.
 
 ---
 
@@ -273,6 +297,14 @@ let mut reader = OsuReader::builder()
 Keys are validated by `ModMultipliers::new` (`"DT/NC"` names one osu! slot, an
 unknown acronym is an error), and the weighted score is `round(score x factor)`
 saturated to `i32::MAX`.
+
+The pp toggle is on the builder too, for the same reason:
+
+```rust
+let mut reader = OsuReader::builder()
+    .ignore_nf_for_pp(true) // rate NF plays as though NoFail were not on them
+    .build()?;
+```
 
 ### Async Tokio Stream
 For async applications, convert the reader into a `Stream`:
