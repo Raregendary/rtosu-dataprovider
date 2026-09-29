@@ -343,7 +343,7 @@ async fn handle_json_v2_precise(State(state): State<AppState>) -> Response {
 /// The v1 payload is built per request rather than pre-encoded by the poll loop,
 /// because it includes the strain graph and pre-encoding it would add a
 /// serialisation to every tick for a route almost nothing calls. See
-/// `audit-1.0.5.md` `L-07`.
+/// `validations/audits/audit-1.0.5.md` `L-07`.
 async fn handle_json_v1(State(state): State<AppState>) -> Response {
     // Clone the `Arc` out from under the guard and drop it before building. A
     // `watch::Ref` holds the read lock for its whole lifetime, so holding one
@@ -380,7 +380,7 @@ async fn handle_json_v1(State(state): State<AppState>) -> Response {
 /// ready/running"}` when no client is attached -- tosu's guard is the same on all
 /// four (`router/scApi.ts:9-11`), and making SC the only route that served a
 /// stale `200` would have been worse than leaving the choice open. See
-/// `audit-1.0.5.md` `M-08`.
+/// `validations/audits/audit-1.0.5.md` `M-08`.
 async fn handle_json_sc(State(state): State<AppState>) -> Response {
     // The `Arc` is cloned out and the guard dropped before the build, for the
     // reason given on `handle_json_v1`.
@@ -636,7 +636,7 @@ async fn handle_beatmap_background(State(state): State<AppState>, raw_query: Raw
 /// `/files/beatmap/*` (`router/v2.ts:39-59`), and the overlay shim rewrites
 /// `/Songs/` onto `/files/beatmap/`. rtosu registered neither destination, so
 /// every overlay asking for a beatmap preview, the `.osu` file or any other song
-/// asset got a 404 with an empty body. See `K-01` in audit-1.0.5.md.
+/// asset got a 404 with an empty body. See `K-01` in validations/audits/audit-1.0.5.md.
 ///
 /// Range requests are not handled yet. tosu streams 206/416 for these paths
 /// (`utils/directories.ts:129-152`), which is what lets an overlay's `<audio>`
@@ -1025,9 +1025,10 @@ async fn handle_ws_upgrade(
 ///
 /// This used to be the full v2 stream, so a precise subscriber paid the whole
 /// packet -- including the strain graph -- on every tick. The rate is still the
-/// main loop's rather than tosu's 10 ms precise loop; that gap is `audit-1.0.5.md`
-/// `B-03` and is the threading restructure `FIX-008` owns, not something to
-/// paper over here. What this fixes is the payload, which is the part that was
+/// main loop's rather than tosu's 10 ms precise loop; that gap is `B-03` in
+/// `validations/audits/audit-1.0.5.md` and is the threading restructure
+/// `FIX-008` owns, not something to paper over here. What this fixes is the
+/// payload, which is the part that was
 /// wrong by two orders of magnitude.
 async fn handle_ws_upgrade_precise(
     ws: WebSocketUpgrade,
@@ -1143,7 +1144,7 @@ fn precise_frame(packet_rx: &mut watch::Receiver<PublishedPacket>) -> Option<Mes
 ///
 /// This is the one rtosu socket that **reads** from the client, which is what
 /// makes it different from the other four
-/// (`audit-1.0.5.md` `D-04`: "inbound messages are never read at all"). The read
+/// (`validations/audits/audit-1.0.5.md` `D-04`: "inbound messages are never read at all"). The read
 /// is bounded -- one `select!` arm against the receiver, so a silent client costs
 /// nothing extra -- and every message is length-capped, because a filter list
 /// arrives from the network on a path that used to have no input at all.
@@ -2584,7 +2585,7 @@ mod tests {
         // serves the real gosumemory payload there, and a v1 overlay cannot read
         // v2. This string was pinned in three places -- here, in the shim's own
         // substring test, and in the route table it duplicated -- which is how the
-        // mapping survived every other change. See `K-02` in audit-1.0.5.md.
+        // mapping survived every other change. See `K-02` in validations/audits/audit-1.0.5.md.
         assert!(body.contains("'/ws': '/ws'"));
         assert!(!body.contains("'/ws': '/websocket/v2'"));
 
@@ -2712,7 +2713,7 @@ mod tests {
     /// against a live server.
     ///
     /// Fails today: the shim advertises `/Songs/` and `/files/skin/`, rewritten onto
-    /// paths with no handler. See `K-01` and `K-02` in audit-1.0.5.md.
+    /// paths with no handler. See `K-01` and `K-02` in validations/audits/audit-1.0.5.md.
     #[tokio::test]
     async fn every_file_route_the_shim_advertises_is_registered() {
         // Straight off the one const the shim itself is generated from, so this

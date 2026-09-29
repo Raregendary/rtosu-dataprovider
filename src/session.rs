@@ -1234,7 +1234,7 @@ fn performance_graph(
                 // is a wrong value rather than an absent one.
                 //
                 // These are rosu-pp's numbers, not tosu's: tosu reads them from its
-                // own lazer calculator fork (audit-1.0.5.md `G-08`). The shape,
+                // own lazer calculator fork (validations/audits/audit-1.0.5.md `G-08`). The shape,
                 // section count and magnitude should agree; the values will not be
                 // identical.
                 name: "reading".to_string(),
@@ -3172,7 +3172,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------
-    // Beatmap switching. audit-1.0.5.md E-01, E-02, E-03, E-05.
+    // Beatmap switching. validations/audits/audit-1.0.5.md E-01, E-02, E-03, E-05.
     //
     // osu! fills `BeatmapInfo` in field by field, so mid-switch the title and the
     // id at +0xC8 can already be current while the md5 at +0x6C is still the

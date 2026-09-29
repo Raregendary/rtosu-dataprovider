@@ -19,6 +19,7 @@ A lightweight native Rust data provider emitting **[tosu](https://github.com/Kot
 - **Solo & Tournament Support**: Supports both standard gameplay and multi-client tournament setups (3v3, 4v4, etc.) with automatic team splitting (`left` / `right`), score aggregation, and `#multiplayer` chat extraction.
 - **Modern Performance Calculation**: Built-in gradual PP calculation powered by `rosu-pp` with modern Combo Scaling Removal (CSR) rework support.
 - **Browser Overlay Hosting**: Serves any tosu v2 compatible overlay dropped into `browser_overlays/`, with a dashboard to browse them and a compatibility shim so drop-in overlays work unmodified.
+- **Documented Release History**: Every release from v1.0.0 onward is described in [`CHANGELOG.md`](CHANGELOG.md), including the deliberate differences from tosu.
 
 ---
 

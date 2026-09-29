@@ -14,14 +14,17 @@ Cargo.lock
 # Benchmarks & local profiling runs
 Benchmarks/
 
-# Validation harness & local test notes
+# Validation harness, release specs/plans, and local audit records.
+# Historical notes were moved into the ignored tree:
+#   validations/notes/    <- 1.0.6.md, 1.0.7-update.md, 1.0.8-updateplan.md (once shipped)
+#   validations/audits/   <- audit.md, audit-1.0.5.md, validations.md, fix.md
+#   validations/scratch/  <- temp.json and other throwaway dumps
+# The root-level patterns keep a re-created spec or record from being committed.
 validations/
-validations.md
-fix.md
-audit.md
-audit-1.0.5.md
-1.0.6.md
-1.0.7-update.md
+/1.0.*.md
+/audit*.md
+/fix.md
+/validations.md
 
 # Logs & temp files
 logs/

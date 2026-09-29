@@ -462,7 +462,7 @@ fn find_doctype(html: &str) -> Option<usize> {
 /// once as a JavaScript array literal inside `OVERLAY_SHIM_JS` and once implicitly
 /// in the route table in `server.rs` — and nothing connected them, so the shim
 /// could advertise a path with no handler and the substring test that "checked" it
-/// would still pass. See `K-01` and `K-02` in audit-1.0.5.md.
+/// would still pass. See `K-01` and `K-02` in validations/audits/audit-1.0.5.md.
 pub const FILE_ROUTES: &[(&str, &str)] = &[
     ("/backgroundImage", "/files/beatmap/background"),
     ("/Songs/", "/files/beatmap/"),
@@ -1184,7 +1184,7 @@ mod tests {
     ///
     /// The companion test that does close the loop is
     /// `server::tests::every_file_route_the_shim_advertises_is_registered`, which
-    /// issues real requests against the router. See `K-02` in audit-1.0.5.md.
+    /// issues real requests against the router. See `K-02` in validations/audits/audit-1.0.5.md.
     #[test]
     fn shim_source_rewrites_the_documented_tosu_routes() {
         let js = overlay_shim_js();

@@ -665,7 +665,8 @@ impl GosuCompatibleApi {
         // tosu's `beatmapPP.strains` is the mode's primary skill, zero padded. For
         // osu!std that is the aim series, which is what `series[0]` holds; for any
         // other mode rtosu emits no series at all, so this is empty rather than
-        // wrong. See the BLOCKED note on the reading strain in audit-1.0.5.md G-03.
+        // wrong. See the BLOCKED note on the reading strain, `G-03` in
+        // `validations/audits/audit-1.0.5.md`.
         //
         // Hoisted once per graph by `PrecomputedGraph`, so this is a refcount bump
         // rather than a second descent into the graph.
@@ -836,10 +837,10 @@ impl GosuCompatibleApi {
                     fc: play.pp.fc,
                     // tosu serves `currAttributes.maxAchievable`, the running maximum
                     // of achieved pp. rtosu's own value for that field is the FC pp,
-                    // which is a different quantity; see the live finding in
-                    // audit-1.0.5.md I-07. Use the achieved-so-far value here, which
-                    // is at least the right shape for a v1 consumer reading a
-                    // session best.
+                    // which is a different quantity; see the live finding `I-07`
+                    // in `validations/audits/audit-1.0.5.md`. Use the
+                    // achieved-so-far value here, which is at least the right shape
+                    // for a v1 consumer reading a session best.
                     max_this_play: play.pp.max_achieved,
                 },
                 // tosu's v1 keyOverlay indexes the read array with `.at(0..3)`
@@ -847,7 +848,7 @@ impl GosuCompatibleApi {
                 // buttons even for taiko's three (`buildResult.ts:194-207`).
                 // The values come from the one read in `client::read_key_overlay`;
                 // `V1KeyOverlay::from` reproduces the four-key shape, and
-                // `audit-1.0.5.md` `B-02` is now closed rather than deferred.
+                // `validations/audits/audit-1.0.5.md` `B-02` is now closed rather than deferred.
                 key_overlay: V1KeyOverlay::from(&play.key_overlay),
                 leaderboard: V1Leaderboard {
                     has_leaderboard: false,

@@ -1698,7 +1698,7 @@ fn read_leaderboard_player(
         //
         // Verified live against tosu on map 1949715: both rows carried
         // `"rank":""` where a correctly-computed grade would have been `A` and
-        // `C`. Reproduced, not corrected: see `audit-1.0.5.md`'s ground rule on
+        // `C`. Reproduced, not corrected: see `validations/audits/audit-1.0.5.md`'s ground rule on
         // tosu quirks.
         rank: String::new(),
     })

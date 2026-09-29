@@ -52,11 +52,11 @@
 //! (`tosu-sourcecode/packages/tosu/package.json:21`): two implementations of one
 //! specification. Roughly 23 of the 136 leaves are pp-bearing and all of them
 //! differ by some amount. No constant is fitted anywhere in this file; see
-//! `audit-1.0.5.md` `G-08` and `M-05`. Compare shape and type, never magnitude.
+//! `validations/audits/audit-1.0.5.md` `G-08` and `M-05`. Compare shape and type, never magnitude.
 //!
 //! # What is not implemented, and why
 //!
-//! The leaves with no osu! stable source are listed in `audit-1.0.5.md` `M-03`.
+//! The leaves with no osu! stable source are listed in `validations/audits/audit-1.0.5.md` `M-03`.
 //! Each ships **tosu's own literal** with a comment naming the row, because a
 //! plausible-looking invented number is worse than an absent key: a consumer
 //! cannot tell a fabricated value from a real read. The seven fields where rtosu
@@ -301,7 +301,7 @@ impl ScKeyOverlay {
 /// One entry of the `leaderBoardPlayers` string (`buildResultSC.ts:216-242`).
 /// **Twelve keys** -- the shape without the visibility flag.
 ///
-/// rtosu has no scoreboard read at all (`audit-1.0.5.md` `I-10` / `L-09` /
+/// rtosu has no scoreboard read at all (`validations/audits/audit-1.0.5.md` `I-10` / `L-09` /
 /// `M-03` items 5 and 6), and the live capture showed tosu serving `[]`, so this
 /// type exists to type the element and is never populated. It is not a
 /// placeholder for [`ScLeaderboardMainPlayer`]: the two shapes differ by one key,
@@ -432,7 +432,7 @@ pub struct ScPayload {
     /// `global.showInterface` (`global.ts:12` <- `memory/stable.ts:814-821`).
     /// A live tosu response reported `0`. The identical read would also close
     /// v1's `settings.showInterface` and v2's `game.interfaceVisible`; see the
-    /// open decision in `audit-1.0.5.md` L-03 before spending it twice.
+    /// open decision in `validations/audits/audit-1.0.5.md` L-03 before spending it twice.
     #[serde(rename = "ingameInterfaceIsEnabled")]
     pub ingame_interface_is_enabled: i32,
     /// **tosu quirk, reproduced.** `buildResultSC.ts:57` is a hardcoded `0` with
@@ -715,7 +715,7 @@ pub struct ScPayload {
     // Seven of tosu's eleven accuracies (90-100), under a plain and an `m`
     // prefix. Values are rosu-pp's, not tosu's: the two calculators are
     // different implementations of one specification and the gap is
-    // structurally unreachable (audit-1.0.5.md G-08). No constant is fitted.
+    // structurally unreachable (validations/audits/audit-1.0.5.md G-08). No constant is fitted.
     #[serde(rename = "osu_90PP")]
     pub osu_90pp: f32,
     #[serde(rename = "osu_95PP")]
@@ -755,7 +755,7 @@ pub struct ScPayload {
     #[serde(rename = "speedPpIfMapEndsNow")]
     pub speed_pp_if_map_ends_now: f32,
     /// `ppDifficulty`. osu!standard has no difficulty skill, so this is
-    /// structurally `0.0` there (audit-1.0.5.md `M-05`).
+    /// structurally `0.0` there (validations/audits/audit-1.0.5.md `M-05`).
     #[serde(rename = "strainPpIfMapEndsNow")]
     pub strain_pp_if_map_ends_now: f32,
     /// **tosu quirk, reproduced** -- this is `currAttributes.fcPP`, the same
@@ -810,7 +810,7 @@ pub struct ScPayload {
     // --- fields rtosu has better values for (buildResultSC.ts:290-292) ---
     /// Matches tosu per D4. rtosu reads a real play count
     /// (`src/client.rs:33`) and tosu hardcodes `0` (`buildResultSC.ts:290`).
-    /// Deviating needs a decision; see `audit-1.0.5.md` `M-06`.
+    /// Deviating needs a decision; see `validations/audits/audit-1.0.5.md` `M-06`.
     #[serde(rename = "plays")]
     pub plays: i32,
     /// Matches tosu per D4 -- `''` against rtosu's real `.osu` tags.
@@ -876,7 +876,7 @@ impl ScPayload {
         // for its `strains` block (`buildResultSC.ts:51, 125-130`). For a
         // non-osu!std map rtosu emits no series, so this is empty rather than
         // wrong -- see the BLOCKED note on per-mode strains in
-        // `audit-1.0.5.md` `G-03` and `L-02`.
+        // `validations/audits/audit-1.0.5.md` `G-03` and `L-02`.
         let graph = packet.performance.graph.decoded();
         let strain_values = graph
             .series
@@ -1848,7 +1848,7 @@ mod tests {
     }
 
     /// Every leaf with no osu! stable source ships **tosu's own literal**
-    /// (`audit-1.0.5.md` `M-03`), because a plausible-looking invented value is
+    /// (`validations/audits/audit-1.0.5.md` `M-03`), because a plausible-looking invented value is
     /// worse than an absent key. Fifteen leaves, all pinned here so a future
     /// pass cannot quietly replace one with a guess.
     #[test]
@@ -2406,7 +2406,7 @@ mod tests {
     /// `mapStrains` in the capture had 298 keys, starting `0, 400, 1134, 1534,
     /// 1934` -- the leading `-100`/`-50` padding, which the value clamp turns
     /// into zeros. The exact length depends on the map and is rtosu's graph
-    /// geometry (`audit-1.0.5.md` `G-01`, still open), so it is not pinned here;
+    /// geometry (`validations/audits/audit-1.0.5.md` `G-01`, still open), so it is not pinned here;
     /// the key *shape* is.
     #[test]
     fn map_strains_keys_are_the_captured_shape() {
