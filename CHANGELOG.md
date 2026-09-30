@@ -16,7 +16,10 @@ Two notes on how to read this file:
 
 ## [Unreleased]
 
-The 1.0.8 line. Design and implementation detail live in `1.0.8-updateplan.md`.
+
+## [1.0.8] - 2026-09-30
+
+The 1.0.8 line.
 
 ### Added
 
@@ -293,7 +296,8 @@ Initial release: a native Rust, tosu-compatible data provider for osu!.
   init`, and `config validate`.
 * Windows release packaging and CI (`.github/workflows/{ci,release}.yml`), tag-triggered.
 
-[Unreleased]: https://github.com/Raregendary/rtosu-dataprovider/compare/v1.0.7...HEAD
+[Unreleased]: https://github.com/Raregendary/rtosu-dataprovider/compare/v1.0.8...HEAD
+[1.0.8]: https://github.com/Raregendary/rtosu-dataprovider/compare/v1.0.7...v1.0.8
 [1.0.7]: https://github.com/Raregendary/rtosu-dataprovider/compare/v1.0.6...v1.0.7
 [1.0.6]: https://github.com/Raregendary/rtosu-dataprovider/compare/v1.0.5...v1.0.6
 [1.0.5]: https://github.com/Raregendary/rtosu-dataprovider/compare/v1.0.4...v1.0.5
