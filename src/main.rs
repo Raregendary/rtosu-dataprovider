@@ -561,7 +561,14 @@ fn execute(
                 .worker_threads(2)
                 .enable_all()
                 .build()?;
-            rt.block_on(run_serve_loop(&host, port, poll_hz, pointer_width, config))?;
+            rt.block_on(run_serve_loop(
+                &host,
+                port,
+                poll_hz,
+                pointer_width,
+                config,
+                std::path::PathBuf::from(custom_config_path.unwrap_or(DEFAULT_CONFIG_FILE)),
+            ))?;
         }
     }
     Ok(())
@@ -601,6 +608,7 @@ async fn run_serve_loop(
     poll_rate_hz: u64,
     pointer_width: Option<usize>,
     config: AppConfig,
+    config_path: std::path::PathBuf,
 ) -> Result<()> {
     let (tx, rx) =
         tokio::sync::watch::channel(rtosu_dataprovider::server::PublishedPacket::default_packet());
@@ -608,6 +616,15 @@ async fn run_serve_loop(
     let enable_ws = config.server.enable_websocket;
     let cors_allow_all = config.server.cors_allow_all;
     let overlays_dir = resolve_overlays_dir(&config);
+
+    // The settings store owns the config from here on: the landing page reads it
+    // through `GET /api/settings`, writes it through `POST /api/settings`, and
+    // this loop reads the live subset so a change does not need a restart.
+    let settings = std::sync::Arc::new(rtosu_dataprovider::settings::SettingsStore::new(
+        config_path.clone(),
+        config.clone(),
+    )?);
+    let mut live_rx = settings.subscribe();
 
     let listener = if enable_http || enable_ws {
         match rtosu_dataprovider::server::bind_listener(host, port).await {
@@ -651,6 +668,7 @@ async fn run_serve_loop(
 
     if let Some(listener) = listener {
         let server_overlays_dir = overlays_dir.clone();
+        let server_settings = settings.clone();
         tokio::spawn(async move {
             if let Err(e) = rtosu_dataprovider::server::serve_with_listener(
                 listener,
@@ -660,6 +678,7 @@ async fn run_serve_loop(
                 server_overlays_dir,
                 rx,
                 rtosu_dataprovider::server::JsonPayload::from_config(&config.server.json_payload),
+                Some(server_settings),
             )
             .await
             {
@@ -687,6 +706,7 @@ async fn run_serve_loop(
         }
         println!(" Live Endpoints:");
         if enable_http {
+            println!("   - Settings page:    http://{}:{}/", display_host, port);
             println!(
                 "   - HTTP JSON (v2):   http://{}:{}/json/v2",
                 display_host, port
@@ -785,7 +805,7 @@ async fn run_serve_loop(
     );
     println!("===========================================================");
 
-    let interval = Duration::from_millis(1000 / poll_rate_hz.max(1));
+    let mut interval = Duration::from_millis(1000 / poll_rate_hz.max(1));
     let limit = config.poll.scan_budget_mb * 1024 * 1024;
     let mut reader = rtosu_dataprovider::OsuReader::builder()
         .tournament_profile(&config.poll.default_profile)
@@ -828,6 +848,23 @@ async fn run_serve_loop(
                 break;
             }
             _ = tokio::time::sleep(interval) => {
+                // A settings change published by the landing page is adopted
+                // here, on the poll thread, so it takes effect on this tick
+                // rather than at the next restart. `has_changed` is a flag read,
+                // not a lock, so the common case costs nothing.
+                if live_rx.has_changed().unwrap_or(false) {
+                    let live = live_rx.borrow_and_update().clone();
+                    interval = live.poll_interval;
+                    reader.apply_live_settings(&live);
+                    tracing::info!(
+                        "applied settings change: poll interval now {:?}, pp={}, hit_errors={}, chat={}, ignore_nf_for_pp={}",
+                        interval,
+                        live.enable_pp,
+                        live.enable_hit_errors,
+                        live.enable_chat,
+                        live.ignore_nf_for_pp
+                    );
+                }
                 if let Ok(packet) = reader.poll() {
                     // Read the attachment flag off the reader rather than out of
                     // the packet: the packet no longer carries a marker for it

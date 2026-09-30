@@ -650,8 +650,12 @@ pub fn escape_html(raw: &str) -> String {
     out
 }
 
-/// Render the overlay dashboard listing every discovered overlay.
-pub fn dashboard_html(overlays: &[Overlay], root: &Path) -> String {
+/// The overlay cards, or the empty-state hint when there are none.
+///
+/// Shared by the overlay dashboard at `/overlays` and the landing page at `/`,
+/// so the two cannot disagree about an overlay's URL, its metadata, or the
+/// escaping any of it needs.
+pub fn dashboard_cards(overlays: &[Overlay], root: &Path) -> String {
     let mut cards = String::new();
 
     for overlay in overlays {
@@ -710,7 +714,7 @@ pub fn dashboard_html(overlays: &[Overlay], root: &Path) -> String {
         ));
     }
 
-    let body = if overlays.is_empty() {
+    if overlays.is_empty() {
         format!(
             r#"<p class="empty">No overlays found in <code>{}</code>.</p>
 <p class="hint">Create a folder per overlay containing an <code>index.html</code>, then reload this page.
@@ -719,7 +723,40 @@ Drop-in tosu v2 overlays work unmodified &mdash; their tosu API calls are rewrit
         )
     } else {
         format!(r#"<div class="grid">{cards}</div>"#)
-    };
+    }
+}
+
+/// The stylesheet the overlay cards and their copy/open widgets need.
+///
+/// Shared with the landing page, so a card looks the same wherever it is shown;
+/// the landing page layers its own layout on top of it.
+pub fn cards_style() -> &'static str {
+    r#".grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); }
+.card {
+  display: flex; flex-direction: column; gap: 12px;
+  padding: 18px; border: 1px solid #262b36; border-radius: 10px; background: #191c24;
+}
+.card h2 { margin: 0; font-size: 16px; }
+dl { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0; font-size: 13px; }
+dt { color: #8b93a7; }
+dd { margin: 0; overflow-wrap: anywhere; }
+dd.notes { white-space: pre-line; color: #b6bdcd; }
+.row { display: flex; gap: 8px; margin-top: auto; }
+.url {
+  flex: 1; min-width: 0; padding: 7px 9px; font: 12px/1.4 ui-monospace, Consolas, monospace;
+  color: #cfd6e6; background: #0f1116; border: 1px solid #262b36; border-radius: 6px;
+}
+button, .open {
+  padding: 7px 12px; font-size: 12px; color: #e7e9ee; cursor: pointer; text-decoration: none;
+  background: #2a3040; border: 1px solid #39405a; border-radius: 6px;
+}
+button:hover, .open:hover { background: #39405a; }"#
+}
+
+/// Render the overlay dashboard listing every discovered overlay.
+pub fn dashboard_html(overlays: &[Overlay], root: &Path) -> String {
+    let body = dashboard_cards(overlays, root);
+    let cards_style = cards_style();
 
     format!(
         r#"<!DOCTYPE html>
@@ -741,29 +778,10 @@ body {{
 header {{ margin-bottom: 24px; }}
 h1 {{ margin: 0 0 4px; font-size: 20px; }}
 .sub {{ margin: 0; color: #8b93a7; }}
-.grid {{ display: grid; gap: 16px; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); }}
-.card {{
-  display: flex; flex-direction: column; gap: 12px;
-  padding: 18px; border: 1px solid #262b36; border-radius: 10px; background: #191c24;
-}}
-.card h2 {{ margin: 0; font-size: 16px; }}
-dl {{ display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0; font-size: 13px; }}
-dt {{ color: #8b93a7; }}
-dd {{ margin: 0; overflow-wrap: anywhere; }}
-dd.notes {{ white-space: pre-line; color: #b6bdcd; }}
-.row {{ display: flex; gap: 8px; margin-top: auto; }}
-.url {{
-  flex: 1; min-width: 0; padding: 7px 9px; font: 12px/1.4 ui-monospace, Consolas, monospace;
-  color: #cfd6e6; background: #0f1116; border: 1px solid #262b36; border-radius: 6px;
-}}
-button, .open {{
-  padding: 7px 12px; font-size: 12px; color: #e7e9ee; cursor: pointer; text-decoration: none;
-  background: #2a3040; border: 1px solid #39405a; border-radius: 6px;
-}}
-button:hover, .open:hover {{ background: #39405a; }}
 .empty, .hint {{ color: #b6bdcd; }}
 code {{ font-family: ui-monospace, Consolas, monospace; color: #ff9ec4; }}
 a {{ color: #8ab4ff; }}
+{cards_style}
 </style>
 </head>
 <body>

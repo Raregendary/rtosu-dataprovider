@@ -60,6 +60,27 @@ The 1.0.8 line. Design and implementation detail live in `1.0.8-updateplan.md`.
   can pass `&ModMultipliers::identity()` for the previous behaviour, or
   `scoring::ModMultipliers::new(&table)?` to weight; `OsuReaderBuilder`'s
   `mod_multipliers(...)` is the same setting for the builder path.
+* `server::start_server` and `server::serve_with_listener` take the settings
+  store as a final `Option<Arc<settings::SettingsStore>>` argument, and the
+  listener is now served with connect info
+  (`into_make_service_with_connect_info`) so the settings write guard can tell a
+  local request from a remote one. A library that builds the router itself with
+  `create_router_with` should serve it the same way; without connect info a write
+  is refused rather than assumed local.
+* `AppConfig::save_preserving_comments(path, previous)` is the writer behind the
+  page's save button, and is public for consumers that keep their own
+  `config.toml`: it patches the file's text, so comments, key order and every
+  unedited line survive, and a key or section the file is missing is appended in
+  place.
+* The poll loop reads its settings from `settings::LiveSettings` (`settings::SettingsStore`)
+  instead of from the config captured at startup, which is what makes a change on
+  the landing page take effect on the next tick. `OsuReader::apply_live_settings`
+  and the per-setting setters next to it are the library-level form of the same
+  thing.
+* The shipped config template documents `server.json_payload`, which it had been
+  missing since that option was added, so a fresh install's file no longer gains
+  the key on its first settings save. `README.md` no longer lists the removed
+  `features.gradual_pp_chunks`.
 * Development notes, release specs, and audit records no longer sit in the repository root.
   They live in the ignored `validations/notes/`, `validations/audits/`, and
   `validations/scratch/` directories, and `.gitignore` matches them by pattern.

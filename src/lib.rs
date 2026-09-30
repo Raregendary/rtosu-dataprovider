@@ -13,6 +13,7 @@ pub mod sc;
 pub mod scoring;
 pub mod server;
 pub mod session;
+pub mod settings;
 pub mod tournament;
 pub mod v1;
 pub mod v2;

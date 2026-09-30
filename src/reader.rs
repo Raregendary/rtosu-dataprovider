@@ -328,6 +328,60 @@ impl OsuReader {
         }
     }
 
+    /// Enable or disable PP calculation without rebuilding the reader.
+    ///
+    /// The landing page drives this: a toggle there takes effect on the next
+    /// poll. Nothing has to be invalidated by hand, because every pp cache is
+    /// keyed by the mods its value was computed for.
+    pub fn set_enable_pp(&mut self, enable: bool) {
+        self.builder.enable_pp = enable;
+        self.solo_session.enable_pp = enable;
+        self.tourney_session.enable_pp = enable;
+    }
+
+    /// Include or drop `play.hitErrorArray` without rebuilding the reader.
+    pub fn set_enable_hit_errors(&mut self, enable: bool) {
+        self.builder.enable_hit_errors = enable;
+        self.solo_session.enable_hit_errors = enable;
+        self.tourney_session.enable_hit_errors = enable;
+    }
+
+    /// Read or skip tournament chat without rebuilding the reader.
+    pub fn set_enable_chat(&mut self, enable: bool) {
+        self.builder.enable_chat = enable;
+        self.tourney_session.enable_chat = enable;
+    }
+
+    /// Compute PP as if NoFail were absent, or stop doing that.
+    ///
+    /// `play.mods` still reports NF: the toggle moves the pp family and nothing
+    /// else. See `features.ignore_nf_for_pp`.
+    pub fn set_ignore_nf_for_pp(&mut self, ignore: bool) {
+        self.builder.ignore_nf_for_pp = ignore;
+        self.solo_session.ignore_nf_for_pp = ignore;
+        self.tourney_session.ignore_nf_for_pp = ignore;
+    }
+
+    /// Replace the per-mod score weights.
+    pub fn set_mod_multipliers(&mut self, multipliers: crate::scoring::ModMultipliers) {
+        self.builder.mod_multipliers = multipliers.clone();
+        self.solo_session.mod_multipliers = multipliers.clone();
+        self.tourney_session.mod_multipliers = multipliers;
+    }
+
+    /// Apply everything the landing page can change without a restart.
+    ///
+    /// Called by the serve loop when the settings store publishes a change, and
+    /// a no-op when the values are what the reader already runs with.
+    pub fn apply_live_settings(&mut self, live: &crate::settings::LiveSettings) {
+        self.set_enable_pp(live.enable_pp);
+        self.set_enable_hit_errors(live.enable_hit_errors);
+        self.set_enable_chat(live.enable_chat);
+        self.set_ignore_nf_for_pp(live.ignore_nf_for_pp);
+        self.set_mod_multipliers((*live.mod_multipliers).clone());
+        self.builder.poll_interval = live.poll_interval;
+    }
+
     pub fn into_stream(self) -> OsuReaderStream {
         let interval = self.builder.poll_interval;
         OsuReaderStream {
@@ -816,6 +870,67 @@ mod tests {
             !reader.solo_session.ignore_nf_for_pp && !reader.tourney_session.ignore_nf_for_pp,
             "the default is the pp osu! would submit"
         );
+    }
+
+    /// The landing page's live settings reach the sessions the poll reads.
+    ///
+    /// Each of these fields is read from a session field rather than from the
+    /// builder at poll time, so a setter that updated only the builder would look
+    /// correct and change nothing the payload shows. The poll interval is the one
+    /// exception: it lives on the builder because the caller owns the sleep.
+    #[test]
+    fn applying_live_settings_reaches_both_sessions() {
+        let mut reader = OsuReader::builder().build().expect("Reader build failed");
+        assert!(reader.solo_session.enable_pp && reader.tourney_session.enable_pp);
+
+        let mut config = crate::config::AppConfig::default();
+        config.features.enable_pp = false;
+        config.features.enable_hit_errors = false;
+        config.features.enable_chat = false;
+        config.features.ignore_nf_for_pp = true;
+        config.poll.poll_rate_hz = 30;
+        config.scoring.enable_mod_multipliers = true;
+        config.scoring.mod_multipliers.insert("EZ".to_string(), 1.8);
+        let live =
+            crate::settings::LiveSettings::from_config(&config).expect("the config must resolve");
+
+        reader.apply_live_settings(&live);
+
+        assert!(!reader.solo_session.enable_pp);
+        assert!(!reader.tourney_session.enable_pp);
+        assert!(!reader.solo_session.enable_hit_errors);
+        assert!(!reader.tourney_session.enable_hit_errors);
+        assert!(!reader.tourney_session.enable_chat);
+        assert!(reader.solo_session.ignore_nf_for_pp);
+        assert!(reader.tourney_session.ignore_nf_for_pp);
+        assert_eq!(reader.poll_interval(), Duration::from_millis(33));
+        assert_eq!(
+            reader
+                .solo_session
+                .mod_multipliers
+                .apply(crate::client::mod_bits::EZ, 1_000_000),
+            1_800_000,
+            "the weighted table must reach the solo payload"
+        );
+        assert_eq!(
+            reader
+                .tourney_session
+                .mod_multipliers
+                .apply(crate::client::mod_bits::EZ, 1_000_000),
+            1_800_000,
+            "and the tournament one"
+        );
+
+        // Applying the same settings twice is a no-op, and the defaults restore
+        // what the builder would have produced.
+        let defaults =
+            crate::settings::LiveSettings::from_config(&crate::config::AppConfig::default())
+                .expect("the default config resolves");
+        reader.apply_live_settings(&defaults);
+        assert!(reader.solo_session.enable_pp && reader.tourney_session.enable_pp);
+        assert!(!reader.solo_session.ignore_nf_for_pp);
+        assert_eq!(reader.poll_interval(), Duration::from_millis(16));
+        assert!(reader.solo_session.mod_multipliers.is_identity());
     }
 
     #[test]

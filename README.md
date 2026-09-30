@@ -38,6 +38,8 @@ A lightweight native Rust data provider emitting **[tosu](https://github.com/Kot
   - `WS /tokens` — StreamCompanion payloads over a socket, with filter support (tosu's `WS_SC`).
   - `WS /websocket/commands` — Inbound-only command channel (tosu's `WS_COMMANDS`).
   - `GET /health` — Service health check.
+  - `GET /` — Settings landing page: the live configuration in a form next to your overlays.
+  - `GET /api/settings`, `POST /api/settings` — The landing page's JSON API (read the config; apply a validated patch).
   - `GET /files/beatmap/background` — Current beatmap background, for overlays.
   - `GET /files/beatmap/{*path}`, `GET /Songs/{*path}` — The osu! songs folder, under either path, for overlays that load audio or images by file.
   - `GET /files/skin/{*path}` — The skin folder.
@@ -51,6 +53,11 @@ A lightweight native Rust data provider emitting **[tosu](https://github.com/Kot
   - `GET /overlays/<folder>/` — The overlay itself; paste this URL into an OBS **Browser** source.
   - Automatic shim injection rewrites tosu API calls (`ws://127.0.0.1:24050/ws`, `/websocket/v2`, `/backgroundImage`, `/Songs/...`) onto the page's own origin, so drop-in overlays need no edits.
   - Live directory re-scan: drop a folder in mid-session and it appears without a restart.
+- **Settings Landing Page** (`http://127.0.0.1:24050/`):
+  - Every `config.toml` setting in one form, next to the overlay cards, for machines with no dashboard app.
+  - Saving patches `config.toml` in place: comments, key order and every line you did not change survive byte for byte.
+  - `[features]`, `[scoring]` and `poll.poll_rate_hz` take effect on the next poll; the rest is saved and marked *restart* in the page.
+  - Writes are restricted to the local machine by default (`server.settings_write_local_only`); everyone else gets a read-only view.
 - **Solo Gameplay State**:
   - Live score, accuracy, current combo, max combo, HP, and smooth HP bar.
   - Hit counts: 300, 100, 50, misses, geki, katu.
@@ -117,6 +124,42 @@ a tosu address keep working — the server injects a compatibility shim into eac
 page that redirects those calls back to itself. See
 [`browser_overlays/README.md`](browser_overlays/README.md) for details.
 
+### Settings Landing Page
+
+Open the root of the server in a browser:
+
+```
+http://127.0.0.1:24050/
+```
+
+The page shows every setting in `config.toml` as a form, grouped by section,
+next to the same overlay cards the `/overlays` dashboard renders. **Save
+changes** writes the config file back in place — comments, key order and every
+line you did not touch are preserved exactly — and applies what can be applied
+without a restart. A setting marked *restart* is saved immediately but only read
+at startup, and the page says so rather than pretending otherwise.
+
+| Path | What it does |
+| --- | --- |
+| `GET /` | The page. |
+| `GET /api/settings` | The current config plus the field table, and whether this viewer may write. |
+| `POST /api/settings` | A flat patch of `section.key` values, e.g. `{"poll.poll_rate_hz": 120}`. Validated against the same rules the config file is loaded with; on any error nothing is applied and nothing is written. |
+
+**Who may write.** `server.settings_write_local_only = true` (the default)
+accepts settings writes only from the loopback interface, and only from a
+request with no `Origin` header or a loopback one. Readers on the LAN still see
+the page and the JSON; they cannot change anything. This is a convenience guard,
+**not authentication** — the real boundary is `host = "127.0.0.1"`, so do not
+publish port 24050 beyond a network you trust.
+
+Applied live, no restart: `[features]`, `[scoring]`, `poll.poll_rate_hz`.
+Needs a restart: everything under `[server]`, `poll.scan_budget_mb`,
+`poll.default_profile`, `poll.auto_mode`, `[logging]`.
+
+tosu's own `POST /api/settingsSave` is deliberately not implemented: its body is
+an Electron dashboard record with a different schema, and serving the same path
+with an incompatible body would be worse than not having it.
+
 ---
 
 ## ⚙️ Configuration (`config.toml`)
@@ -129,9 +172,11 @@ host = "127.0.0.1"        # Bind host address
 port = 24050              # Drop-in tosu port (1024-65535)
 cors_allow_all = true     # Permissive CORS headers for browser overlays
 enable_websocket = true   # Mount /websocket/v2 stream
-enable_http = true        # Mount /json/v2 and /health REST endpoints
+enable_http = true        # Mount the /json endpoints, /health and the settings page
+json_payload = "v1"       # What GET /json serves: "v1" (tosu's choice) or "v2"
 enable_overlays = true    # Serve overlays from overlays_dir (needs enable_http)
 overlays_dir = "browser_overlays"  # One subfolder per overlay, each with index.html
+settings_write_local_only = true   # Only the local machine may save settings (GET / is read-only for everyone else)
 
 [poll]
 poll_rate_hz = 60         # 60 Hz = ~16.6ms update interval (1-120 Hz)
@@ -143,7 +188,6 @@ auto_mode = true          # Auto-detect tournament vs single-player mode
 enable_chat = true        # Attributed multiplayer tournament chat
 enable_pp = true          # Real-time gradual PP calculation
 ignore_nf_for_pp = false  # Rate NF plays as if NoFail were not on them
-gradual_pp_chunks = 100   # Number of gradual PP checkpoints per beatmap (1-250)
 enable_hit_errors = true  # Include full hit error array in JSON packet
 
 [scoring]

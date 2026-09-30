@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 
@@ -57,6 +57,19 @@ pub struct ServerConfig {
     /// Directory containing one subfolder per browser overlay, each with an
     /// index.html. Relative paths resolve against the working directory.
     pub overlays_dir: String,
+    /// Accept settings writes (`POST /api/settings`) only from the loopback
+    /// interface. See `src/settings.rs`.
+    ///
+    /// Readers on the LAN can still view the landing page (`GET /`) and read
+    /// `GET /api/settings`; they just cannot change anything. Moot when
+    /// `host = "127.0.0.1"` (the default), which is the real boundary -- this
+    /// exists so `host = "0.0.0.0"` does not hand the configuration to every
+    /// machine on the venue network.
+    ///
+    /// **A convenience guard, not authentication.** Anything that can open a
+    /// socket from the host machine is still inside it, which is why the
+    /// landing page must never be exposed beyond a trusted network.
+    pub settings_write_local_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +167,9 @@ impl Default for ServerConfig {
             json_payload: "v1".to_string(),
             enable_overlays: true,
             overlays_dir: "browser_overlays".to_string(),
+            // Local writes only. The default host is loopback anyway, so this
+            // only has an effect once the operator publishes the port.
+            settings_write_local_only: true,
         }
     }
 }
@@ -315,6 +331,179 @@ impl AppConfig {
         Ok(())
     }
 
+    /// Write `self` to `path`, changing only the value tokens of the leaves that
+    /// differ from `previous`.
+    ///
+    /// [`Self::save_default_template`] writes the documented template verbatim,
+    /// and every comment in it is the reason a setting exists. A
+    /// `toml::to_string_pretty` round-trip would delete all of them, so this
+    /// patches the text instead: a line whose key is unchanged is copied byte for
+    /// byte, and only a changed leaf's value token is replaced. Nothing else is
+    /// touched -- not the comments, not the key order, not the quoting style, and
+    /// not any line the patch does not mention.
+    ///
+    /// * The base text is `previous` when it parses, otherwise the file on disk,
+    ///   otherwise the documented template -- so a missing or hand-broken file
+    ///   still ends up with a complete, documented config rather than a
+    ///   comment-free serialisation.
+    /// * A key the base does not carry is appended inside its own section, and a
+    ///   section the base does not carry is appended with its header. That is how
+    ///   a config written before `[scoring]` existed gains it on the first save.
+    /// * Scalars are formatted the way the template writes them: bare integers,
+    ///   floats with a decimal point, quoted strings, and an inline table with
+    ///   quoted keys for `mod_multipliers`.
+    /// * The write goes through a sibling temporary file and a rename, so an
+    ///   interrupted save cannot leave a truncated config behind.
+    pub fn save_preserving_comments<P: AsRef<Path>>(
+        &self,
+        path: P,
+        previous: Option<&str>,
+    ) -> Result<()> {
+        /// One leaf the writer knows about, in the order the field table lists
+        /// it -- which is also the order an appended key lands in.
+        struct WantedField {
+            key: &'static str,
+            section: &'static str,
+            leaf: &'static str,
+            value: String,
+        }
+
+        let path = path.as_ref();
+        let (base_text, base) = Self::patch_base(path, previous)?;
+
+        let wanted: Vec<WantedField> = crate::settings::field_values(self)?
+            .into_iter()
+            .map(|field| WantedField {
+                key: field.spec.key,
+                section: field.section,
+                leaf: field.leaf,
+                value: crate::settings::format_field_value(field.spec.key, &field.value),
+            })
+            .collect();
+
+        // The same renderings for what the file already says, so a leaf that is
+        // saved with the value it already had is not rewritten at all.
+        let current: HashMap<&str, String> = crate::settings::field_values(&base)?
+            .into_iter()
+            .map(|field| {
+                (
+                    field.spec.key,
+                    crate::settings::format_field_value(field.spec.key, &field.value),
+                )
+            })
+            .collect();
+        let newline = if base_text.contains("\r\n") {
+            "\r\n"
+        } else {
+            "\n"
+        };
+        let mut lines: Vec<String> = base_text.lines().map(str::to_string).collect();
+
+        // Replace the value token of every leaf the file already carries. The
+        // section is tracked rather than parsed per line because the schema is
+        // exactly two levels deep.
+        let mut section = String::new();
+        let mut present: HashSet<&'static str> = HashSet::new();
+        for line in lines.iter_mut() {
+            let trimmed = line.trim();
+            if let Some(name) = section_header(trimmed) {
+                section = name.to_string();
+                continue;
+            }
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let Some((key, _rest)) = trimmed.split_once('=') else {
+                continue;
+            };
+            let key = key.trim();
+            let dotted = format!("{section}.{key}");
+            let Some(field) = wanted.iter().find(|field| field.key == dotted) else {
+                continue;
+            };
+            present.insert(field.key);
+            if current.get(field.key).map(String::as_str) != Some(field.value.as_str()) {
+                *line = format!("{key} = {}", field.value);
+            }
+        }
+
+        // Both the missed keys and the missed sections are added last, walking
+        // the sections backwards so an insertion never moves an index that a
+        // section before it still has to use.
+        let sections: Vec<&'static str> = wanted.iter().fold(Vec::new(), |mut sections, field| {
+            if !sections.contains(&field.section) {
+                sections.push(field.section);
+            }
+            sections
+        });
+        for position in (0..sections.len()).rev() {
+            let section = sections[position];
+            let header_present = lines
+                .iter()
+                .any(|line| section_header(line.trim()) == Some(section));
+            let missing: Vec<&WantedField> = wanted
+                .iter()
+                .filter(|field| field.section == section && !present.contains(field.key))
+                .collect();
+            if header_present && missing.is_empty() {
+                continue;
+            }
+
+            let mut block: Vec<String> = Vec::new();
+            if !header_present {
+                block.push(String::new());
+                block.push(format!("[{section}]"));
+            }
+            block.extend(
+                missing
+                    .iter()
+                    .map(|field| format!("{} = {}", field.leaf, field.value)),
+            );
+
+            let at = section_insert_index(&lines, &sections, position);
+            lines.splice(at..at, block);
+        }
+        let mut text = lines.join(newline);
+        if !text.ends_with(newline) {
+            text.push_str(newline);
+        }
+
+        // Written beside the target and renamed over it: the rename is the only
+        // step that touches the real file, so an interrupted save leaves the
+        // previous contents exactly as they were instead of a truncated config.
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+            .unwrap_or_else(|| "config.toml".to_string());
+        let temp = path.with_file_name(format!(".{file_name}.tmp"));
+        fs::write(&temp, &text).with_context(|| format!("writing {}", temp.display()))?;
+        if let Err(err) = fs::rename(&temp, path) {
+            let _ = fs::remove_file(&temp);
+            return Err(anyhow::Error::new(err).context(format!("replacing {}", path.display())));
+        }
+        Ok(())
+    }
+
+    /// The text [`Self::save_preserving_comments`] patches, and the config it
+    /// holds.
+    fn patch_base(path: &Path, previous: Option<&str>) -> Result<(String, Self)> {
+        if let Some(text) = previous
+            && let Ok(config) = toml::from_str::<Self>(text)
+        {
+            return Ok((text.to_string(), config));
+        }
+        if previous.is_none()
+            && let Ok(text) = fs::read_to_string(path)
+            && let Ok(config) = toml::from_str::<Self>(&text)
+        {
+            return Ok((text, config));
+        }
+        let template = Self::generate_documented_template();
+        let config = toml::from_str::<Self>(template)
+            .context("the documented config template must parse")?;
+        Ok((template.to_string(), config))
+    }
+
     /// Generate human-readable TOML with comments, defaults, min and max values
     pub fn generate_documented_template() -> &'static str {
         r#"# ==============================================================================
@@ -346,6 +535,15 @@ enable_websocket = true
 # Default: true
 enable_http = true
 
+# Which payload GET /json serves.
+# "v1" is the gosumemory-compatible shape, which is what tosu serves on that
+# path; "v2" is rtosu's own payload, which is what this route served before the
+# parity work. /json/v1 always serves v1 and /json/v2 always serves v2, so this
+# only decides the bare path.
+# Options: "v1", "v2"
+# Default: "v1"
+json_payload = "v1"
+
 # Serve browser overlays from a local directory.
 # Every subfolder containing an index.html is treated as one overlay and served
 # at http://<host>:<port>/overlays/<folder>/, which is the URL to paste into an
@@ -359,6 +557,17 @@ enable_overlays = true
 # Relative paths resolve against the current working directory.
 # Default: "browser_overlays"
 overlays_dir = "browser_overlays"
+
+# Accept settings writes (POST /api/settings) only from the loopback interface.
+# Readers on the LAN can always VIEW the landing page at http://<host>:<port>/
+# and read GET /api/settings; they just cannot change anything. Moot when
+# host = "127.0.0.1" (the default), which is the real boundary -- this toggle
+# exists so host = "0.0.0.0" does not hand the settings over to every machine
+# on the venue network.
+# A convenience guard, not authentication: anything that can open a socket from
+# the host machine is still inside it.
+# Default: true
+settings_write_local_only = true
 
 
 [poll]
@@ -461,6 +670,42 @@ log_to_file = true
 max_log_files = 7
 "#
     }
+}
+
+/// The section name of a `[section]` header line, if that is what the line is.
+///
+/// Deliberately strict: a comment that mentions a section, a dotted key, or an
+/// inline table must not be mistaken for a header, because the writer uses this
+/// to decide which section it is patching.
+fn section_header(line: &str) -> Option<&str> {
+    let inner = line.strip_prefix('[')?.strip_suffix(']')?;
+    if inner.is_empty() || inner.contains(['[', ']', '.', '=']) {
+        return None;
+    }
+    Some(inner)
+}
+
+/// Where a block appended to `sections[position]` should land: just before the
+/// header of the next section the text already carries, or at the end.
+///
+/// Walking back over the blank lines that separate the two sections keeps the
+/// file's own spacing, so an appended key reads as the last line of its own
+/// section rather than as the first line of the next one.
+fn section_insert_index(lines: &[String], sections: &[&str], position: usize) -> usize {
+    let mut index = lines.len();
+    for later in &sections[position + 1..] {
+        if let Some(found) = lines
+            .iter()
+            .position(|line| section_header(line.trim()) == Some(*later))
+        {
+            index = found;
+            break;
+        }
+    }
+    while index > 0 && lines[index - 1].trim().is_empty() {
+        index -= 1;
+    }
+    index
 }
 
 #[cfg(test)]

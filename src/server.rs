@@ -1,13 +1,17 @@
 use crate::overlays::{self, OverlayStore};
+use crate::settings::{self, SettingsStore};
 use crate::v2::TosuV2Packet;
 use anyhow::{Context, Result};
 use axum::Router;
 use axum::body::{Body, Bytes};
+use axum::extract::connect_info::{ConnectInfo, MockConnectInfo};
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, RawQuery, State};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, RawQuery, State};
+use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Json, Redirect, Response};
 use axum::routing::get;
+use serde::Serialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::watch;
@@ -102,6 +106,12 @@ pub struct AppState {
     pub packet_rx: watch::Receiver<PublishedPacket>,
     /// User-supplied browser overlays. `None` disables the overlay routes.
     pub overlays: Option<Arc<OverlayStore>>,
+    /// The settings page's store. `None` renders the landing page without a
+    /// settings form and answers `/api/settings` with `404`.
+    pub settings: Option<Arc<SettingsStore>>,
+    /// The address the listener is bound to, for the landing page header.
+    pub bound_host: String,
+    pub bound_port: u16,
 }
 
 impl AppState {
@@ -109,6 +119,9 @@ impl AppState {
         Self {
             packet_rx,
             overlays: None,
+            settings: None,
+            bound_host: String::new(),
+            bound_port: 0,
         }
     }
 
@@ -120,7 +133,24 @@ impl AppState {
         Self {
             packet_rx,
             overlays: Some(Arc::new(OverlayStore::new(root))),
+            settings: None,
+            bound_host: String::new(),
+            bound_port: 0,
         }
+    }
+
+    /// Attach the settings store and the bound address, so `/` can render the
+    /// settings form and name the address it is serving on.
+    pub fn with_settings(
+        mut self,
+        settings: Arc<SettingsStore>,
+        bound_host: impl Into<String>,
+        bound_port: u16,
+    ) -> Self {
+        self.settings = Some(settings);
+        self.bound_host = bound_host.into();
+        self.bound_port = bound_port;
+        self
     }
 }
 
@@ -194,6 +224,19 @@ pub fn create_router_with(
             // nothing else in this router can be confused with it.
             .route("/json/sc", get(handle_json_sc))
             .route("/health", get(handle_health))
+            // The landing page and its API. Registered inside the HTTP block so
+            // the zero-port bypass still means what it says: with HTTP off,
+            // there is no page either.
+            .route("/", get(handle_landing))
+            .route(
+                "/api/settings",
+                get(handle_settings_get)
+                    .post(handle_settings_post)
+                    // The only legal body is a few hundred bytes of
+                    // `section.key: value` pairs, so a larger one is refused
+                    // before it is parsed.
+                    .layer(DefaultBodyLimit::max(settings::MAX_PATCH_BYTES)),
+            )
             // tosu file endpoints that overlays use to display the current
             // beatmap background, so drop-in overlays render unchanged.
             .route("/files/beatmap/background", get(handle_beatmap_background))
@@ -519,6 +562,229 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 
 fn text_response(body: impl Into<Body>, content_type: &'static str) -> Response {
     ([(header::CONTENT_TYPE, content_type)], body.into()).into_response()
+}
+
+/// Whether the request provably came from the loopback interface.
+///
+/// A request without connect info is **not** treated as local. A router served
+/// without `into_make_service_with_connect_info` cannot say where a request came
+/// from, and assuming "local" would silently disable the settings write guard.
+fn peer_is_loopback(peer: PeerAddress) -> bool {
+    peer.0.map(|addr| addr.ip().is_loopback()).unwrap_or(false)
+}
+
+/// The peer's address, when the service knows it.
+///
+/// Hand-written rather than `Option<ConnectInfo<SocketAddr>>` because axum only
+/// supports optional extraction for the extractors that implement
+/// `OptionalFromRequestParts`, and `ConnectInfo` is not one of them: as an
+/// extractor its rejection is `500`, so the settings routes would answer "500"
+/// instead of "403" whenever connect info is unavailable. Reading the extension
+/// directly makes "unknown peer" a value the guard handles.
+///
+/// Both halves are read: real serving inserts `ConnectInfo`, and
+/// [`MockConnectInfo`] -- which is how tests set a peer without a socket --
+/// inserts itself.
+#[derive(Clone, Copy, Debug)]
+struct PeerAddress(Option<SocketAddr>);
+
+impl<S> FromRequestParts<S> for PeerAddress
+where
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let peer = parts
+            .extensions
+            .get::<ConnectInfo<SocketAddr>>()
+            .map(|ConnectInfo(addr)| *addr)
+            .or_else(|| {
+                parts
+                    .extensions
+                    .get::<MockConnectInfo<SocketAddr>>()
+                    .map(|MockConnectInfo(addr)| *addr)
+            });
+        Ok(Self(peer))
+    }
+}
+
+/// `{"error": message}`, which is tosu's error shape everywhere
+/// (`utils/http.ts:186-207`) and the one rtosu already reproduces in
+/// [`not_ready`], so a consumer that parses one parses all of them.
+fn json_error(status: StatusCode, message: &str) -> Response {
+    let body = serde_json::json!({ "error": message }).to_string();
+    (status, [(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+/// A serialisable value as the response body.
+fn json_serializable<T: Serialize>(value: T) -> Response {
+    match serde_json::to_vec(&value) {
+        Ok(bytes) => json_response(Bytes::from(bytes)),
+        Err(err) => {
+            tracing::error!("failed to serialise a response: {err:#}");
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to encode the response",
+            )
+        }
+    }
+}
+
+/// Whether the request declares a JSON body.
+///
+/// A missing or different content type is refused rather than guessed at: the
+/// patch is applied verbatim, so the client has to say what it is sending.
+fn content_type_is_json(headers: &HeaderMap) -> bool {
+    headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(|value| {
+            value
+                .split(';')
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .eq_ignore_ascii_case("application/json")
+        })
+        .unwrap_or(false)
+}
+
+/// `GET /`: the settings landing page.
+///
+/// Renders with whatever is attached: the settings form and overlay cards when
+/// both are available, and a notice in place of either when it is not.
+async fn handle_landing(State(state): State<AppState>, peer: PeerAddress) -> Response {
+    let found = match state.overlays.as_ref() {
+        Some(store) => Some((store.list().await, store.root.clone())),
+        None => None,
+    };
+    let settings = state
+        .settings
+        .as_ref()
+        .map(|store| settings::settings_response(store, peer_is_loopback(peer)));
+    let overlays = found
+        .as_ref()
+        .map(|(overlays, root)| (overlays.as_slice(), root.as_path()));
+
+    let html = settings::landing_html(&settings::LandingView {
+        host: &state.bound_host,
+        port: state.bound_port,
+        config_path: state.settings.as_ref().map(|store| store.path()),
+        settings,
+        overlays,
+    });
+    text_response(html, "text/html; charset=utf-8")
+}
+
+/// `GET /api/settings`: the current configuration plus what the page needs to
+/// render it, including whether this viewer may change anything.
+async fn handle_settings_get(State(state): State<AppState>, peer: PeerAddress) -> Response {
+    let Some(store) = state.settings.as_ref() else {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "settings are unavailable in this mode",
+        );
+    };
+    json_serializable(settings::settings_response(store, peer_is_loopback(peer)))
+}
+
+/// `POST /api/settings`: validate a flat patch of `section.key` values, write it
+/// to the config file, then publish the part of it the poll loop can adopt
+/// without a restart.
+///
+/// **Atomic or nothing.** Every check runs before the file is touched, and the
+/// only step that changes anything in memory follows the write, so a rejected
+/// patch leaves both the file and the running process exactly as they were.
+async fn handle_settings_post(
+    State(state): State<AppState>,
+    peer: PeerAddress,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(store) = state.settings.as_ref() else {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "settings are unavailable in this mode",
+        );
+    };
+
+    if !content_type_is_json(&headers) {
+        return json_error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "expected Content-Type: application/json",
+        );
+    }
+
+    let origin = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok());
+    match settings::write_blocker(
+        &store.config(),
+        peer_is_loopback(peer),
+        origin,
+        store.check_writable(),
+    ) {
+        Some(settings::WriteBlocker::SettingsWriteLocalOnly) => {
+            return json_error(
+                StatusCode::FORBIDDEN,
+                "settings writes are restricted to localhost",
+            );
+        }
+        // A change that cannot be persisted is refused rather than accepted and
+        // lost on the next restart.
+        Some(settings::WriteBlocker::ConfigReadOnly) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "the config file could not be opened for writing; nothing was changed",
+            );
+        }
+        None => {}
+    }
+
+    let patch: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(patch) => patch,
+        Err(err) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                &format!("the request body is not valid JSON: {err}"),
+            );
+        }
+    };
+
+    let outcome = match store.apply_patch(&patch) {
+        Ok(outcome) => outcome,
+        Err(err) => return json_error(StatusCode::BAD_REQUEST, &format!("{err:#}")),
+    };
+
+    if let Err(err) = store.persist(&outcome.config) {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("writing the config file failed: {err:#}"),
+        );
+    }
+    if let Err(err) = store.commit(outcome.config.clone()) {
+        return json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("applying the configuration failed: {err:#}"),
+        );
+    }
+
+    tracing::info!(
+        "settings updated from {}: {}",
+        match peer.0 {
+            Some(addr) => addr.to_string(),
+            None => "an unknown peer".to_string(),
+        },
+        outcome.applied.join(", ")
+    );
+
+    json_serializable(serde_json::json!({
+        "ok": true,
+        "applied": outcome.applied,
+        "restart_required": outcome.restart_required,
+        "config": outcome.config,
+    }))
 }
 
 /// Read a single value out of a raw query string.
@@ -1460,7 +1726,8 @@ fn v2_frame(packet_rx: &mut watch::Receiver<PublishedPacket>) -> Option<Message>
 /// Start the tosu-compatible HTTP and WebSocket server.
 /// If both `enable_http` and `enable_ws` are false, the function immediately
 /// returns `Ok(())` without binding any TCP port (zero-port bypass).
-/// `overlays_dir` enables user-supplied browser overlays when set.
+/// `overlays_dir` enables user-supplied browser overlays when set, and
+/// `settings` enables the landing page's settings form and its API.
 /// Also configures graceful shutdown listening for termination signals.
 #[allow(clippy::too_many_arguments)]
 pub async fn start_server(
@@ -1472,6 +1739,7 @@ pub async fn start_server(
     overlays_dir: Option<std::path::PathBuf>,
     packet_rx: watch::Receiver<PublishedPacket>,
     json_payload: JsonPayload,
+    settings: Option<Arc<SettingsStore>>,
 ) -> Result<()> {
     if !enable_http && !enable_ws {
         tracing::info!(
@@ -1489,6 +1757,7 @@ pub async fn start_server(
         overlays_dir,
         packet_rx,
         json_payload,
+        settings,
     )
     .await
 }
@@ -1505,6 +1774,11 @@ pub async fn bind_listener(host: &str, port: u16) -> Result<tokio::net::TcpListe
 }
 
 /// Run Axum HTTP and WebSocket serving loop on an already bound TCP listener.
+///
+/// The peer address is part of the service: `settings_write_local_only` refuses
+/// a settings write from anywhere but the loopback interface, which cannot be
+/// decided without `ConnectInfo`.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_with_listener(
     listener: tokio::net::TcpListener,
     enable_http: bool,
@@ -1513,24 +1787,38 @@ pub async fn serve_with_listener(
     overlays_dir: Option<std::path::PathBuf>,
     packet_rx: watch::Receiver<PublishedPacket>,
     json_payload: JsonPayload,
+    settings: Option<Arc<SettingsStore>>,
 ) -> Result<()> {
-    let state = match overlays_dir {
+    let bound = listener.local_addr().ok();
+    let mut state = match overlays_dir {
         Some(root) => AppState::with_overlays(packet_rx, root),
         None => AppState::new(packet_rx),
     };
+    if let Some(store) = settings {
+        // `local_addr` is the address actually bound, so a configured port of
+        // `0` shows the port the OS picked rather than `0`.
+        state = state.with_settings(
+            store,
+            bound.map(|addr| addr.ip().to_string()).unwrap_or_default(),
+            bound.map(|addr| addr.port()).unwrap_or(0),
+        );
+    }
     let app = create_router_with(state, enable_http, enable_ws, cors_allow_all, json_payload);
 
-    if let Ok(addr) = listener.local_addr() {
+    if let Some(addr) = bound {
         tracing::info!("Listening on TCP socket {}", addr);
     }
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-            tracing::info!("Server received shutdown signal, closing active listeners");
-        })
-        .await
-        .context("running axum server")?;
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+        tracing::info!("Server received shutdown signal, closing active listeners");
+    })
+    .await
+    .context("running axum server")?;
 
     Ok(())
 }
@@ -2377,6 +2665,7 @@ mod tests {
             None,
             rx,
             JsonPayload::V1,
+            None,
         )
         .await;
         assert!(res.is_ok());
@@ -3239,5 +3528,337 @@ mod tests {
         assert_eq!(query_value(Some("mapset%3D1"), "mapset").as_deref(), None);
         assert_eq!(query_value(Some("other=1"), "mapset"), None);
         assert_eq!(query_value(None, "mapset"), None);
+    }
+
+    // ---- the landing page and its API ----
+
+    use crate::config::AppConfig;
+
+    fn loopback() -> SocketAddr {
+        SocketAddr::from(([127, 0, 0, 1], 51_234))
+    }
+
+    /// A settings store over a path in a fresh temp directory.
+    fn settings_store(tag: &str) -> Arc<SettingsStore> {
+        let dir = std::env::temp_dir().join(format!("rtosu-server-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create the settings directory");
+        Arc::new(
+            SettingsStore::new(dir.join("config.toml"), AppConfig::default())
+                .expect("the default config builds a store"),
+        )
+    }
+
+    /// A router carrying a settings store and a peer address, which is what the
+    /// settings routes need to make a decision.
+    fn settings_app(store: Arc<SettingsStore>, peer: SocketAddr) -> Router {
+        let (_tx, rx) = watch::channel(PublishedPacket::default_packet());
+        create_router(
+            AppState::new(rx).with_settings(store, "127.0.0.1", 24050),
+            true,
+            true,
+            true,
+        )
+        .layer(MockConnectInfo(peer))
+    }
+
+    /// A `POST /api/settings` as a client would send it.
+    ///
+    /// The peer comes from the router's own [`MockConnectInfo`] layer rather than
+    /// from here: two such layers would both write the extension and the inner
+    /// one would win, which is exactly the bug this signature avoids.
+    async fn post_settings(
+        app: Router,
+        content_type: Option<&str>,
+        origin: Option<&str>,
+        body: &str,
+    ) -> (StatusCode, String) {
+        let mut request = Request::builder().method("POST").uri("/api/settings");
+        if let Some(content_type) = content_type {
+            request = request.header(header::CONTENT_TYPE, content_type);
+        }
+        if let Some(origin) = origin {
+            request = request.header(header::ORIGIN, origin);
+        }
+        let response = app
+            .oneshot(request.body(Body::from(body.to_string())).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// `GET /` answers with a page rather than the 404 it used to fall through
+    /// to, and it works with nothing attached: no store, no overlay directory.
+    #[tokio::test]
+    async fn the_root_serves_the_landing_page() {
+        let (_tx, rx) = watch::channel(PublishedPacket::default_packet());
+        let (status, body) =
+            get_text(create_router(AppState::new(rx), true, false, true), "/").await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("<!DOCTYPE html>"));
+        assert!(
+            body.contains("Settings are unavailable"),
+            "a page without a store has to say so"
+        );
+
+        // And the API says 404 rather than pretending it has settings.
+        let (_tx, rx) = watch::channel(PublishedPacket::default_packet());
+        let (status, _) = get_text(
+            create_router(AppState::new(rx), true, false, true),
+            "/api/settings",
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        // The zero-port bypass still means "no page either", because the route
+        // lives inside the HTTP block.
+        let (_tx, rx) = watch::channel(PublishedPacket::default_packet());
+        let (status, _) = get_text(create_router(AppState::new(rx), false, false, true), "/").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// `GET /api/settings` carries the config, the field table, and whether this
+    /// viewer may write.
+    #[tokio::test]
+    async fn settings_get_returns_the_config_the_fields_and_the_write_flag() {
+        let store = settings_store("get");
+        let (status, body) =
+            get_text(settings_app(store.clone(), loopback()), "/api/settings").await;
+        assert_eq!(status, StatusCode::OK);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        assert_eq!(parsed["writable"], serde_json::json!(true));
+        assert_eq!(parsed["writable_reason"], serde_json::Value::Null);
+        assert_eq!(
+            parsed["config"]["poll"]["poll_rate_hz"],
+            serde_json::json!(60)
+        );
+        assert_eq!(
+            parsed["config"]["server"]["settings_write_local_only"],
+            serde_json::json!(true)
+        );
+        assert!(
+            parsed["fields"]
+                .as_array()
+                .expect("fields are an array")
+                .iter()
+                .any(|field| field["key"] == "poll.poll_rate_hz"),
+            "the field table must reach the page"
+        );
+        let config: AppConfig =
+            serde_json::from_value(parsed["config"].clone()).expect("the config round-trips");
+        assert_eq!(config.server.port, 24050);
+
+        // A viewer on the LAN sees everything and is told why it cannot write.
+        let (status, body) = get_text(
+            settings_app(store, SocketAddr::from(([192, 168, 1, 10], 51_234))),
+            "/api/settings",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        assert_eq!(parsed["writable"], serde_json::json!(false));
+        assert_eq!(
+            parsed["writable_reason"],
+            serde_json::json!("settings_write_local_only")
+        );
+    }
+
+    /// The happy path: a local peer saves, the file is rewritten with its
+    /// comments intact, and the poll loop's live view moves.
+    #[tokio::test]
+    async fn settings_post_from_localhost_writes_the_file_and_publishes_the_change() {
+        let store = settings_store("post");
+        let mut live_rx = store.subscribe();
+
+        let (status, body) = post_settings(
+            settings_app(store.clone(), loopback()),
+            Some("application/json; charset=utf-8"),
+            Some("http://localhost:24050"),
+            r#"{ "poll.poll_rate_hz": 120, "features.enable_pp": false, "logging.level": "debug" }"#,
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let parsed: serde_json::Value = serde_json::from_str(&body).expect("json body");
+        assert_eq!(parsed["ok"], serde_json::json!(true));
+        assert_eq!(parsed["applied"].as_array().expect("applied").len(), 3);
+        assert_eq!(
+            parsed["restart_required"],
+            serde_json::json!(["logging.level"]),
+            "only the log level needs a restart"
+        );
+        assert_eq!(
+            parsed["config"]["poll"]["poll_rate_hz"],
+            serde_json::json!(120)
+        );
+
+        // The file on disk carries the change and kept the template's comments.
+        let text = std::fs::read_to_string(store.path()).expect("the config must be written");
+        assert!(text.contains("poll_rate_hz = 120"));
+        assert!(text.contains("enable_pp = false"));
+        assert!(text.contains("# A high-performance native Rust memory reader"));
+        let written: AppConfig = toml::from_str(&text).expect("the written file parses");
+        written.validate().expect("the written file validates");
+        assert_eq!(written.logging.level, "debug");
+
+        // And the poll loop can see it on its next tick.
+        assert!(live_rx.has_changed().unwrap_or(false));
+        let live = live_rx.borrow_and_update().clone();
+        assert_eq!(live.poll_interval, std::time::Duration::from_millis(8));
+        assert!(!live.enable_pp);
+        assert_eq!(store.config().poll.poll_rate_hz, 120);
+    }
+
+    /// The write guard: a LAN viewer, and a browser on this machine that was
+    /// loaded from somewhere else, are both refused.
+    #[tokio::test]
+    async fn settings_post_is_refused_for_a_lan_peer_or_a_foreign_origin() {
+        let store = settings_store("guard");
+
+        let (status, body) = post_settings(
+            settings_app(store.clone(), SocketAddr::from(([192, 168, 1, 10], 51_234))),
+            Some("application/json"),
+            None,
+            r#"{ "poll.poll_rate_hz": 120 }"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("restricted to localhost"));
+
+        let (status, body) = post_settings(
+            settings_app(store.clone(), loopback()),
+            Some("application/json"),
+            Some("http://evil.example"),
+            r#"{ "poll.poll_rate_hz": 120 }"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert!(body.contains("restricted to localhost"));
+
+        // Neither refusal may have written or applied anything.
+        assert!(!store.path().exists());
+        assert_eq!(store.config().poll.poll_rate_hz, 60);
+    }
+
+    /// A body that is not declared as JSON, and one that is too large, are
+    /// refused before they are parsed.
+    #[tokio::test]
+    async fn settings_post_refuses_a_wrong_content_type_and_an_oversized_body() {
+        let store = settings_store("media");
+
+        let (status, body) = post_settings(
+            settings_app(store.clone(), loopback()),
+            Some("text/plain"),
+            None,
+            r#"{ "poll.poll_rate_hz": 120 }"#,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert!(body.contains("application/json"));
+
+        let (status, _) = post_settings(
+            settings_app(store.clone(), loopback()),
+            None,
+            None,
+            r#"{ "poll.poll_rate_hz": 120 }"#,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "a missing content type is not a guess"
+        );
+
+        let huge = format!(
+            "{{\"logging.level\": \"{}\"}}",
+            "x".repeat(settings::MAX_PATCH_BYTES)
+        );
+        let (status, _) = post_settings(
+            settings_app(store, loopback()),
+            Some("application/json"),
+            None,
+            &huge,
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// A patch the validator refuses is answered `400` with the key named, and
+    /// nothing is written or applied.
+    #[tokio::test]
+    async fn a_rejected_patch_is_answered_with_the_key_and_writes_nothing() {
+        let cases = [
+            (r#"{ "poll.poll_rate_hz": 0 }"#, "poll.poll_rate_hz"),
+            (r#"{ "features.enable_pp": 5 }"#, "features.enable_pp"),
+            (
+                r#"{ "scoring.mod_multipliers": { "DTNC": 2.0 } }"#,
+                "scoring.mod_multipliers",
+            ),
+            (r#"{ "server.overlay_dir": "x" }"#, "unknown key"),
+            ("[]", "must be a JSON object"),
+            ("not json at all", "not valid JSON"),
+        ];
+
+        for (body, expected) in cases {
+            let store = settings_store("rejected");
+            let (status, response_body) = post_settings(
+                settings_app(store.clone(), loopback()),
+                Some("application/json"),
+                None,
+                body,
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&response_body).expect("the error is JSON, like tosu's");
+            let message = parsed["error"].as_str().expect("an error message");
+            assert!(
+                message.contains(expected),
+                "{body} must name {expected}, got: {message}"
+            );
+            assert!(!store.path().exists(), "{body} must not write the config");
+            assert_eq!(store.config().poll.poll_rate_hz, 60);
+        }
+    }
+
+    /// The landing page renders the settings form and the same overlay cards the
+    /// `/overlays` dashboard does.
+    #[tokio::test]
+    async fn the_landing_page_shows_the_form_and_the_overlay_cards() {
+        let store = settings_store("landing");
+        let root = temp_overlay_root("landing");
+        write_overlay_file(&root, "Team Bar/index.html", "<html>team bar</html>");
+
+        let (_tx, rx) = watch::channel(PublishedPacket::default_packet());
+        let app = create_router(
+            AppState::with_overlays(rx, root.clone()).with_settings(store, "127.0.0.1", 24050),
+            true,
+            true,
+            true,
+        )
+        .layer(MockConnectInfo(loopback()));
+
+        let (status, body) = get_text(app, "/").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            body.contains("data-key=\"poll.poll_rate_hz\""),
+            "the form must render a control per setting"
+        );
+        assert!(body.contains("data-key=\"scoring.mod_multipliers\""));
+        assert!(
+            body.contains("/overlays/Team%20Bar/"),
+            "the overlay card URL must be the one an OBS source uses"
+        );
+        assert!(body.contains("Team Bar"), "and the card names it");
+        assert!(
+            body.contains("/api/settings"),
+            "the page's script posts to the API"
+        );
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }
