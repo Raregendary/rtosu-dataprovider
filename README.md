@@ -40,6 +40,7 @@ A lightweight native Rust data provider emitting **[tosu](https://github.com/Kot
   - `GET /health` — Service health check.
   - `GET /` — Settings landing page: the live configuration in a form next to your overlays.
   - `GET /api/settings`, `POST /api/settings` — The landing page's JSON API (read the config; apply a validated patch).
+  - `POST /api/restart` — Hot restart: the process replaces itself with a fresh copy, same arguments (loopback only).
   - `GET /files/beatmap/background` — Current beatmap background, for overlays.
   - `GET /files/beatmap/{*path}`, `GET /Songs/{*path}` — The osu! songs folder, under either path, for overlays that load audio or images by file.
   - `GET /files/skin/{*path}` — The skin folder.
@@ -54,9 +55,10 @@ A lightweight native Rust data provider emitting **[tosu](https://github.com/Kot
   - Automatic shim injection rewrites tosu API calls (`ws://127.0.0.1:24050/ws`, `/websocket/v2`, `/backgroundImage`, `/Songs/...`) onto the page's own origin, so drop-in overlays need no edits.
   - Live directory re-scan: drop a folder in mid-session and it appears without a restart.
 - **Settings Landing Page** (`http://127.0.0.1:24050/`):
-  - Every `config.toml` setting in one form, next to the overlay cards, for machines with no dashboard app.
+  - Every `config.toml` setting in one form, in collapsible sections, above the overlay cards rendered full width, for machines with no dashboard app.
   - Saving patches `config.toml` in place: comments, key order and every line you did not change survive byte for byte.
-  - `[features]`, `[scoring]` and `poll.poll_rate_hz` take effect on the next poll; the rest is saved and marked *restart* in the page.
+  - `[features]`, `[scoring]`, `poll.poll_rate_hz` and `server.settings_write_local_only` take effect on the next poll or the next request; the rest is saved and marked *restart* in the page.
+  - **↻ Restart** button in the header (`POST /api/restart`): the server replaces itself with a fresh copy started from the same command line, and the page reloads when the new one answers. Local machine only.
   - Writes are restricted to the local machine by default (`server.settings_write_local_only`); everyone else gets a read-only view.
 - **Solo Gameplay State**:
   - Live score, accuracy, current combo, max combo, HP, and smooth HP bar.
@@ -132,18 +134,31 @@ Open the root of the server in a browser:
 http://127.0.0.1:24050/
 ```
 
-The page shows every setting in `config.toml` as a form, grouped by section,
-next to the same overlay cards the `/overlays` dashboard renders. **Save
-changes** writes the config file back in place — comments, key order and every
-line you did not touch are preserved exactly — and applies what can be applied
-without a restart. A setting marked *restart* is saved immediately but only read
-at startup, and the page says so rather than pretending otherwise.
+The page shows every setting in `config.toml` as a form grouped by collapsible
+sections, above the same overlay cards the `/overlays` dashboard renders at
+full width, an index of every endpoint, and links to this repository and to the
+original tosu project the API mirrors. **Save changes** writes the config file
+back in place — comments, key order and every line you did not touch are
+preserved exactly — and applies what can be applied without a restart. A
+setting marked *restart* is saved immediately but only read at startup, and the
+page says so rather than pretending otherwise. The **↻ Restart** button in the
+header then replaces the running process with a fresh copy started from the
+same command line, so restart-required settings land without touching a
+terminal (CLI `serve` only, and from the machine itself only — see the guards
+below).
 
 | Path | What it does |
 | --- | --- |
 | `GET /` | The page. |
 | `GET /api/settings` | The current config plus the field table, and whether this viewer may write. |
 | `POST /api/settings` | A flat patch of `section.key` values, e.g. `{"poll.poll_rate_hz": 120}`. Validated against the same rules the config file is loaded with; on any error nothing is applied and nothing is written. |
+| `POST /api/restart` | Hot restart: the server stops listening, starts a fresh copy of itself with the same arguments, and exits. The page reloads itself as soon as the new process answers. |
+
+**Who may restart.** Always the loopback interface with no `Origin` or a
+loopback one — stricter than the write guard, and deliberately not
+configurable, because a restart drops every live overlay socket the moment it
+lands. A server without a process supervisor (a library consumer, not the CLI)
+answers `409` rather than pretending.
 
 **Who may write.** `server.settings_write_local_only = true` (the default)
 accepts settings writes only from the loopback interface, and only from a
@@ -152,9 +167,13 @@ the page and the JSON; they cannot change anything. This is a convenience guard,
 **not authentication** — the real boundary is `host = "127.0.0.1"`, so do not
 publish port 24050 beyond a network you trust.
 
-Applied live, no restart: `[features]`, `[scoring]`, `poll.poll_rate_hz`.
-Needs a restart: everything under `[server]`, `poll.scan_budget_mb`,
-`poll.default_profile`, `poll.auto_mode`, `[logging]`.
+Applied live, no restart: `[features]`, `[scoring]`, `poll.poll_rate_hz`,
+and `server.settings_write_local_only` (it is checked on every request).
+Needs a restart: `server.host`, `server.port`, `server.cors_allow_all`,
+`server.enable_http`, `server.enable_websocket`, `server.json_payload`,
+`server.enable_overlays`, `server.overlays_dir`, `poll.scan_budget_mb`,
+`poll.default_profile`, `poll.auto_mode`, `[logging]` — or just press
+**↻ Restart**.
 
 tosu's own `POST /api/settingsSave` is deliberately not implemented: its body is
 an Electron dashboard record with a different schema, and serving the same path

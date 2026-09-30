@@ -158,7 +158,7 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
     toggle(
         "server.settings_write_local_only",
         "Accept settings writes from localhost only",
-        true,
+        false,
     ),
     number(
         "poll.poll_rate_hz",
@@ -835,6 +835,13 @@ pub fn settings_response(store: &SettingsStore, peer_is_loopback: bool) -> Setti
     }
 }
 
+/// The project's source repository, shown in the header and footer.
+const GITHUB_URL: &str = "https://github.com/Raregendary/rtosu-dataprovider";
+
+/// The original tosu project, credited in the footer: this server exists to
+/// replace its data API, and drop-in overlays are written against tosu.
+const TOSU_URL: &str = "https://tosu.app/";
+
 /// Everything `/` renders.
 pub struct LandingView<'a> {
     /// The bound host, as the listener reported it.
@@ -847,6 +854,11 @@ pub struct LandingView<'a> {
     pub settings: Option<SettingsResponse>,
     /// The discovered overlays and the directory they came from.
     pub overlays: Option<(&'a [Overlay], &'a Path)>,
+    /// Whether this viewer may hot-restart the server: only the CLI `serve`
+    /// process has a supervisor to do it, and only a loopback viewer passes
+    /// the endpoint's guard, so the button is offered under exactly the
+    /// conditions the endpoint would honour.
+    pub can_restart: bool,
 }
 
 /// Render the landing page at `/`.
@@ -867,12 +879,15 @@ pub fn landing_html(view: &LandingView<'_>) -> String {
     html.push_str("\n</style>\n</head>\n<body>\n");
     html.push_str(&header_html(view));
     html.push_str(&banner_html(view));
-    html.push_str("<main class=\"wrap\">\n<section class=\"col main\">\n");
+    // One column, top to bottom: settings first (it is the working surface),
+    // overlays next at full width so the cards read like the /overlays
+    // dashboard rather than cramped sidebar widgets, then the endpoint index.
+    html.push_str("<main class=\"wrap\">\n");
     html.push_str(&settings_html(view));
-    html.push_str("</section>\n<aside class=\"col side\">\n");
     html.push_str(&overlays_html(view));
     html.push_str(&links_html());
-    html.push_str("</aside>\n</main>\n");
+    html.push_str("</main>\n");
+    html.push_str(&footer_html());
     html.push_str("<script id=\"rtosu-data\" type=\"application/json\">");
     html.push_str(&page_meta_json(view));
     html.push_str("</script>\n<script>\n");
@@ -894,14 +909,16 @@ fn header_html(view: &LandingView<'_>) -> String {
     };
     let mut html = String::from("<header class=\"top\"><div class=\"top-inner\">\n");
     html.push_str(
-        "<span class=\"brand\">rtosu<span class=\"dot\">&middot;</span>dataprovider</span>\n",
+        "<span class=\"brand\"><span class=\"mark\">R</span>rtosu<span class=\"dot\">&middot;</span>dataprovider</span>\n",
     );
     html.push_str(&format!(
         "<span class=\"pill\">v{}</span>\n",
         escape_html(&version)
     ));
     html.push_str(&format!(
-        "<span class=\"pill\">{}:{}</span>\n",
+        "<a class=\"pill\" href=\"http://{}:{}/\" title=\"this page\">{}:{}</a>\n",
+        escape_html(host),
+        view.port,
         escape_html(host),
         view.port
     ));
@@ -911,7 +928,16 @@ fn header_html(view: &LandingView<'_>) -> String {
             escape_html(&path.display().to_string())
         ));
     }
-    html.push_str("</div></header>\n");
+    html.push_str("<span class=\"top-actions\">\n");
+    if view.can_restart {
+        html.push_str(
+            "<button class=\"ghost danger\" id=\"restart\" type=\"button\" title=\"Restart the server so settings that need a restart take effect. Live overlay sockets drop for a moment.\">&#x21bb; Restart</button>\n",
+        );
+    }
+    html.push_str(&format!(
+        "<a class=\"ghost\" href=\"{GITHUB_URL}\" target=\"_blank\" rel=\"noreferrer noopener\">GitHub</a>\n",
+    ));
+    html.push_str("</span>\n</div></header>\n");
     html
 }
 
@@ -950,7 +976,7 @@ fn banner_html(view: &LandingView<'_>) -> String {
         },
     };
     format!(
-        "<div class=\"wrap\"><div class=\"banner {class}\" id=\"banner\"{}>{}</div></div>\n",
+        "<div class=\"wrap tight\"><div class=\"banner {class}\" id=\"banner\"{}>{}</div></div>\n",
         if can_write { " hidden" } else { "" },
         escape_html(&text)
     )
@@ -966,6 +992,7 @@ struct PageMeta {
     config_path: Option<String>,
     restart_required: Vec<&'static str>,
     settings_available: bool,
+    restart_available: bool,
 }
 
 fn page_meta_json(view: &LandingView<'_>) -> String {
@@ -987,6 +1014,7 @@ fn page_meta_json(view: &LandingView<'_>) -> String {
         config_path: view.config_path.map(|path| path.display().to_string()),
         restart_required: restart_required_keys(),
         settings_available: view.settings.is_some(),
+        restart_available: view.can_restart,
     };
     // `<` is escaped because the blob sits inside a `<script>` element, where a
     // `</script>` in a path would end the element early. A JSON parser reads
@@ -1044,7 +1072,8 @@ fn settings_html(view: &LandingView<'_>) -> String {
     html.push_str(
         "<p class=\"hint\">Changes are written back to the config file with every comment and \
          every unedited line preserved. A value marked <span class=\"tag\">restart</span> is \
-         saved immediately but only takes effect after a restart.</p>\n",
+         saved immediately but only takes effect on the next start -- use <em>Restart</em> in \
+         the header to apply it now. Click a section heading to collapse it.</p>\n",
     );
     html.push_str("</div>\n<form id=\"settings\" autocomplete=\"off\">\n");
 
@@ -1053,18 +1082,25 @@ fn settings_html(view: &LandingView<'_>) -> String {
     for field in &fields {
         if field.section != section {
             if open {
-                html.push_str("</div>\n</fieldset>\n");
+                html.push_str("</div>\n</details>\n");
             }
+            // `details`/`summary` rather than `fieldset`/`legend`: the section
+            // collapses with no script at all, the summary keeps the title,
+            // the `[section]` key and the one-line note on a single readable
+            // row, and the page's script remembers which ones the operator
+            // left open.
             html.push_str(&format!(
-                "<fieldset class=\"section\" id=\"sec-{}\">\n<legend>{} <span class=\"key\">[{}]</span></legend>\n",
+                "<details class=\"section\" id=\"sec-{}\">\n<summary>\
+<span class=\"chev\" aria-hidden=\"true\"></span>\
+<span class=\"s-title\">{}</span>\
+<span class=\"key\">[{}]</span>\
+<span class=\"s-note\">{}</span>\
+</summary>\n",
                 escape_html(field.section),
                 escape_html(section_title(field.section)),
                 escape_html(field.section),
+                escape_html(section_note(field.section)),
             ));
-            let note = section_note(field.section);
-            if !note.is_empty() {
-                html.push_str(&format!("<p class=\"hint\">{}</p>\n", escape_html(note)));
-            }
             html.push_str("<div class=\"fields\">\n");
             section = field.section;
             open = true;
@@ -1072,7 +1108,7 @@ fn settings_html(view: &LandingView<'_>) -> String {
         html.push_str(&field_row(field));
     }
     if open {
-        html.push_str("</div>\n</fieldset>\n");
+        html.push_str("</div>\n</details>\n");
     }
 
     let disabled = if settings.writable { "" } else { " disabled" };
@@ -1279,6 +1315,23 @@ fn links_html() -> String {
     html
 }
 
+/// The footer: where the code lives, and credit where the API design came from.
+fn footer_html() -> String {
+    format!(
+        "<footer class=\"foot\"><div class=\"wrap foot-inner\">\n\
+<div class=\"foot-project\">\n\
+<span class=\"brand small\"><span class=\"mark\">R</span>rtosu<span class=\"dot\">&middot;</span>dataprovider</span>\n\
+<p class=\"hint\">A standalone, memory-reading data server for osu! tournament overlays. \
+Source: <a href=\"{github}\" target=\"_blank\" rel=\"noreferrer noopener\">github.com/Raregendary/rtosu-dataprovider</a></p>\n\
+</div>\n\
+<p class=\"hint credit\">Credit to the original <a href=\"{tosu}\" target=\"_blank\" rel=\"noreferrer noopener\"><strong>tosu</strong></a> \
+project, whose data API and overlay format this server reproduces so that tosu overlays work unmodified.</p>\n\
+</div></footer>\n",
+        github = GITHUB_URL,
+        tosu = TOSU_URL,
+    )
+}
+
 /// The landing page's own stylesheet.
 ///
 /// Deliberately self-contained -- no font, image or script is fetched from
@@ -1287,14 +1340,14 @@ fn links_html() -> String {
 /// machine that may have no internet at all.
 const LANDING_STYLE: &str = r#":root {
   color-scheme: dark;
-  --bg: #0c0e13;
-  --panel: #151922;
-  --panel-2: #1a1f2a;
-  --line: #252b38;
-  --line-2: #333b4d;
+  --bg: #0b0d12;
+  --panel: #141824;
+  --panel-2: #1a1f2d;
+  --line: #232a3a;
+  --line-2: #333d55;
   --text: #e9ecf3;
-  --muted: #8b95aa;
-  --faint: #6b7488;
+  --muted: #93a0b8;
+  --faint: #6d7891;
   --pink: #ff74ad;
   --blue: #7aa7ff;
   --ok: #62d492;
@@ -1307,8 +1360,8 @@ body {
   font: 14px/1.55 "Segoe UI", system-ui, -apple-system, sans-serif;
   color: var(--text);
   background:
-    radial-gradient(1100px 520px at 12% -12%, #1e2740 0%, rgba(30, 39, 64, 0) 62%),
-    radial-gradient(900px 480px at 100% 0%, #2a1c2c 0%, rgba(42, 28, 44, 0) 58%),
+    radial-gradient(1200px 560px at 15% -10%, #1d2742 0%, rgba(29, 39, 66, 0) 60%),
+    radial-gradient(1000px 520px at 100% -5%, #2b1b2e 0%, rgba(43, 27, 46, 0) 55%),
     var(--bg);
   background-attachment: fixed;
 }
@@ -1318,24 +1371,41 @@ code { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
 
 .top {
   position: sticky; top: 0; z-index: 10;
-  background: rgba(12, 14, 19, .82);
+  background: rgba(11, 13, 18, .85);
   backdrop-filter: blur(10px);
   border-bottom: 1px solid var(--line);
 }
 .top-inner {
-  max-width: 1240px; margin: 0 auto; padding: 14px 26px;
+  max-width: 1160px; margin: 0 auto; padding: 12px 26px;
   display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
 }
-.brand { font-size: 17px; font-weight: 650; letter-spacing: .2px; }
+.brand { display: inline-flex; align-items: center; font-size: 16px; font-weight: 650; letter-spacing: .2px; }
+.brand .mark {
+  display: inline-grid; place-items: center; width: 26px; height: 26px; margin-right: 9px;
+  border-radius: 8px; background: linear-gradient(135deg, var(--pink), #7c5cff);
+  color: #0b0d12; font-weight: 800; font-size: 14px;
+}
+.brand.small { font-size: 14px; }
 .brand .dot { color: var(--pink); margin: 0 3px; }
 .pill {
-  max-width: 100%; padding: 3px 9px; font-size: 12px; color: var(--muted);
+  max-width: 100%; padding: 3px 10px; font-size: 12px; color: var(--muted);
   background: var(--panel-2); border: 1px solid var(--line); border-radius: 999px;
   overflow-wrap: anywhere;
 }
+a.pill:hover { border-color: var(--line-2); color: var(--text); text-decoration: none; }
+.top-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+.ghost {
+  padding: 6px 13px; font: inherit; font-size: 12.5px; color: var(--text);
+  background: var(--panel-2); border: 1px solid var(--line-2); border-radius: 8px;
+  cursor: pointer; text-decoration: none; white-space: nowrap;
+}
+.ghost:hover:not(:disabled) { background: #242b3c; border-color: #43506f; text-decoration: none; }
+.ghost.danger { color: #ffd7e7; border-color: #5d2a44; background: #241320; }
+.ghost.danger:hover:not(:disabled) { background: #33192b; border-color: #7c3a5a; }
+.ghost:disabled { opacity: .55; cursor: progress; }
 
 .banner {
-  margin: 18px 0 0; padding: 11px 14px; font-size: 13px;
+  margin: 16px 0 0; padding: 11px 14px; font-size: 13px;
   border: 1px solid var(--line-2); border-radius: 10px;
   background: var(--panel); color: var(--muted);
 }
@@ -1344,42 +1414,65 @@ code { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; }
 .banner.ok { border-color: #2c4a39; background: #10241a; color: var(--ok); }
 .banner[hidden] { display: none; }
 
-.wrap { max-width: 1240px; margin: 0 auto; padding: 0 26px 56px; }
+.wrap { max-width: 1160px; margin: 0 auto; padding: 0 26px 40px; }
+.wrap.tight { padding-bottom: 0; }
 main.wrap {
-  display: grid; grid-template-columns: minmax(0, 1fr) 360px;
-  gap: 22px; align-items: start; padding-top: 22px;
+  padding-top: 22px;
+  display: flex; flex-direction: column; gap: 22px;
 }
-.col { min-width: 0; display: flex; flex-direction: column; gap: 22px; }
 .panel {
-  padding: 20px; border: 1px solid var(--line); border-radius: 12px;
-  background: rgba(21, 25, 34, .72);
+  padding: 20px; border: 1px solid var(--line); border-radius: 14px;
+  background: linear-gradient(180deg, rgba(26, 31, 45, .72), rgba(20, 24, 36, .78));
+  box-shadow: 0 10px 30px rgba(0, 0, 0, .25);
 }
 .panel-head { margin-bottom: 14px; }
 .panel h2 {
+  display: flex; align-items: center; gap: 8px;
   margin: 0 0 4px; font-size: 13px; font-weight: 650; letter-spacing: .8px;
   text-transform: uppercase; color: var(--muted);
+}
+.panel h2::before {
+  content: ""; flex: none; width: 8px; height: 8px; border-radius: 3px;
+  background: linear-gradient(135deg, var(--pink), #7c5cff);
 }
 p { margin: 0; }
 .hint { font-size: 12px; color: var(--faint); }
 .hint code { color: var(--pink); }
 
-fieldset.section {
-  margin: 0 0 18px; padding: 16px; border: 1px solid var(--line);
-  border-radius: 10px; background: var(--panel-2);
+details.section {
+  margin: 0 0 14px; border: 1px solid var(--line); border-radius: 12px;
+  background: var(--panel-2); overflow: hidden;
 }
-fieldset.section:last-of-type { margin-bottom: 0; }
-legend { padding: 0 6px; font-size: 14px; font-weight: 600; }
-legend .key {
-  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
-  font-size: 12px; font-weight: 400; color: var(--faint);
+details.section:last-of-type { margin-bottom: 0; }
+details.section > summary {
+  display: flex; align-items: center; gap: 10px; padding: 12px 15px;
+  cursor: pointer; list-style: none; user-select: none;
 }
-fieldset.section > .hint { margin: 2px 0 0 6px; }
-.fields { display: flex; flex-direction: column; margin-top: 10px; }
+details.section > summary::-webkit-details-marker { display: none; }
+details.section > summary:hover { background: rgba(122, 167, 255, .05); }
+details[open] > summary { border-bottom: 1px solid var(--line); }
+.chev {
+  flex: none; width: 0; height: 0;
+  border-left: 6px solid var(--faint);
+  border-top: 5px solid transparent; border-bottom: 5px solid transparent;
+  transition: transform .15s ease;
+}
+details[open] > summary .chev { transform: rotate(90deg); }
+summary .s-title { font-size: 14px; font-weight: 600; }
+summary .key { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 11.5px; color: var(--faint); }
+summary .s-note {
+  flex: 1 1 auto; min-width: 0; text-align: right;
+  font-size: 12px; color: var(--faint);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.fields { display: flex; flex-direction: column; padding: 2px 15px 8px; }
 .field {
-  display: grid; grid-template-columns: minmax(0, 1fr) minmax(170px, 280px);
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, 340px);
   gap: 6px 18px; align-items: center;
-  padding: 9px 0; border-top: 1px solid rgba(37, 43, 56, .7);
+  padding: 10px 6px; border-top: 1px solid rgba(35, 42, 58, .9);
+  border-radius: 8px;
 }
+.field:hover { background: rgba(122, 167, 255, .04); }
 .field:first-child { border-top: 0; }
 .meta { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
 .meta label { font-size: 13px; }
@@ -1426,14 +1519,31 @@ input[type="checkbox"] { width: 16px; height: 16px; accent-color: var(--pink); c
 .status.err { color: var(--err); }
 .status.busy { color: var(--muted); }
 
-ul.links { list-style: none; display: flex; flex-direction: column; gap: 8px; margin: 0 0 12px; padding: 0; }
-ul.links li { display: flex; flex-direction: column; }
+ul.links {
+  display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 10px; list-style: none; margin: 0 0 12px; padding: 0;
+}
+ul.links li {
+  display: flex; flex-direction: column; gap: 2px;
+  padding: 9px 12px; border: 1px solid var(--line); border-radius: 9px;
+  background: rgba(13, 16, 24, .55);
+}
 ul.links a { font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 12.5px; }
 ul.links span { font-size: 11.5px; color: var(--faint); }
 
-@media (max-width: 1000px) {
-  main.wrap { grid-template-columns: minmax(0, 1fr); }
+.foot { border-top: 1px solid var(--line); background: rgba(11, 13, 18, .6); }
+.foot-inner {
+  display: flex; align-items: flex-end; justify-content: space-between;
+  gap: 14px 26px; flex-wrap: wrap; padding: 22px 26px 30px;
+}
+.foot-project .hint { margin-top: 6px; }
+.credit { max-width: 56ch; }
+.credit strong { color: var(--pink); font-weight: 650; }
+
+@media (max-width: 720px) {
   .field { grid-template-columns: minmax(0, 1fr); }
+  summary .s-note { display: none; }
+  .top-actions { margin-left: 0; width: 100%; }
 }
 "#;
 
@@ -1594,6 +1704,70 @@ const LANDING_SCRIPT: &str = r#"(function () {
       done();
     }
   });
+
+  // Section collapse memory: an operator who hides [logging] keeps it hidden
+  // across reloads, including the reload a restart triggers.
+  Array.prototype.forEach.call(document.querySelectorAll('details.section'), function (section) {
+    var key = 'rtosu.section.' + section.id;
+    var saved = null;
+    try { saved = window.localStorage.getItem(key); } catch (error) {}
+    if (saved === '1' || saved === '0') section.open = saved === '1';
+    section.addEventListener('toggle', function () {
+      try { window.localStorage.setItem(key, section.open ? '1' : '0'); } catch (error) {}
+    });
+  });
+
+  // Hot restart. The button is rendered only when the endpoint would honour
+  // this browser: a CLI `serve` process with a supervisor, viewed from the
+  // machine itself. After the request lands, poll until the replacement
+  // process answers, then hand the browser over to it.
+  var restart = document.getElementById('restart');
+  if (restart) {
+    restart.addEventListener('click', function () {
+      if (!window.confirm('Restart the server now? Live overlay sockets drop for a moment while a new process takes over this port.')) return;
+      restart.disabled = true;
+      setStatus('Restart requested...', 'busy');
+      fetch('/api/restart', { method: 'POST' }).then(function (response) {
+        return response.text().then(function (text) {
+          var body = null;
+          try { body = JSON.parse(text); } catch (error) { body = null; }
+          return { status: response.status, body: body };
+        });
+      }).then(function (result) {
+        if (result.status === 200 && result.body && result.body.ok) {
+          restart.textContent = 'Restarting...';
+          setStatus('Restarting. This page reloads when the new process is up.', 'ok');
+          if (banner) {
+            banner.textContent = 'Restarting the server: a new process is taking over this port. This page reloads as soon as it answers.';
+            banner.className = 'banner warn';
+            banner.hidden = false;
+          }
+          var wait = function (attempt) {
+            setTimeout(function () {
+              fetch('/', { method: 'GET', cache: 'no-store' }).then(function (probe) {
+                if (probe.ok) { location.replace('/'); }
+                else if (attempt < 20) { wait(attempt + 1); }
+              }).catch(function () {
+                if (attempt < 20) {
+                  wait(attempt + 1);
+                } else {
+                  setStatus('The new process is not answering yet. Reload this page manually in a moment.', 'err');
+                  restart.disabled = false;
+                }
+              });
+            }, 1000);
+          };
+          wait(0);
+        } else {
+          restart.disabled = false;
+          setStatus((result.body && result.body.error) || ('Restart failed: HTTP ' + result.status), 'err');
+        }
+      }).catch(function (error) {
+        restart.disabled = false;
+        setStatus('Restart failed: ' + error, 'err');
+      });
+    });
+  }
 
   if (meta.writable) {
     setStatus('Ready. ' + controls.length + ' settings loaded.', '');
@@ -2069,6 +2243,7 @@ mod tests {
             config_path: Some(store.path()),
             settings: Some(settings_response(&store, true)),
             overlays: Some((&overlays, &root)),
+            can_restart: true,
         });
 
         // The header, the save bar and the endpoints.
@@ -2079,6 +2254,22 @@ mod tests {
         for link in ["/json/v2", "/json/sc", "/overlays", "/health"] {
             assert!(html.contains(link), "{link} must be linked");
         }
+
+        // The restart button is offered where the endpoint would honour it.
+        assert!(
+            html.contains("id=\"restart\""),
+            "a local viewer gets Restart"
+        );
+        assert!(meta_restart_available(&html));
+
+        // The header links the repository and the footer credits tosu, whose
+        // API and overlay format this server reproduces.
+        assert!(html.contains("https://github.com/Raregendary/rtosu-dataprovider"));
+        assert!(html.contains("https://tosu.app/"));
+        assert!(
+            html.contains("<footer"),
+            "the footer carrying those links must be there"
+        );
 
         // A folder named like HTML cannot inject markup, and its URL is the
         // percent-encoded form the overlay routes expect.
@@ -2101,13 +2292,19 @@ mod tests {
             "the form has one control per field and no strays"
         );
 
-        // One fieldset per config section, opened and closed.
-        assert_eq!(html.matches("<fieldset").count(), 5, "five sections");
+        // One collapsible `details` section per config section, opened and
+        // closed, each with a `summary` row so it can be collapsed by click.
         assert_eq!(
-            html.matches("<fieldset").count(),
-            html.matches("</fieldset>").count(),
-            "every fieldset is closed"
+            html.matches("<details class=\"section\"").count(),
+            5,
+            "five sections"
         );
+        assert_eq!(
+            html.matches("<details class=\"section\"").count(),
+            html.matches("</details>").count(),
+            "every section is closed"
+        );
+        assert_eq!(html.matches("<summary>").count(), 5, "each one collapses");
         for section in ["server", "poll", "features", "scoring", "logging"] {
             assert!(
                 html.contains(&format!("id=\"sec-{section}\"")),
@@ -2145,6 +2342,7 @@ mod tests {
             config_path: None,
             settings: None,
             overlays: None,
+            can_restart: false,
         });
         assert!(bare.contains("Settings are unavailable"));
         assert!(
@@ -2155,6 +2353,11 @@ mod tests {
             bare.contains("/overlays"),
             "the endpoint list is still there"
         );
+        assert!(
+            !bare.contains("id=\"restart\""),
+            "no supervisor, no restart button -- a dead button is worse than none"
+        );
+        assert!(!meta_restart_available(&bare));
 
         // An empty overlay directory is the "no overlays yet" hint, not a panic
         // and not a blank section.
@@ -2164,12 +2367,22 @@ mod tests {
             config_path: Some(store.path()),
             settings: Some(settings_response(&store, true)),
             overlays: Some((&[], &root)),
+            can_restart: true,
         });
         assert!(empty.contains("No overlays found in"));
         assert!(
             empty.contains("127.0.0.1:24050"),
             "a wildcard bind is displayed as the address a viewer can open"
         );
+    }
+
+    /// Reads `restart_available` back out of the page's own metadata blob.
+    fn meta_restart_available(html: &str) -> bool {
+        html.split("<script id=\"rtosu-data\" type=\"application/json\">")
+            .nth(1)
+            .and_then(|rest| rest.split("</script>").next())
+            .and_then(|blob| serde_json::from_str::<serde_json::Value>(blob).ok())
+            .is_some_and(|meta| meta["restart_available"] == serde_json::json!(true))
     }
 
     /// `GET /api/settings` round-trips: the `config` it carries deserialises

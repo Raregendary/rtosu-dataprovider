@@ -626,6 +626,11 @@ async fn run_serve_loop(
     )?);
     let mut live_rx = settings.subscribe();
 
+    // The hot-restart channel. The settings page raises the sender through
+    // `POST /api/restart`; this loop owns the receiver, because only it knows
+    // the original command line and can start the replacement process.
+    let (restart_signal, mut restart_rx) = rtosu_dataprovider::server::RestartSignal::channel();
+
     let listener = if enable_http || enable_ws {
         match rtosu_dataprovider::server::bind_listener(host, port).await {
             Ok(listener) => Some(listener),
@@ -666,10 +671,15 @@ async fn run_serve_loop(
         None
     };
 
+    // Kept so a restart can cancel serving and await the cancellation: that
+    // is what guarantees the listener socket is closed before the replacement
+    // process binds the same port.
+    let mut server_task: Option<tokio::task::JoinHandle<()>> = None;
     if let Some(listener) = listener {
         let server_overlays_dir = overlays_dir.clone();
         let server_settings = settings.clone();
-        tokio::spawn(async move {
+        let server_restart = restart_signal.clone();
+        server_task = Some(tokio::spawn(async move {
             if let Err(e) = rtosu_dataprovider::server::serve_with_listener(
                 listener,
                 enable_http,
@@ -679,12 +689,13 @@ async fn run_serve_loop(
                 rx,
                 rtosu_dataprovider::server::JsonPayload::from_config(&config.server.json_payload),
                 Some(server_settings),
+                Some(server_restart),
             )
             .await
             {
                 tracing::error!("tosu Server error: {e:#}");
             }
-        });
+        }));
     } else {
         tracing::info!(
             "Server feature toggles: HTTP and WebSocket are both disabled. Zero-port bypass active; skipping server spawn."
@@ -839,12 +850,22 @@ async fn run_serve_loop(
     }
 
     let mut last_published: Option<rtosu_dataprovider::server::PublishedPacket> = None;
+    let mut restart_requested = false;
 
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("Received shutdown signal (Ctrl+C). Terminating cleanly...");
                 println!("\nShutdown signal received. Exiting rtosu-dataprovider... Goodbye!");
+                break;
+            }
+            // A restart requested from the settings page. The sender also
+            // lives here, so this arm can only fire on a real request, never
+            // on a dropped sender.
+            _ = restart_rx.changed() => {
+                tracing::info!("Restart requested from the settings page.");
+                println!("\nRestart requested from the settings page. Starting a fresh process...");
+                restart_requested = true;
                 break;
             }
             _ = tokio::time::sleep(interval) => {
@@ -891,7 +912,50 @@ async fn run_serve_loop(
         }
     }
 
+    if restart_requested {
+        // Cancel serving and await the cancellation: dropping the task drops
+        // the listener inside `serve_with_listener`, which is what guarantees
+        // the port is free by the time the replacement process binds it.
+        if let Some(task) = server_task.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        restart_this_process();
+    }
+
     Ok(())
+}
+
+/// Start a replacement copy of this executable with the same command line.
+///
+/// The parent exits right after; the child keeps the console because
+/// `spawn` inherits stdio, so the operator's window survives the restart
+/// rather than closing with the old process. If the spawn itself fails there
+/// is no fallback beyond telling the operator to start it by hand.
+fn restart_this_process() {
+    let exe = match std::env::current_exe() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("Hot restart failed: could not locate this executable ({err}).");
+            eprintln!("Start rtosu-dataprovider again to apply the restart-required settings.");
+            return;
+        }
+    };
+    match std::process::Command::new(&exe)
+        .args(std::env::args_os().skip(1))
+        .spawn()
+    {
+        Ok(child) => {
+            println!(
+                "Restarted as process {} with the same arguments; this process is now exiting.",
+                child.id()
+            );
+        }
+        Err(err) => {
+            eprintln!("Hot restart failed to start {}: {err}", exe.display());
+            eprintln!("Start rtosu-dataprovider again to apply the restart-required settings.");
+        }
+    }
 }
 
 fn http_get_localhost(port: u16, path: &str) -> Result<String> {

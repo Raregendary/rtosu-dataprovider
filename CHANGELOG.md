@@ -33,11 +33,23 @@ The 1.0.8 line. Design and implementation detail live in `1.0.8-updateplan.md`.
   twice. An unknown acronym is rejected by `config validate` instead of being ignored.
   Accuracy, rank, pp and the leaderboard are never weighted.
 * **Settings landing page** at `http://127.0.0.1:24050/`: view and edit the configuration
-  from a browser, with the same overlay list the `/overlays` dashboard shows. Backed by
+  from a browser. Every `config.toml` setting renders as a form control inside a
+  collapsible section (open/closed states are remembered between loads), above the
+  overlay cards — shown full width, the same cards the `/overlays` dashboard renders —
+  an index of every endpoint, and a footer linking the repository and crediting the
+  original [tosu](https://tosu.app/) project whose API this server reproduces. Backed by
   `GET /api/settings` and `POST /api/settings` (a flat patch of dot-path keys, validated by
   the same code that validates the config file at startup). Edits are written back to
   `config.toml` with every comment preserved, and the ones that can take effect without a
-  restart (`[features]`, `[scoring]`, `poll.poll_rate_hz`) are applied live.
+  restart (`[features]`, `[scoring]`, `poll.poll_rate_hz`, `settings_write_local_only`)
+  are applied live.
+* **Hot restart** (`POST /api/restart`, and a **↻ Restart** button in the page header):
+  the running process stops listening, starts a fresh copy of itself from the same command
+  line, and exits — so settings that are only read at startup take effect without touching
+  a terminal, and the page reloads itself once the new process answers. Guarded more
+  strictly than settings writes and not configurable: loopback peer with a loopback (or
+  absent) `Origin` only, and only where a process supervisor is attached — a library
+  consumer that never wired one gets `409` instead of a silently ignored request.
 * `server.settings_write_local_only` (default `true`): when the server is bound to `0.0.0.0`,
   only loopback clients may change settings. Everyone on the LAN can still view the page and
   the settings. This is a convenience guard, not authentication.
@@ -61,8 +73,10 @@ The 1.0.8 line. Design and implementation detail live in `1.0.8-updateplan.md`.
   `scoring::ModMultipliers::new(&table)?` to weight; `OsuReaderBuilder`'s
   `mod_multipliers(...)` is the same setting for the builder path.
 * `server::start_server` and `server::serve_with_listener` take the settings
-  store as a final `Option<Arc<settings::SettingsStore>>` argument, and the
-  listener is now served with connect info
+  store as an `Option<Arc<settings::SettingsStore>>` argument followed by an
+  `Option<server::RestartSignal>` (from `RestartSignal::channel()`, wired by the
+  CLI so `POST /api/restart` has a supervisor to raise; `None` answers `409`),
+  and the listener is now served with connect info
   (`into_make_service_with_connect_info`) so the settings write guard can tell a
   local request from a remote one. A library that builds the router itself with
   `create_router_with` should serve it the same way; without connect info a write

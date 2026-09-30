@@ -10,7 +10,7 @@ use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, RawQuery, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Json, Redirect, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use serde::Serialize;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -112,6 +112,34 @@ pub struct AppState {
     /// The address the listener is bound to, for the landing page header.
     pub bound_host: String,
     pub bound_port: u16,
+    /// Raised by `POST /api/restart`. `None` answers that route with `409`:
+    /// only the CLI `serve` path wires a receiver that can re-exec, so a
+    /// library embedder that never wired one must not see a request that
+    /// silently does nothing.
+    pub restart: Option<RestartSignal>,
+}
+
+/// A one-shot request to restart the process, wired by the CLI `serve` path.
+///
+/// The endpoint never restarts anything itself: it raises this flag, the
+/// graceful shutdown closes the listener, and the CLI loop -- the only code
+/// that owns the original command line -- spawns the replacement process.
+/// That keeps "restart" out of the server task, which cannot re-exec itself
+/// without leaving the port bound by the dying process behind.
+#[derive(Clone, Debug)]
+pub struct RestartSignal(watch::Sender<bool>);
+
+impl RestartSignal {
+    /// The signal to hand the server, and the receiver the CLI loop waits on.
+    pub fn channel() -> (Self, watch::Receiver<bool>) {
+        let (tx, rx) = watch::channel(false);
+        (Self(tx), rx)
+    }
+
+    /// Raise the restart request. Idempotent.
+    pub fn request(&self) {
+        let _ = self.0.send(true);
+    }
 }
 
 impl AppState {
@@ -122,6 +150,7 @@ impl AppState {
             settings: None,
             bound_host: String::new(),
             bound_port: 0,
+            restart: None,
         }
     }
 
@@ -136,6 +165,7 @@ impl AppState {
             settings: None,
             bound_host: String::new(),
             bound_port: 0,
+            restart: None,
         }
     }
 
@@ -150,6 +180,12 @@ impl AppState {
         self.settings = Some(settings);
         self.bound_host = bound_host.into();
         self.bound_port = bound_port;
+        self
+    }
+
+    /// Wire the restart request so `POST /api/restart` can be honoured.
+    pub fn with_restart(mut self, restart: RestartSignal) -> Self {
+        self.restart = Some(restart);
         self
     }
 }
@@ -237,6 +273,9 @@ pub fn create_router_with(
                     // before it is parsed.
                     .layer(DefaultBodyLimit::max(settings::MAX_PATCH_BYTES)),
             )
+            // Hot restart for restart-required settings, CLI `serve` only. No
+            // body at all; the guard is in the handler.
+            .route("/api/restart", post(handle_restart))
             // tosu file endpoints that overlays use to display the current
             // beatmap background, so drop-in overlays render unchanged.
             .route("/files/beatmap/background", get(handle_beatmap_background))
@@ -673,6 +712,9 @@ async fn handle_landing(State(state): State<AppState>, peer: PeerAddress) -> Res
         config_path: state.settings.as_ref().map(|store| store.path()),
         settings,
         overlays,
+        // Same rule as the endpoint itself: the button only shows where it
+        // would actually work.
+        can_restart: state.restart.is_some() && state.settings.is_some() && peer_is_loopback(peer),
     });
     text_response(html, "text/html; charset=utf-8")
 }
@@ -785,6 +827,72 @@ async fn handle_settings_post(
         "restart_required": outcome.restart_required,
         "config": outcome.config,
     }))
+}
+
+/// `POST /api/restart`: ask the CLI loop to replace this process with a fresh
+/// one started from the same command line.
+///
+/// The guard is **stricter than the settings write guard, and deliberately
+/// not configurable**: a restart is at least as dangerous as a config write --
+/// it kills every live overlay socket the moment it lands -- so it always
+/// requires a loopback peer and a loopback `Origin`, even when
+/// `settings_write_local_only` is off. With no receiver wired (`None`) the
+/// route answers `409`: a request nobody will ever honour should say so.
+///
+/// The signal fires after a short delay so this response reaches the browser
+/// before the listener starts closing.
+async fn handle_restart(
+    State(state): State<AppState>,
+    peer: PeerAddress,
+    headers: HeaderMap,
+) -> Response {
+    if state.settings.is_none() {
+        return json_error(
+            StatusCode::NOT_FOUND,
+            "settings are unavailable in this mode",
+        );
+    }
+    let Some(restart) = state.restart.clone() else {
+        return json_error(
+            StatusCode::CONFLICT,
+            "no process supervisor is attached; this instance cannot restart itself",
+        );
+    };
+    if !peer_is_loopback(peer) {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "restarts are restricted to the machine running the server",
+        );
+    }
+    if let Some(origin) = headers
+        .get(header::ORIGIN)
+        .and_then(|value| value.to_str().ok())
+        && !settings::origin_is_loopback(origin)
+    {
+        return json_error(
+            StatusCode::FORBIDDEN,
+            "restarts are restricted to the machine running the server",
+        );
+    }
+
+    tracing::info!(
+        "restart requested from {}; a new process will take over on this port",
+        match peer.0 {
+            Some(addr) => addr.to_string(),
+            None => "an unknown peer".to_string(),
+        }
+    );
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        restart.request();
+    });
+
+    Json(serde_json::json!({
+        "ok": true,
+        "restarting": true,
+        "note": "a new process is starting on this port; reload this page in a few seconds",
+    }))
+    .into_response()
 }
 
 /// Read a single value out of a raw query string.
@@ -1728,6 +1836,7 @@ fn v2_frame(packet_rx: &mut watch::Receiver<PublishedPacket>) -> Option<Message>
 /// returns `Ok(())` without binding any TCP port (zero-port bypass).
 /// `overlays_dir` enables user-supplied browser overlays when set, and
 /// `settings` enables the landing page's settings form and its API.
+/// `restart` wires `POST /api/restart`; with `None` the route answers `409`.
 /// Also configures graceful shutdown listening for termination signals.
 #[allow(clippy::too_many_arguments)]
 pub async fn start_server(
@@ -1740,6 +1849,7 @@ pub async fn start_server(
     packet_rx: watch::Receiver<PublishedPacket>,
     json_payload: JsonPayload,
     settings: Option<Arc<SettingsStore>>,
+    restart: Option<RestartSignal>,
 ) -> Result<()> {
     if !enable_http && !enable_ws {
         tracing::info!(
@@ -1758,6 +1868,7 @@ pub async fn start_server(
         packet_rx,
         json_payload,
         settings,
+        restart,
     )
     .await
 }
@@ -1788,6 +1899,7 @@ pub async fn serve_with_listener(
     packet_rx: watch::Receiver<PublishedPacket>,
     json_payload: JsonPayload,
     settings: Option<Arc<SettingsStore>>,
+    restart: Option<RestartSignal>,
 ) -> Result<()> {
     let bound = listener.local_addr().ok();
     let mut state = match overlays_dir {
@@ -1803,6 +1915,10 @@ pub async fn serve_with_listener(
             bound.map(|addr| addr.port()).unwrap_or(0),
         );
     }
+    let shutdown_restart = restart.clone();
+    if let Some(signal) = restart {
+        state = state.with_restart(signal);
+    }
     let app = create_router_with(state, enable_http, enable_ws, cors_allow_all, json_payload);
 
     if let Some(addr) = bound {
@@ -1813,9 +1929,31 @@ pub async fn serve_with_listener(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(async {
-        let _ = tokio::signal::ctrl_c().await;
-        tracing::info!("Server received shutdown signal, closing active listeners");
+    .with_graceful_shutdown(async move {
+        // Ctrl+C and a page-requested restart end the listener the same way;
+        // only the log line differs, because a restart continues in a new
+        // process rather than ending this one.
+        let mut restart_rx = shutdown_restart.map(|signal| signal.0.subscribe());
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("Server received shutdown signal, closing active listeners");
+            }
+            changed = async {
+                match restart_rx.as_mut() {
+                    Some(rx) => rx.changed().await,
+                    // No supervisor: this arm must simply never fire, and a
+                    // pending future of the arm's own result type does that.
+                    None => std::future::pending::<
+                        std::result::Result<(), tokio::sync::watch::error::RecvError>,
+                    >()
+                    .await,
+                }
+            } => {
+                if changed.is_ok() {
+                    tracing::info!("Restart requested from the settings page, closing listeners");
+                }
+            }
+        }
     })
     .await
     .context("running axum server")?;
@@ -2665,6 +2803,7 @@ mod tests {
             None,
             rx,
             JsonPayload::V1,
+            None,
             None,
         )
         .await;
@@ -3619,6 +3758,100 @@ mod tests {
         let (_tx, rx) = watch::channel(PublishedPacket::default_packet());
         let (status, _) = get_text(create_router(AppState::new(rx), false, false, true), "/").await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    /// `POST /api/restart`: the CLI-wired supervisor gets a signalled restart,
+    /// and every other situation is refused rather than quietly dropped.
+    #[tokio::test]
+    async fn restart_needs_a_supervisor_and_a_loopback_request() {
+        async fn post_restart(app: Router, origin: Option<&str>) -> (StatusCode, String) {
+            let mut request = Request::builder().method("POST").uri("/api/restart");
+            if let Some(origin) = origin {
+                request = request.header(header::ORIGIN, origin);
+            }
+            let response = app
+                .oneshot(request.body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (status, String::from_utf8_lossy(&bytes).into_owned())
+        }
+
+        // No supervisor wired: 409, because a request nobody honours must say so.
+        let store = settings_store("restart-none");
+        let (status, body) = post_restart(settings_app(store, loopback()), None).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert!(body.contains("supervisor"), "{body}");
+
+        // Supervisor wired, loopback peer: accepted, and the signal fires after
+        // the grace period that lets the response flush.
+        let store = settings_store("restart-ok");
+        let (signal, mut restart_rx) = RestartSignal::channel();
+        let (_tx, packet_rx) = watch::channel(PublishedPacket::default_packet());
+        let app = create_router(
+            AppState::new(packet_rx)
+                .with_settings(store.clone(), "127.0.0.1", 24050)
+                .with_restart(signal),
+            true,
+            false,
+            true,
+        )
+        .layer(MockConnectInfo(loopback()));
+        let (status, body) = post_restart(app, Some("http://127.0.0.1:24050")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("\"restarting\":true"), "{body}");
+        tokio::time::timeout(std::time::Duration::from_secs(3), restart_rx.changed())
+            .await
+            .expect("the restart signal fires")
+            .expect("the sender outlives the request");
+        assert!(*restart_rx.borrow_and_update());
+
+        // A LAN peer is refused even though the store itself would allow the
+        // read: restarting kills every live overlay socket, so the guard is
+        // unconditional.
+        let (status, body) = post_restart(
+            {
+                let (_tx, packet_rx) = watch::channel(PublishedPacket::default_packet());
+                create_router(
+                    AppState::new(packet_rx)
+                        .with_settings(store.clone(), "127.0.0.1", 24050)
+                        .with_restart(RestartSignal::channel().0),
+                    true,
+                    false,
+                    true,
+                )
+                .layer(MockConnectInfo(SocketAddr::from((
+                    [192, 168, 1, 10],
+                    51_234,
+                ))))
+            },
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+        // A foreign Origin from a loopback peer is refused too -- the same CSRF
+        // shape the settings write guard refuses.
+        let (status, body) = post_restart(
+            {
+                let (_tx, packet_rx) = watch::channel(PublishedPacket::default_packet());
+                create_router(
+                    AppState::new(packet_rx)
+                        .with_settings(store, "127.0.0.1", 24050)
+                        .with_restart(RestartSignal::channel().0),
+                    true,
+                    false,
+                    true,
+                )
+                .layer(MockConnectInfo(loopback()))
+            },
+            Some("http://evil.example"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
     }
 
     /// `GET /api/settings` carries the config, the field table, and whether this
