@@ -17,7 +17,7 @@ Two notes on how to read this file:
 ## [Unreleased]
 
 
-## [1.0.9] - 2026-10-01
+## [1.0.9] - 2026-10-02
 
 The 1.0.9 line.
 
