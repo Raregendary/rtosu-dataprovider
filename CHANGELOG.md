@@ -33,6 +33,12 @@ The 1.0.9 line.
   * Configurable per-socket buffer and backpressure tuning via `server.ws_write_buffer_size` (default: 64 KB), `server.ws_max_write_buffer_size` (default: 512 KB), and `server.ws_max_frame_size` (default: 16 MB) in `config.toml` and the settings landing page.
   * Opt-in RFC 7396 JSON merge patch WebSocket stream at `WS /websocket/v2/delta`: sends an initial full frame on connect/attach, followed only by compact diffs when state changes. Identical ticks emit 0 bytes, reducing bandwidth and Wi-Fi congestion by ~95–99% without requiring WebSocket deflate compression.
   * Transparent HTTP response compression (`gzip` and `deflate`) on large JSON REST endpoints (`/json/v2`, `/json/v2/precise`, `/json/v1`, `/json/sc`, and `/json`) via `tower-http`.
+* **In-page JSON API Inspector & Live Poller**:
+  * Interactive modal inspector on the landing page (`/`) allowing instant testing of JSON endpoints (`/json/v2`, `/json/v2/precise`, `/json`, `/json/sc`, `/health`, `/api/settings`, `/api/logs`, or custom paths) without navigating away.
+  * Live poller with configurable refresh interval (default: `0.2`s / 200 ms) with non-stacking timers and live pulsing status indicator.
+  * State-preserving syntax-highlighted tree view that remembers all user collapsed and expanded nodes across periodic polling cycles, with in-place live value updates and flash transitions for changed values (score, combo, time, etc.).
+  * Native browser search (`Ctrl+F`) compatibility via plain text DOM nodes, HTML5 standard `hidden="until-found"` with `beforematch` auto-expansion of collapsed matching sections, and a full-payload Raw JSON view mode.
+  * Quick toolbar controls: keyword filter input, Expand All, Collapse All, one-click Copy JSON to clipboard, and direct `↗ raw` links next to endpoint rows.
 * **Schema-level parity drift detection** (`6.3` in `validations/ClineIdeas.md`):
   * Recursive JSON schema comparison engine (`src/schema_parity.rs`) verifying keys, nesting, and type compatibility across all four payload shapes (`/json/v2`, `/json/v2/precise`, `/json/v1`, and `/json/sc`) against tosu on port 24050, explicitly ignoring `settings` under v2.
   * Live test suite integration (`tests/schema_parity.rs`) executing as part of `cargo test` when tosu and osu! are active, reporting 0 schema drifts across all shapes.

@@ -888,6 +888,7 @@ pub fn landing_html(view: &LandingView<'_>) -> String {
     html.push_str(&links_html());
     html.push_str(&logs_html(false));
     html.push_str("</main>\n");
+    html.push_str(&json_inspector_html());
     html.push_str(&footer_html());
     html.push_str("<script id=\"rtosu-data\" type=\"application/json\">");
     html.push_str(&page_meta_json(view));
@@ -910,6 +911,7 @@ pub fn logs_page_html(view: &LandingView<'_>) -> String {
     html.push_str("<main class=\"wrap logs-standalone-wrap\">\n");
     html.push_str(&logs_html(true));
     html.push_str("</main>\n");
+    html.push_str(&json_inspector_html());
     html.push_str(&footer_html());
     html.push_str("<script id=\"rtosu-data\" type=\"application/json\">");
     html.push_str(&page_meta_json(view));
@@ -1389,21 +1391,45 @@ fn logs_html(standalone: bool) -> String {
 /// Links to everything the server serves, so the page is a usable index rather
 /// than only a settings form.
 fn links_html() -> String {
-    let links = [
-        ("/json/v2", "full v2 payload"),
-        ("/json", "gosumemory-compatible payload"),
-        ("/json/sc", "StreamCompanion payload"),
-        (overlays::OVERLAYS_BASE, "overlay dashboard"),
-        ("/logs", "system logs & live tail"),
-        ("/health", "attachment status"),
+    let links: &[(&str, &str, bool)] = &[
+        ("/json/v2", "full v2 payload", true),
+        ("/json", "gosumemory-compatible payload", true),
+        ("/json/sc", "StreamCompanion payload", true),
+        (overlays::OVERLAYS_BASE, "overlay dashboard", false),
+        ("/logs", "system logs & live tail", false),
+        ("/health", "attachment status", true),
     ];
     let mut html = String::from(
         "<section class=\"panel\">\n<div class=\"panel-head\">\n<h2>Endpoints</h2>\n</div>\n<ul class=\"links\">\n",
     );
-    for (path, description) in links {
+    for (path, description, is_json) in links {
+        let inspect_btn = if *is_json {
+            format!(
+                r#" <button type="button" class="btn-inspect" data-endpoint="{path}" title="Inspect {path} in this page">⚡ Inspect</button>"#,
+                path = escape_html(path)
+            )
+        } else {
+            String::new()
+        };
+        let inspect_attr = if *is_json {
+            format!(r#" data-inspect="{path}""#, path = escape_html(path))
+        } else {
+            String::new()
+        };
+        let raw_link = if *is_json {
+            format!(
+                r#"<a href="{path}" target="_blank" class="raw-link" title="Open raw in new tab">↗ raw</a> "#,
+                path = escape_html(path)
+            )
+        } else {
+            String::new()
+        };
         html.push_str(&format!(
-            "<li><a href=\"{path}\">{path}</a><span>{description}</span></li>\n",
+            "<li><span class=\"link-title\"><a href=\"{path}\"{inspect_attr}>{path}</a>{inspect_btn}</span><span>{raw_link}{description}</span></li>\n",
             path = escape_html(path),
+            inspect_attr = inspect_attr,
+            inspect_btn = inspect_btn,
+            raw_link = raw_link,
             description = escape_html(description),
         ));
     }
@@ -1412,6 +1438,85 @@ fn links_html() -> String {
          <code>/tokens</code>, <code>/websocket/commands</code>.</p>\n</section>\n",
     );
     html
+}
+
+/// The in-page JSON API Inspector & Live Poller modal.
+fn json_inspector_html() -> String {
+    r#"<div id="json-inspector-modal" class="json-modal" style="display: none;" role="dialog" aria-modal="true" aria-labelledby="json-modal-title">
+<div class="json-modal-backdrop" id="json-modal-backdrop"></div>
+<div class="json-modal-dialog">
+  <div class="json-modal-header">
+    <div class="json-header-left">
+      <span class="json-modal-icon">⚡</span>
+      <h3 id="json-modal-title">JSON API Inspector</h3>
+      <div class="json-endpoint-picker">
+        <select id="json-endpoint-select" class="json-select" title="Select API Endpoint">
+          <option value="/json/v2">/json/v2 (Full v2 payload)</option>
+          <option value="/json/v2/precise">/json/v2/precise (Precise tourney stream)</option>
+          <option value="/json">/json (gosumemory payload)</option>
+          <option value="/json/sc">/json/sc (StreamCompanion payload)</option>
+          <option value="/health">/health (Attachment &amp; state)</option>
+          <option value="/api/settings">/api/settings (Config JSON)</option>
+          <option value="/api/logs">/api/logs (Log events JSON)</option>
+          <option value="custom">Custom Endpoint...</option>
+        </select>
+        <input type="text" id="json-endpoint-custom" class="json-custom-input" placeholder="/path" style="display: none;" spellcheck="false">
+      </div>
+    </div>
+    <div class="json-header-right">
+      <button type="button" id="json-close-btn" class="ghost small json-close-btn" title="Close inspector (Esc)">✕</button>
+    </div>
+  </div>
+
+  <div class="json-modal-toolbar">
+    <div class="json-toolbar-group json-poll-controls">
+      <button type="button" id="json-poll-toggle" class="btn-chip chip-poll" title="Toggle automatic periodic requests">
+        <span class="poll-indicator" id="json-poll-dot"></span>
+        <span id="json-poll-label">Live Poll: OFF</span>
+      </button>
+      <div class="json-interval-wrapper">
+        <label for="json-poll-rate" class="json-poll-label">Every</label>
+        <input type="number" id="json-poll-rate" class="json-num-input" value="0.2" min="0.05" max="60" step="0.05" title="Polling interval in seconds (0.2s = 200ms)">
+        <span class="json-unit">s</span>
+      </div>
+      <button type="button" id="json-fetch-btn" class="ghost small" title="Fetch fresh JSON now">↻ Fetch</button>
+    </div>
+
+    <div class="json-toolbar-group json-search-controls">
+      <input type="text" id="json-search-input" class="json-search" placeholder="Filter keys/values... (or use Ctrl+F)" spellcheck="false">
+      <span id="json-search-count" class="json-search-count"></span>
+    </div>
+
+    <div class="json-toolbar-group json-view-controls">
+      <div class="json-tab-group" id="json-view-mode">
+        <button type="button" class="btn-chip active" data-mode="tree">Tree</button>
+        <button type="button" class="btn-chip" data-mode="raw">Raw</button>
+      </div>
+      <button type="button" id="json-expand-all" class="ghost small" title="Expand all nodes">Expand All</button>
+      <button type="button" id="json-collapse-all" class="ghost small" title="Collapse all nodes">Collapse</button>
+      <button type="button" id="json-copy-btn" class="ghost small" title="Copy JSON payload to clipboard">Copy</button>
+    </div>
+  </div>
+
+  <div class="json-modal-body">
+    <div id="json-tree-container" class="json-tree-view" tabindex="0">
+      <div class="json-placeholder">Click an endpoint or Fetch to inspect JSON data.</div>
+    </div>
+    <pre id="json-raw-container" class="json-raw-view" style="display: none;" tabindex="0"><code id="json-raw-code"></code></pre>
+  </div>
+
+  <div class="json-modal-footer">
+    <div class="json-footer-left">
+      <span id="json-status-tag" class="badge">Idle</span>
+      <span id="json-meta-info" class="hint">No requests yet</span>
+    </div>
+    <div class="json-footer-right">
+      <span class="hint json-tip">Press <kbd>Ctrl+F</kbd> for browser search &bull; Nodes preserve expand/collapse on live polling</span>
+    </div>
+  </div>
+</div>
+</div>
+"#.to_string()
 }
 
 /// The footer: where the code lives, and credit where the API design came from.
@@ -1733,6 +1838,183 @@ ul.links span { font-size: 11.5px; color: var(--faint); }
   .field { grid-template-columns: minmax(0, 1fr); }
   summary .s-note { display: none; }
   .top-actions { margin-left: 0; width: 100%; }
+}
+
+/* ---- Endpoints & Inspect Buttons ---- */
+.link-title { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.btn-inspect {
+  background: rgba(122, 167, 255, 0.15); color: var(--blue);
+  border: 1px solid rgba(122, 167, 255, 0.35); border-radius: 4px;
+  padding: 1px 7px; font-size: 11px; font-weight: 600; cursor: pointer;
+  line-height: 1.4; transition: all 0.15s ease;
+}
+.btn-inspect:hover {
+  background: rgba(122, 167, 255, 0.3); border-color: var(--blue);
+  color: #fff;
+}
+.raw-link {
+  color: var(--faint); font-size: 11px; margin-right: 6px;
+  text-decoration: none;
+}
+.raw-link:hover { color: var(--blue); text-decoration: underline; }
+
+/* ---- JSON API Inspector Modal ---- */
+.json-modal {
+  position: fixed; inset: 0; z-index: 2000;
+  display: flex; align-items: center; justify-content: center;
+}
+.json-modal-backdrop {
+  position: absolute; inset: 0; background: rgba(8, 10, 15, 0.84);
+  backdrop-filter: blur(6px);
+}
+.json-modal-dialog {
+  position: relative; z-index: 1;
+  width: min(1200px, 95vw); height: min(880px, 88vh);
+  background: var(--panel); border: 1px solid var(--line-2);
+  border-radius: 8px; box-shadow: 0 20px 60px rgba(0,0,0,0.65);
+  display: flex; flex-direction: column; overflow: hidden;
+}
+.json-modal-header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 10px 16px; border-bottom: 1px solid var(--line);
+  background: var(--panel-2); gap: 12px;
+}
+.json-header-left {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap; flex: 1 1 auto;
+}
+.json-modal-icon { font-size: 18px; color: var(--warn); }
+.json-modal-header h3 {
+  margin: 0; font-size: 15px; font-weight: 700; color: var(--text);
+  white-space: nowrap;
+}
+.json-endpoint-picker { display: flex; align-items: center; gap: 6px; }
+.json-select {
+  background: #0f131c; color: var(--text); border: 1px solid var(--line-2);
+  border-radius: 4px; padding: 4px 8px; font-size: 12.5px;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+.json-custom-input {
+  background: #0f131c; color: var(--text); border: 1px solid var(--line-2);
+  border-radius: 4px; padding: 4px 8px; font-size: 12.5px; width: 140px;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+.json-close-btn { font-size: 16px; padding: 2px 8px; border-radius: 4px; }
+
+/* ---- JSON Toolbar ---- */
+.json-modal-toolbar {
+  display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+  justify-content: space-between; padding: 8px 16px;
+  border-bottom: 1px solid var(--line); background: rgba(0,0,0,0.22);
+}
+.json-toolbar-group { display: flex; align-items: center; gap: 6px; }
+.chip-poll {
+  display: inline-flex; align-items: center; gap: 6px; font-weight: 600;
+}
+.chip-poll.active {
+  background: rgba(98, 212, 146, 0.18); border-color: rgba(98, 212, 146, 0.5);
+  color: #62d492;
+}
+.poll-indicator {
+  display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+  background: var(--faint);
+}
+.chip-poll.active .poll-indicator {
+  background: #62d492;
+  box-shadow: 0 0 6px #62d492;
+  animation: pulse-dot 1.2s infinite;
+}
+@keyframes pulse-dot {
+  0% { transform: scale(0.95); opacity: 0.8; }
+  50% { transform: scale(1.25); opacity: 1; }
+  100% { transform: scale(0.95); opacity: 0.8; }
+}
+.json-interval-wrapper {
+  display: inline-flex; align-items: center; gap: 4px;
+  background: #0f131c; border: 1px solid var(--line-2); border-radius: 4px;
+  padding: 2px 6px; font-size: 12px; color: var(--muted);
+}
+.json-poll-label { font-size: 11px; }
+.json-num-input {
+  background: transparent; border: none; color: var(--text);
+  width: 44px; font-size: 12px; text-align: center;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+}
+.json-num-input:focus { outline: none; }
+.json-unit { font-size: 11px; color: var(--faint); }
+.json-search {
+  background: #0f131c; color: var(--text); border: 1px solid var(--line-2);
+  border-radius: 4px; padding: 4px 8px; font-size: 12px; width: 220px;
+}
+.json-search:focus { outline: 1px solid var(--blue); }
+.json-search-count { font-size: 11px; color: var(--warn); min-width: 40px; }
+.json-tab-group { display: flex; gap: 2px; }
+
+/* ---- JSON Modal Body ---- */
+.json-modal-body {
+  flex: 1 1 auto; overflow: hidden; position: relative; display: flex;
+}
+.json-tree-view {
+  flex: 1 1 auto; overflow-y: auto; overflow-x: auto; padding: 14px 18px;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 12.5px; line-height: 1.6; color: #d0d7de;
+}
+.json-raw-view {
+  flex: 1 1 auto; overflow: auto; padding: 14px 18px; margin: 0;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace;
+  font-size: 12px; line-height: 1.6; color: #d0d7de; background: #080a0f;
+}
+.json-placeholder {
+  color: var(--faint); font-style: italic; padding: 24px; text-align: center;
+}
+
+/* ---- Tree Node Hierarchy & Styling ---- */
+.json-node {
+  position: relative; padding-left: 18px; white-space: pre-wrap; word-break: break-all;
+}
+.json-caret {
+  position: absolute; left: 0; top: 1px; width: 14px; height: 16px;
+  cursor: pointer; user-select: none; display: inline-flex; align-items: center;
+  justify-content: center; font-size: 9px; color: var(--faint);
+  transition: transform 0.15s ease;
+}
+.json-caret:hover { color: var(--blue); }
+.json-caret.collapsed { transform: rotate(-90deg); }
+.json-key {
+  color: #79c0ff; font-weight: 600; cursor: pointer;
+}
+.json-key:hover { text-decoration: underline; }
+.json-val.json-string { color: #a5d6ff; }
+.json-val.json-number { color: #79c0ff; font-weight: 500; }
+.json-val.json-bool { color: #ff7b72; font-weight: 600; }
+.json-val.json-null { color: #8b949e; font-style: italic; }
+.json-bracket { color: #8b949e; }
+.json-comma { color: #8b949e; }
+.json-item-count {
+  color: var(--faint); font-size: 11px; margin-left: 6px; font-style: italic;
+  user-select: none;
+}
+.json-children.collapsed { display: none; }
+.json-children.collapsed[hidden="until-found"] { display: none; }
+.json-search-match {
+  background: rgba(255, 214, 102, 0.35); border-radius: 2px;
+  outline: 1px solid rgba(255, 214, 102, 0.6);
+}
+.json-val-flash {
+  background: rgba(98, 212, 146, 0.25); border-radius: 2px;
+  transition: background 0.4s ease;
+}
+
+/* ---- JSON Modal Footer ---- */
+.json-modal-footer {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 6px 16px; border-top: 1px solid var(--line);
+  background: var(--panel-2); font-size: 11.5px;
+}
+.json-footer-left { display: flex; align-items: center; gap: 8px; }
+.json-footer-right { display: flex; align-items: center; gap: 8px; }
+.json-tip kbd {
+  background: rgba(255,255,255,0.08); border: 1px solid var(--line-2);
+  border-radius: 3px; padding: 1px 4px; font-size: 10px; font-family: inherit;
 }
 "#;
 
@@ -2293,6 +2575,535 @@ const LANDING_SCRIPT: &str = r#"(function () {
 
     fetchLogFileList();
     connectLiveStream();
+  })();
+
+  // ---- JSON API Inspector & Live Poller Controller ----
+  (function () {
+    var modal = document.getElementById('json-inspector-modal');
+    if (!modal) return;
+
+    var backdrop = document.getElementById('json-modal-backdrop');
+    var closeBtn = document.getElementById('json-close-btn');
+    var endpointSelect = document.getElementById('json-endpoint-select');
+    var customInput = document.getElementById('json-endpoint-custom');
+    var pollToggle = document.getElementById('json-poll-toggle');
+    var pollLabel = document.getElementById('json-poll-label');
+    var pollRateInput = document.getElementById('json-poll-rate');
+    var fetchBtn = document.getElementById('json-fetch-btn');
+    var searchInput = document.getElementById('json-search-input');
+    var searchCount = document.getElementById('json-search-count');
+    var viewModeGroup = document.getElementById('json-view-mode');
+    var expandAllBtn = document.getElementById('json-expand-all');
+    var collapseAllBtn = document.getElementById('json-collapse-all');
+    var copyBtn = document.getElementById('json-copy-btn');
+    var treeContainer = document.getElementById('json-tree-container');
+    var rawContainer = document.getElementById('json-raw-container');
+    var rawCode = document.getElementById('json-raw-code');
+    var statusTag = document.getElementById('json-status-tag');
+    var metaInfo = document.getElementById('json-meta-info');
+
+    var isPolling = false;
+    var pollTimer = null;
+    var currentData = null;
+    var activeViewMode = 'tree';
+    var userNodeStates = {};
+    var globalExpandOverride = null;
+
+    function getActiveEndpoint() {
+      if (endpointSelect.value === 'custom') {
+        var v = customInput.value.trim();
+        return v.length > 0 ? (v.startsWith('/') ? v : '/' + v) : '/json/v2';
+      }
+      return endpointSelect.value;
+    }
+
+    function openInspector(endpoint) {
+      if (endpoint) {
+        var found = false;
+        for (var i = 0; i < endpointSelect.options.length; i++) {
+          if (endpointSelect.options[i].value === endpoint) {
+            endpointSelect.value = endpoint;
+            customInput.style.display = 'none';
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
+          endpointSelect.value = 'custom';
+          customInput.value = endpoint;
+          customInput.style.display = 'inline-block';
+        }
+      }
+      modal.style.display = 'flex';
+      fetchEndpoint(getActiveEndpoint(), true);
+    }
+
+    function closeInspector() {
+      modal.style.display = 'none';
+      stopPolling();
+    }
+
+    function startPolling() {
+      isPolling = true;
+      pollToggle.classList.add('active');
+      pollLabel.textContent = 'Live Poll: ON';
+      fetchEndpoint(getActiveEndpoint(), false);
+    }
+
+    function stopPolling() {
+      isPolling = false;
+      if (pollTimer) {
+        clearTimeout(pollTimer);
+        pollTimer = null;
+      }
+      pollToggle.classList.remove('active');
+      pollLabel.textContent = 'Live Poll: OFF';
+    }
+
+    function scheduleNextPoll() {
+      if (!isPolling) return;
+      if (pollTimer) clearTimeout(pollTimer);
+      var rateSec = parseFloat(pollRateInput.value) || 0.2;
+      if (rateSec < 0.05) rateSec = 0.05;
+      if (rateSec > 60) rateSec = 60;
+      var intervalMs = Math.round(rateSec * 1000);
+      pollTimer = setTimeout(function () {
+        if (!isPolling) return;
+        fetchEndpoint(getActiveEndpoint(), false);
+      }, intervalMs);
+    }
+
+    function formatBytes(bytes) {
+      if (bytes < 1024) return bytes + ' B';
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+      return (bytes / (1024 * 1024)).toFixed(2) + ' MB';
+    }
+
+    function fetchEndpoint(url, forceRebuild) {
+      var startTime = performance.now();
+      statusTag.textContent = 'Fetching...';
+      statusTag.className = 'badge';
+
+      fetch(url, { cache: 'no-store' })
+        .then(function (res) {
+          var latencyMs = Math.round(performance.now() - startTime);
+          var statusText = res.status + ' ' + (res.statusText || (res.ok ? 'OK' : 'Error'));
+          statusTag.textContent = statusText;
+          statusTag.className = 'badge ' + (res.ok ? 'live-badge' : 'err');
+
+          return res.text().then(function (text) {
+            var byteLength = new Blob([text]).size;
+            var timeStr = new Date().toLocaleTimeString();
+            metaInfo.textContent = latencyMs + ' ms \u2022 ' + formatBytes(byteLength) + ' \u2022 ' + timeStr;
+
+            var data;
+            try {
+              data = JSON.parse(text);
+            } catch (err) {
+              data = { _raw_response: text, _error: 'Invalid JSON: ' + err.message };
+            }
+
+            rawCode.textContent = JSON.stringify(data, null, 2);
+
+            if (forceRebuild || !currentData) {
+              currentData = data;
+              rebuildTree();
+            } else {
+              updateTreeOrRebuild(data);
+            }
+
+            if (searchInput.value.trim().length > 0) {
+              applySearchFilter(searchInput.value.trim());
+            }
+
+            if (isPolling) {
+              scheduleNextPoll();
+            }
+          });
+        })
+        .catch(function (err) {
+          statusTag.textContent = 'Fetch Failed';
+          statusTag.className = 'badge err';
+          metaInfo.textContent = err.message;
+          if (isPolling) {
+            scheduleNextPoll();
+          }
+        });
+    }
+
+    function formatPrimitive(val) {
+      if (val === null) return 'null';
+      if (typeof val === 'string') return JSON.stringify(val);
+      if (typeof val === 'number') return String(val);
+      if (typeof val === 'boolean') return val ? 'true' : 'false';
+      return String(val);
+    }
+
+    function getValueClass(val) {
+      if (val === null) return 'json-null';
+      if (typeof val === 'string') return 'json-string';
+      if (typeof val === 'number') return 'json-number';
+      if (typeof val === 'boolean') return 'json-bool';
+      return 'json-other';
+    }
+
+    function getValueByPath(obj, path) {
+      if (!obj || !path) return obj;
+      var parts = path.split('.');
+      var cur = obj;
+      for (var i = 0; i < parts.length; i++) {
+        var p = parts[i];
+        var arrMatch = p.match(/^(\w+)\[(\d+)\]$/);
+        if (arrMatch) {
+          var key = arrMatch[1];
+          var idx = parseInt(arrMatch[2], 10);
+          if (!cur || cur[key] === undefined || cur[key][idx] === undefined) return undefined;
+          cur = cur[key][idx];
+        } else {
+          var bareArr = p.match(/^\[(\d+)\]$/);
+          if (bareArr) {
+            var bIdx = parseInt(bareArr[1], 10);
+            if (!cur || cur[bIdx] === undefined) return undefined;
+            cur = cur[bIdx];
+          } else {
+            if (!cur || cur[p] === undefined) return undefined;
+            cur = cur[p];
+          }
+        }
+      }
+      return cur;
+    }
+
+    function canReconcileInPlace(oldData, newData) {
+      if (typeof oldData !== typeof newData || oldData === null || newData === null) return false;
+      if (Array.isArray(oldData) !== Array.isArray(newData)) return false;
+      if (Array.isArray(oldData)) {
+        return oldData.length === newData.length;
+      }
+      if (typeof oldData === 'object') {
+        var oldKeys = Object.keys(oldData);
+        var newKeys = Object.keys(newData);
+        if (oldKeys.length !== newKeys.length) return false;
+        for (var i = 0; i < oldKeys.length; i++) {
+          if (oldKeys[i] !== newKeys[i]) return false;
+        }
+        return true;
+      }
+      return true;
+    }
+
+    function updateTreeOrRebuild(newData) {
+      if (!canReconcileInPlace(currentData, newData) || !treeContainer.firstElementChild) {
+        currentData = newData;
+        var savedScroll = treeContainer.scrollTop;
+        rebuildTree();
+        treeContainer.scrollTop = savedScroll;
+        return;
+      }
+      currentData = newData;
+      var valSpans = treeContainer.querySelectorAll('[data-val-path]');
+      for (var s = 0; s < valSpans.length; s++) {
+        var span = valSpans[s];
+        var p = span.getAttribute('data-val-path');
+        var val = getValueByPath(newData, p);
+        if (val !== undefined) {
+          var text = formatPrimitive(val);
+          if (span.textContent !== text) {
+            span.textContent = text;
+            span.className = 'json-val ' + getValueClass(val) + ' json-val-flash';
+            (function (el) {
+              setTimeout(function () { el.classList.remove('json-val-flash'); }, 400);
+            })(span);
+          }
+        }
+      }
+    }
+
+    function buildTreeNode(key, value, path, depth) {
+      var isArray = Array.isArray(value);
+      var isObject = value !== null && typeof value === 'object';
+      var nodeEl = document.createElement('div');
+      nodeEl.className = 'json-node' + (isObject ? ' json-node-complex' : '');
+      nodeEl.setAttribute('data-path', path);
+
+      if (isObject) {
+        var keys = Object.keys(value);
+        var caret = document.createElement('span');
+        caret.className = 'json-caret';
+        caret.textContent = '\u25bc';
+        nodeEl.appendChild(caret);
+
+        var keySpan = null;
+        if (key !== null) {
+          keySpan = document.createElement('span');
+          keySpan.className = 'json-key';
+          keySpan.textContent = JSON.stringify(key);
+          nodeEl.appendChild(keySpan);
+          nodeEl.appendChild(document.createTextNode(': '));
+        }
+
+        var openBracket = document.createElement('span');
+        openBracket.className = 'json-bracket';
+        openBracket.textContent = isArray ? '[' : '{';
+        nodeEl.appendChild(openBracket);
+
+        var countBadge = document.createElement('span');
+        countBadge.className = 'json-item-count';
+        countBadge.textContent = isArray ? (' ' + keys.length + ' items') : (' ' + keys.length + ' keys');
+        nodeEl.appendChild(countBadge);
+
+        var childrenEl = document.createElement('div');
+        childrenEl.className = 'json-children';
+        childrenEl.setAttribute('data-children-path', path);
+
+        var collapsed = false;
+        if (userNodeStates[path] !== undefined) {
+          collapsed = userNodeStates[path];
+        } else if (globalExpandOverride !== null) {
+          collapsed = !globalExpandOverride;
+        } else {
+          collapsed = depth >= 1;
+        }
+
+        if (collapsed) {
+          caret.classList.add('collapsed');
+          childrenEl.classList.add('collapsed');
+          childrenEl.setAttribute('hidden', 'until-found');
+        }
+
+        childrenEl.addEventListener('beforematch', function () {
+          userNodeStates[path] = false;
+          caret.classList.remove('collapsed');
+          childrenEl.classList.remove('collapsed');
+          childrenEl.removeAttribute('hidden');
+        });
+
+        var toggle = function (e) {
+          if (e) e.stopPropagation();
+          var isNowCollapsed = !childrenEl.classList.contains('collapsed');
+          userNodeStates[path] = isNowCollapsed;
+          if (isNowCollapsed) {
+            caret.classList.add('collapsed');
+            childrenEl.classList.add('collapsed');
+            childrenEl.setAttribute('hidden', 'until-found');
+          } else {
+            caret.classList.remove('collapsed');
+            childrenEl.classList.remove('collapsed');
+            childrenEl.removeAttribute('hidden');
+          }
+        };
+
+        caret.addEventListener('click', toggle);
+        if (keySpan) {
+          keySpan.addEventListener('click', toggle);
+        }
+
+        for (var i = 0; i < keys.length; i++) {
+          var k = keys[i];
+          var childPath = path ? (isArray ? (path + '[' + k + ']') : (path + '.' + k)) : (isArray ? ('[' + k + ']') : k);
+          var childNode = buildTreeNode(isArray ? null : k, value[k], childPath, depth + 1);
+          childrenEl.appendChild(childNode);
+        }
+        nodeEl.appendChild(childrenEl);
+
+        var closeBracket = document.createElement('span');
+        closeBracket.className = 'json-bracket';
+        closeBracket.textContent = isArray ? ']' : '}';
+        nodeEl.appendChild(closeBracket);
+      } else {
+        if (key !== null) {
+          var kSpan = document.createElement('span');
+          kSpan.className = 'json-key';
+          kSpan.textContent = JSON.stringify(key);
+          nodeEl.appendChild(kSpan);
+          nodeEl.appendChild(document.createTextNode(': '));
+        }
+        var valSpan = document.createElement('span');
+        valSpan.className = 'json-val ' + getValueClass(value);
+        valSpan.setAttribute('data-val-path', path);
+        valSpan.textContent = formatPrimitive(value);
+        nodeEl.appendChild(valSpan);
+      }
+
+      return nodeEl;
+    }
+
+    function rebuildTree() {
+      treeContainer.innerHTML = '';
+      if (currentData === null || currentData === undefined) {
+        treeContainer.innerHTML = '<div class="json-placeholder">No data to display.</div>';
+        return;
+      }
+      var rootNode = buildTreeNode(null, currentData, '', 0);
+      treeContainer.appendChild(rootNode);
+    }
+
+    function applySearchFilter(query) {
+      var allMatches = treeContainer.querySelectorAll('.json-search-match');
+      for (var m = 0; m < allMatches.length; m++) {
+        allMatches[m].classList.remove('json-search-match');
+      }
+
+      if (!query) {
+        searchCount.textContent = '';
+        return;
+      }
+
+      var q = query.toLowerCase();
+      var nodes = treeContainer.querySelectorAll('.json-node');
+      var matchCount = 0;
+
+      for (var n = 0; n < nodes.length; n++) {
+        var node = nodes[n];
+        var keyEl = node.querySelector(':scope > .json-key');
+        var valEl = node.querySelector(':scope > .json-val');
+        var matched = false;
+
+        if (keyEl && keyEl.textContent.toLowerCase().indexOf(q) !== -1) {
+          keyEl.classList.add('json-search-match');
+          matched = true;
+        }
+        if (valEl && valEl.textContent.toLowerCase().indexOf(q) !== -1) {
+          valEl.classList.add('json-search-match');
+          matched = true;
+        }
+
+        if (matched) {
+          matchCount++;
+          var cur = node.parentElement;
+          while (cur && cur !== treeContainer) {
+            if (cur.classList.contains('json-children') && cur.classList.contains('collapsed')) {
+              cur.classList.remove('collapsed');
+              cur.removeAttribute('hidden');
+              var parentCaret = cur.parentElement.querySelector(':scope > .json-caret');
+              if (parentCaret) parentCaret.classList.remove('collapsed');
+            }
+            cur = cur.parentElement;
+          }
+        }
+      }
+
+      searchCount.textContent = matchCount + (matchCount === 1 ? ' match' : ' matches');
+    }
+
+    // Modal Events
+    backdrop.addEventListener('click', closeInspector);
+    closeBtn.addEventListener('click', closeInspector);
+
+    window.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && modal.style.display !== 'none') {
+        closeInspector();
+      }
+    });
+
+    endpointSelect.addEventListener('change', function () {
+      if (endpointSelect.value === 'custom') {
+        customInput.style.display = 'inline-block';
+        customInput.focus();
+      } else {
+        customInput.style.display = 'none';
+        userNodeStates = {};
+        fetchEndpoint(endpointSelect.value, true);
+      }
+    });
+
+    customInput.addEventListener('keydown', function (e) {
+      if (e.key === 'Enter') {
+        userNodeStates = {};
+        fetchEndpoint(getActiveEndpoint(), true);
+      }
+    });
+
+    pollToggle.addEventListener('click', function () {
+      if (isPolling) {
+        stopPolling();
+      } else {
+        startPolling();
+      }
+    });
+
+    pollRateInput.addEventListener('change', function () {
+      if (isPolling) {
+        scheduleNextPoll();
+      }
+    });
+
+    fetchBtn.addEventListener('click', function () {
+      fetchEndpoint(getActiveEndpoint(), false);
+    });
+
+    searchInput.addEventListener('input', function () {
+      applySearchFilter(searchInput.value.trim());
+    });
+
+    viewModeGroup.addEventListener('click', function (e) {
+      var btn = e.target.closest('.btn-chip');
+      if (!btn) return;
+      viewModeGroup.querySelectorAll('.btn-chip').forEach(function (b) { b.classList.remove('active'); });
+      btn.classList.add('active');
+      activeViewMode = btn.getAttribute('data-mode') || 'tree';
+
+      if (activeViewMode === 'raw') {
+        treeContainer.style.display = 'none';
+        rawContainer.style.display = 'block';
+      } else {
+        treeContainer.style.display = 'block';
+        rawContainer.style.display = 'none';
+      }
+    });
+
+    expandAllBtn.addEventListener('click', function () {
+      globalExpandOverride = true;
+      userNodeStates = {};
+      var carets = treeContainer.querySelectorAll('.json-caret');
+      var children = treeContainer.querySelectorAll('.json-children');
+      for (var i = 0; i < carets.length; i++) carets[i].classList.remove('collapsed');
+      for (var j = 0; j < children.length; j++) {
+        children[j].classList.remove('collapsed');
+        children[j].removeAttribute('hidden');
+      }
+    });
+
+    collapseAllBtn.addEventListener('click', function () {
+      globalExpandOverride = false;
+      userNodeStates = {};
+      var carets = treeContainer.querySelectorAll('.json-caret');
+      var children = treeContainer.querySelectorAll('.json-children');
+      for (var i = 0; i < carets.length; i++) carets[i].classList.add('collapsed');
+      for (var j = 0; j < children.length; j++) {
+        children[j].classList.add('collapsed');
+        children[j].setAttribute('hidden', 'until-found');
+      }
+    });
+
+    copyBtn.addEventListener('click', function () {
+      var str = JSON.stringify(currentData, null, 2);
+      var done = function () {
+        var old = copyBtn.textContent;
+        copyBtn.textContent = 'Copied!';
+        setTimeout(function () { copyBtn.textContent = old; }, 1200);
+      };
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(str).then(done, done);
+      } else {
+        done();
+      }
+    });
+
+    // Intercept clicks on inspect buttons & inspectable endpoint links
+    document.addEventListener('click', function (e) {
+      var inspectTrigger = e.target.closest('[data-inspect], .btn-inspect');
+      if (inspectTrigger) {
+        if (e.ctrlKey || e.metaKey || e.shiftKey) return;
+        e.preventDefault();
+        var targetPath = inspectTrigger.getAttribute('data-inspect') ||
+                         inspectTrigger.getAttribute('data-endpoint') ||
+                         inspectTrigger.getAttribute('href');
+        if (targetPath) {
+          openInspector(targetPath);
+        }
+      }
+    });
   })();
 
   if (meta.writable) {
