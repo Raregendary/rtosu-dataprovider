@@ -97,7 +97,10 @@ pub fn diff_schema(
                     format!("{}.{}", current_path, key)
                 };
 
-                if ignore_prefixes.iter().any(|p| child_path == *p || child_path.starts_with(&format!("{}.", p))) {
+                if ignore_prefixes
+                    .iter()
+                    .any(|p| child_path == *p || child_path.starts_with(&format!("{}.", p)))
+                {
                     continue;
                 }
 
@@ -119,7 +122,10 @@ pub fn diff_schema(
                     format!("{}.{}", current_path, key)
                 };
 
-                if ignore_prefixes.iter().any(|p| child_path == *p || child_path.starts_with(&format!("{}.", p))) {
+                if ignore_prefixes
+                    .iter()
+                    .any(|p| child_path == *p || child_path.starts_with(&format!("{}.", p)))
+                {
                     continue;
                 }
 
@@ -135,7 +141,12 @@ pub fn diff_schema(
         (Value::Array(exp_arr), Value::Array(act_arr)) => {
             if let (Some(first_exp), Some(first_act)) = (exp_arr.first(), act_arr.first()) {
                 let child_path = format!("{}[0]", current_path);
-                drifts.extend(diff_schema(first_exp, first_act, &child_path, ignore_prefixes));
+                drifts.extend(diff_schema(
+                    first_exp,
+                    first_act,
+                    &child_path,
+                    ignore_prefixes,
+                ));
             }
         }
         _ => {}
@@ -152,18 +163,24 @@ pub fn fetch_tosu_endpoint(port: u16, path: &str) -> Result<Value> {
     let mut stream = TcpStream::connect(("127.0.0.1", port))
         .with_context(|| format!("connecting to tosu at 127.0.0.1:{port}"))?;
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
-    let request = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
     stream.write_all(request.as_bytes())?;
 
     let mut response = Vec::new();
     stream.read_to_end(&mut response)?;
     let response_str = String::from_utf8_lossy(&response);
 
-    let body = if let Some(pos) = response_str.find("\r\n\r\n") {
-        &response_str[pos + 4..]
+    let (headers, body) = if let Some(pos) = response_str.find("\r\n\r\n") {
+        (&response_str[..pos], &response_str[pos + 4..])
     } else {
-        &response_str
+        ("", response_str.as_ref())
     };
+
+    let status_line = headers.lines().next().unwrap_or("");
+    if !status_line.contains("200 OK") && !status_line.contains(" 200 ") {
+        anyhow::bail!("tosu {path} returned non-200 HTTP response: {status_line}");
+    }
 
     serde_json::from_str(body).with_context(|| format!("parsing JSON response from tosu {path}"))
 }

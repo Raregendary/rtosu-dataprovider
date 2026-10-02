@@ -6,7 +6,9 @@ fn test_schema_level_parity_against_tosu() {
     // 1. Check if tosu is running on 24050
     let tosu_live = fetch_tosu_endpoint(24050, "/json/v2");
     let Ok(_sample) = tosu_live else {
-        println!("[SKIPPED] tosu is not running on 127.0.0.1:24050; skipping live schema parity test");
+        println!(
+            "[SKIPPED] tosu is not running on 127.0.0.1:24050; skipping live schema parity test"
+        );
         return;
     };
 
@@ -53,5 +55,8 @@ fn test_schema_level_parity_against_tosu() {
         }
     }
 
-    assert!(!any_failure, "Schema drift detected between tosu and rtosu!");
+    assert!(
+        !any_failure,
+        "Schema drift detected between tosu and rtosu!"
+    );
 }

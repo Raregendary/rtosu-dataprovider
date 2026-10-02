@@ -292,13 +292,25 @@ pub fn create_router_with(
 
     if enable_http {
         router = router
-            .route("/json/v2", get(handle_json_v2).layer(CompressionLayer::new()))
-            .route("/json/v2/precise", get(handle_json_v2_precise).layer(CompressionLayer::new()))
-            .route("/json/v1", get(handle_json_v1).layer(CompressionLayer::new()))
+            .route(
+                "/json/v2",
+                get(handle_json_v2).layer(CompressionLayer::new()),
+            )
+            .route(
+                "/json/v2/precise",
+                get(handle_json_v2_precise).layer(CompressionLayer::new()),
+            )
+            .route(
+                "/json/v1",
+                get(handle_json_v1).layer(CompressionLayer::new()),
+            )
             // The StreamCompanion payload, for overlays written against
             // StreamCompanion rather than against tosu. Flat and 136 keys, so
             // nothing else in this router can be confused with it.
-            .route("/json/sc", get(handle_json_sc).layer(CompressionLayer::new()))
+            .route(
+                "/json/sc",
+                get(handle_json_sc).layer(CompressionLayer::new()),
+            )
             .route("/health", get(handle_health))
             // The landing page and its API. Registered inside the HTTP block so
             // the zero-port bypass still means what it says: with HTTP off,
@@ -318,7 +330,10 @@ pub fn create_router_with(
             .route("/api/restart", post(handle_restart))
             // Log listing, historical file viewing, log downloading, live SSE tail, and standalone page.
             .route("/api/logs", get(handle_logs_list))
-            .route("/api/logs/view", get(handle_logs_view).layer(CompressionLayer::new()))
+            .route(
+                "/api/logs/view",
+                get(handle_logs_view).layer(CompressionLayer::new()),
+            )
             .route("/api/logs/download", get(handle_logs_download))
             .route("/api/logs/tail", get(handle_logs_tail))
             .route("/logs", get(handle_logs_page))
@@ -996,8 +1011,21 @@ async fn handle_logs_download(
     Query(query): Query<LogDownloadQuery>,
 ) -> Response {
     let filename = query.file.or(query.name).unwrap_or_default();
-    if filename.is_empty() || filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+    if filename.is_empty()
+        || filename.contains('/')
+        || filename.contains('\\')
+        || filename.contains(':')
+        || filename.contains("..")
+        || !filename.starts_with("rtosu-")
+        || !filename.ends_with(".log")
+    {
         return (StatusCode::BAD_REQUEST, "invalid file name").into_response();
+    }
+    let p = std::path::Path::new(&filename);
+    let mut comps = p.components();
+    match comps.next() {
+        Some(std::path::Component::Normal(_)) if comps.next().is_none() => {}
+        _ => return (StatusCode::BAD_REQUEST, "invalid file name").into_response(),
     }
     let path = state.logs_dir.join(&filename);
     match tokio::fs::read(&path).await {
@@ -1017,7 +1045,8 @@ async fn handle_logs_download(
     }
 }
 
-async fn handle_logs_tail() -> Sse<impl futures_util::Stream<Item = std::result::Result<Event, std::convert::Infallible>>> {
+async fn handle_logs_tail()
+-> Sse<impl futures_util::Stream<Item = std::result::Result<Event, std::convert::Infallible>>> {
     let rx = crate::logging::get_log_receiver();
     let initial_entries = crate::logging::get_recent_logs(100);
 
@@ -1602,7 +1631,11 @@ async fn handle_ws_stream_delta(
     // Send immediate initial state if attached
     let (attached, packet, full_json) = {
         let borrowed = packet_rx.borrow();
-        (borrowed.attached, borrowed.packet.clone(), borrowed.json.clone())
+        (
+            borrowed.attached,
+            borrowed.packet.clone(),
+            borrowed.json.clone(),
+        )
     };
 
     if attached {
@@ -4380,5 +4413,37 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_logs_download_security() {
+        let (_tx, rx) = watch::channel(PublishedPacket::default_packet());
+        let app = create_router(AppState::new(rx), true, true, true);
+
+        for attack in [
+            "../config.toml",
+            "C:Cargo.toml",
+            "C:config.toml",
+            "C:rtosu-2026-10-02.log",
+            "Cargo.toml",
+            "other.txt",
+            "..\\Cargo.toml",
+        ] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/logs/download?file={}", attack))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                res.status(),
+                StatusCode::BAD_REQUEST,
+                "download of '{attack}' must be rejected with 400"
+            );
+        }
     }
 }

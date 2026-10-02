@@ -1229,10 +1229,7 @@ mod tests {
         );
 
         // Primitive change
-        assert_eq!(
-            compute_json_delta(&json!(1), &json!(2)),
-            Some(json!(2))
-        );
+        assert_eq!(compute_json_delta(&json!(1), &json!(2)), Some(json!(2)));
 
         // Nested object diff only includes changed fields
         let prev = json!({
@@ -1317,4 +1314,3 @@ pub fn compute_json_delta(prev: &Value, curr: &Value) -> Option<Value> {
         _ => Some(curr.clone()),
     }
 }
-

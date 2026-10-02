@@ -161,6 +161,27 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
         false,
     ),
     number(
+        "server.ws_write_buffer_size",
+        "WebSocket write buffer (bytes)",
+        1024.0,
+        16777216.0,
+        true,
+    ),
+    number(
+        "server.ws_max_write_buffer_size",
+        "WebSocket max write buffer (bytes)",
+        1024.0,
+        67108864.0,
+        true,
+    ),
+    number(
+        "server.ws_max_frame_size",
+        "WebSocket max frame size (bytes)",
+        1024.0,
+        67108864.0,
+        true,
+    ),
+    number(
         "poll.poll_rate_hz",
         "Poll rate (Hz)",
         1.0,
@@ -2324,9 +2345,14 @@ const LANDING_SCRIPT: &str = r#"(function () {
         if (lvl !== activeLevel) return false;
       }
       if (activeSearch) {
-        var q = activeSearch.toLowerCase();
-        var full = (entry.raw || ((entry.target || '') + ' ' + (entry.message || ''))).toLowerCase();
-        if (full.indexOf(q) === -1) return false;
+        var full = entry.raw || ((entry.target || '') + ' ' + (entry.message || ''));
+        var match = false;
+        try {
+          match = new RegExp(activeSearch, 'i').test(full);
+        } catch (_) {
+          match = full.toLowerCase().indexOf(activeSearch.toLowerCase()) !== -1;
+        }
+        if (!match) return false;
       }
       return true;
     }
@@ -2370,8 +2396,11 @@ const LANDING_SCRIPT: &str = r#"(function () {
         if (emptyMsg) consoleElem.removeChild(emptyMsg);
 
         consoleElem.appendChild(renderRow(entry));
+        while (consoleElem.children.length > 2000) {
+          consoleElem.removeChild(consoleElem.firstElementChild);
+        }
         if (countInfo) {
-          countInfo.textContent = currentEntries.length + ' lines';
+          countInfo.textContent = consoleElem.children.length + ' of ' + currentEntries.length + ' lines';
         }
         scrollToBottom();
       }
@@ -2447,9 +2476,14 @@ const LANDING_SCRIPT: &str = r#"(function () {
               var ts = tokens[0] || '';
               var lvl = tokens[1] || 'INFO';
               var rem = line.slice(line.indexOf(lvl) + lvl.length).trim();
-              var colon = rem.indexOf(':');
+              var colon = rem.indexOf(': ');
+              var colonLen = 2;
+              if (colon === -1) {
+                colon = rem.indexOf(':');
+                colonLen = 1;
+              }
               var tgt = colon !== -1 ? rem.slice(0, colon).trim() : '';
-              var msg = colon !== -1 ? rem.slice(colon + 1).trim() : rem;
+              var msg = colon !== -1 ? rem.slice(colon + colonLen).trim() : rem;
 
               currentEntries.push({
                 timestamp: ts,
@@ -2952,6 +2986,14 @@ const LANDING_SCRIPT: &str = r#"(function () {
       var q = query.toLowerCase();
       var nodes = treeContainer.querySelectorAll('.json-node');
       var matchCount = 0;
+      var isMatch = function(text) {
+        if (!text) return false;
+        try {
+          return new RegExp(query, 'i').test(text);
+        } catch (_) {
+          return text.toLowerCase().indexOf(q) !== -1;
+        }
+      };
 
       for (var n = 0; n < nodes.length; n++) {
         var node = nodes[n];
@@ -2959,11 +3001,11 @@ const LANDING_SCRIPT: &str = r#"(function () {
         var valEl = node.querySelector(':scope > .json-val');
         var matched = false;
 
-        if (keyEl && keyEl.textContent.toLowerCase().indexOf(q) !== -1) {
+        if (keyEl && isMatch(keyEl.textContent)) {
           keyEl.classList.add('json-search-match');
           matched = true;
         }
-        if (valEl && valEl.textContent.toLowerCase().indexOf(q) !== -1) {
+        if (valEl && isMatch(valEl.textContent)) {
           valEl.classList.add('json-search-match');
           matched = true;
         }
@@ -3796,6 +3838,26 @@ mod tests {
                     "{name} must document {}",
                     field.spec.key
                 );
+            }
+
+            // Reverse check: every leaf setting in the document tables must be present in FIELD_SPECS
+            let toml_val: toml::Value = toml::from_str(&text).unwrap();
+            if let Some(table) = toml_val.as_table() {
+                for (sec, val) in table {
+                    if let Some(sec_table) = val.as_table() {
+                        for (key, _) in sec_table {
+                            if sec == "scoring" && key == "mod_multipliers" {
+                                assert!(field_spec("scoring.mod_multipliers").is_some());
+                                continue;
+                            }
+                            let full_key = format!("{sec}.{key}");
+                            assert!(
+                                field_spec(&full_key).is_some(),
+                                "{name} carries {full_key}, but it is missing from FIELD_SPECS"
+                            );
+                        }
+                    }
+                }
             }
         }
     }

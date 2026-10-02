@@ -114,6 +114,10 @@ impl LogTailWriter {
         }
     }
 
+    pub fn with_buffer(buffer: Arc<LogTailBuffer>) -> Self {
+        Self { buffer }
+    }
+
     fn process_line(&self, line: &str) {
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() {
@@ -125,10 +129,15 @@ impl LogTailWriter {
         let timestamp = tokens.next().unwrap_or("").to_string();
         let level = tokens.next().unwrap_or("INFO").to_string();
 
-        let rem = trimmed.strip_prefix(&timestamp).unwrap_or(trimmed).trim_start();
+        let rem = trimmed
+            .strip_prefix(&timestamp)
+            .unwrap_or(trimmed)
+            .trim_start();
         let rem = rem.strip_prefix(&level).unwrap_or(rem).trim_start();
 
-        let (target, message) = if let Some((tgt, msg)) = rem.split_once(':') {
+        let (target, message) = if let Some((tgt, msg)) = rem.split_once(": ") {
+            (tgt.trim().to_string(), msg.trim().to_string())
+        } else if let Some((tgt, msg)) = rem.split_once(':') {
             (tgt.trim().to_string(), msg.trim().to_string())
         } else {
             ("rtosu".to_string(), rem.to_string())
@@ -218,7 +227,11 @@ pub fn list_log_files<P: AsRef<Path>>(logs_dir: P) -> Result<Vec<LogFileInfo>> {
     }
 
     // Sort descending by date (newest first)
-    files.sort_by(|a, b| b.date.cmp(&a.date).then_with(|| b.modified_secs.cmp(&a.modified_secs)));
+    files.sort_by(|a, b| {
+        b.date
+            .cmp(&a.date)
+            .then_with(|| b.modified_secs.cmp(&a.modified_secs))
+    });
     Ok(files)
 }
 
@@ -229,8 +242,18 @@ pub fn read_log_file<P: AsRef<Path>>(
     filename: &str,
     tail_lines: Option<usize>,
 ) -> Result<LogFileContent> {
-    if filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+    if filename.contains('/')
+        || filename.contains('\\')
+        || filename.contains(':')
+        || filename.contains("..")
+    {
         anyhow::bail!("Invalid log filename: path traversal characters not permitted");
+    }
+    let p = Path::new(filename);
+    let mut comps = p.components();
+    match comps.next() {
+        Some(std::path::Component::Normal(_)) if comps.next().is_none() => {}
+        _ => anyhow::bail!("Invalid log filename: single normal component required"),
     }
     if !filename.starts_with("rtosu-") || !filename.ends_with(".log") {
         anyhow::bail!("Invalid log filename: must match 'rtosu-*.log'");
@@ -589,8 +612,24 @@ mod tests {
         // Path traversal rejection
         assert!(read_log_file(&dir, "../secret.log", None).is_err());
         assert!(read_log_file(&dir, "other.txt", None).is_err());
+        assert!(read_log_file(&dir, "C:Cargo.toml", None).is_err());
+        assert!(read_log_file(&dir, "C:rtosu-2026-09-28.log", None).is_err());
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_log_tail_writer_parses_target_with_colons() {
+        let buffer = Arc::new(LogTailBuffer::new(10));
+        let writer = LogTailWriter::with_buffer(buffer.clone());
+        let raw_line = "2026-10-02T02:50:05.502667Z  INFO rtosu_dataprovider::server: Listening on TCP socket 127.0.0.1:24099\n";
+        writer.process_line(raw_line);
+
+        let recent = buffer.recent(1);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].level, "INFO");
+        assert_eq!(recent[0].target, "rtosu_dataprovider::server");
+        assert_eq!(recent[0].message, "Listening on TCP socket 127.0.0.1:24099");
     }
 
     #[test]

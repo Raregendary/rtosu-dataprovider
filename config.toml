@@ -58,6 +58,19 @@ overlays_dir = "browser_overlays"
 # Default: true
 settings_write_local_only = true
 
+# WebSocket per-socket initial write buffer size in bytes.
+# Default: 65536 (64 KB)
+ws_write_buffer_size = 65536
+
+# WebSocket per-socket maximum write buffer size in bytes.
+# Caps outbound buffering for slow or congested clients.
+# Default: 524288 (512 KB)
+ws_max_write_buffer_size = 524288
+
+# WebSocket per-socket maximum frame size in bytes.
+# Default: 16777216 (16 MB)
+ws_max_frame_size = 16777216
+
 
 [poll]
 # Polling update frequency in Hertz (updates per second).

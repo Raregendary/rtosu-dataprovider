@@ -10,6 +10,7 @@ pub mod process;
 pub mod profile;
 pub mod reader;
 pub mod sc;
+pub mod schema_parity;
 pub mod scoring;
 pub mod server;
 pub mod session;
@@ -18,7 +19,6 @@ pub mod tournament;
 pub mod v1;
 pub mod v2;
 pub mod ws_filters;
-pub mod schema_parity;
 
 #[cfg(feature = "instr")]
 pub mod instr;

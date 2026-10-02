@@ -286,7 +286,9 @@ impl AppConfig {
                 anyhow::bail!("server.overlays_dir must not be empty when overlays are enabled");
             }
         }
-        if self.server.ws_write_buffer_size < 1024 || self.server.ws_write_buffer_size > 16 * 1024 * 1024 {
+        if self.server.ws_write_buffer_size < 1024
+            || self.server.ws_write_buffer_size > 16 * 1024 * 1024
+        {
             anyhow::bail!(
                 "server.ws_write_buffer_size must be between 1024 and 16777216 bytes (got {})",
                 self.server.ws_write_buffer_size
@@ -300,7 +302,8 @@ impl AppConfig {
                 self.server.ws_max_write_buffer_size
             );
         }
-        if self.server.ws_max_frame_size < 1024 || self.server.ws_max_frame_size > 64 * 1024 * 1024 {
+        if self.server.ws_max_frame_size < 1024 || self.server.ws_max_frame_size > 64 * 1024 * 1024
+        {
             anyhow::bail!(
                 "server.ws_max_frame_size must be between 1024 and 67108864 bytes (got {})",
                 self.server.ws_max_frame_size

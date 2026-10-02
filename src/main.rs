@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
+use rtosu_dataprovider::OsuReader;
 use rtosu_dataprovider::address::{
     checked_add, checked_add_signed, format_address, parse_i64, parse_u64, parse_u128_as_u64,
 };
@@ -10,7 +11,6 @@ use rtosu_dataprovider::process::{ProcessMemory, list_modules, list_processes, m
 use rtosu_dataprovider::profile::{available_profiles, load_profile};
 use rtosu_dataprovider::session::TournamentSession;
 use rtosu_dataprovider::tournament::read_tournament_state;
-use rtosu_dataprovider::OsuReader;
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -1012,7 +1012,9 @@ fn run_schema_check(port: u16) -> Result<()> {
     if any_drift {
         bail!("Schema parity drift detected!");
     } else {
-        println!("\nAll 4 payload schemas (/json/v2, /json/v2/precise, /json/v1, /json/sc) match tosu perfectly!");
+        println!(
+            "\nAll 4 payload schemas (/json/v2, /json/v2/precise, /json/v1, /json/sc) match tosu perfectly!"
+        );
         Ok(())
     }
 }
