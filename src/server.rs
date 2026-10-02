@@ -1630,7 +1630,7 @@ async fn handle_ws_stream_delta(
 
     // Send immediate initial state if attached
     let (attached, packet, full_json) = {
-        let borrowed = packet_rx.borrow();
+        let borrowed = packet_rx.borrow_and_update();
         (
             borrowed.attached,
             borrowed.packet.clone(),
@@ -1663,7 +1663,7 @@ async fn handle_ws_stream_delta(
                     break;
                 }
                 let (attached, packet, full_json) = {
-                    let borrowed = packet_rx.borrow();
+                    let borrowed = packet_rx.borrow_and_update();
                     (borrowed.attached, borrowed.packet.clone(), borrowed.json.clone())
                 };
                 if !attached {
@@ -2632,8 +2632,10 @@ mod tests {
     /// an overlay's bandwidth actually depends on.
     #[tokio::test]
     async fn the_precise_route_serves_three_keys_and_not_the_v2_packet() {
-        let mut sample = TosuV2Packet::default();
-        sample.client = "stable".to_string();
+        let mut sample = TosuV2Packet {
+            client: "stable".to_string(),
+            ..Default::default()
+        };
         sample.state.number = 2;
         sample.beatmap.id = 2964306;
         sample.play.key_overlay.k1 = crate::v2::KeyOverlayButton {
@@ -2705,8 +2707,10 @@ mod tests {
     /// an SC client pointed at rtosu had nothing to read at all.
     #[tokio::test]
     async fn test_http_json_sc_endpoint() {
-        let mut sample = TosuV2Packet::default();
-        sample.client = "stable".to_string();
+        let mut sample = TosuV2Packet {
+            client: "stable".to_string(),
+            ..Default::default()
+        };
         sample.state.number = 2;
         sample.play.score = 4652;
         sample.beatmap.id = 2964306;
@@ -2742,9 +2746,9 @@ mod tests {
         // Flat and 136 keys, with no subtrees.
         let object = parsed.as_object().expect("an object");
         assert_eq!(object.len(), 136, "SC key count");
-        assert!(!parsed.get("menu").is_some());
-        assert!(!parsed.get("beatmap").is_some());
-        assert!(!parsed.get("play").is_some());
+        assert!(parsed.get("menu").is_none());
+        assert!(parsed.get("beatmap").is_none());
+        assert!(parsed.get("play").is_none());
 
         // Spot-check leaves across the payload, including the two shapes most
         // likely to be built wrongly.
@@ -2814,8 +2818,10 @@ mod tests {
     async fn test_tokens_route_upgrades_and_answers_the_requested_leaves() {
         use crate::ws_filters::{filter_json, parse_filters, parse_packet};
 
-        let mut sample = TosuV2Packet::default();
-        sample.client = "stable".to_string();
+        let mut sample = TosuV2Packet {
+            client: "stable".to_string(),
+            ..Default::default()
+        };
         sample.play.score = 4652;
         sample.beatmap.id = 2964306;
 
@@ -3000,8 +3006,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_router_conditional_routes_http_only() {
-        let mut sample = TosuV2Packet::default();
-        sample.client = "stable".to_string();
+        let sample = TosuV2Packet {
+            client: "stable".to_string(),
+            ..Default::default()
+        };
 
         let (_tx, rx) = watch::channel(PublishedPacket::new(sample).expect("serialize"));
         let state = AppState::new(rx);
@@ -3022,6 +3030,7 @@ mod tests {
 
         // WS endpoint should be 404 NOT_FOUND
         let ws_res = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/websocket/v2")
@@ -3031,12 +3040,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ws_res.status(), StatusCode::NOT_FOUND);
+
+        let ws_delta_res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/websocket/v2/delta")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ws_delta_res.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
     async fn test_router_conditional_routes_ws_only() {
-        let mut sample = TosuV2Packet::default();
-        sample.client = "stable".to_string();
+        let sample = TosuV2Packet {
+            client: "stable".to_string(),
+            ..Default::default()
+        };
 
         let (_tx, rx) = watch::channel(PublishedPacket::new(sample).expect("serialize"));
         let state = AppState::new(rx);
@@ -3057,6 +3079,7 @@ mod tests {
 
         // WS endpoint should be accessible (status is NOT 404; without WS headers it returns 400 Bad Request)
         let ws_res = app
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/websocket/v2")
@@ -3067,12 +3090,26 @@ mod tests {
             .unwrap();
         assert_ne!(ws_res.status(), StatusCode::NOT_FOUND);
         assert_eq!(ws_res.status(), StatusCode::BAD_REQUEST);
+
+        let ws_delta_res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/websocket/v2/delta")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_ne!(ws_delta_res.status(), StatusCode::NOT_FOUND);
+        assert_eq!(ws_delta_res.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
     async fn test_router_cors_toggle() {
-        let mut sample = TosuV2Packet::default();
-        sample.client = "stable".to_string();
+        let sample = TosuV2Packet {
+            client: "stable".to_string(),
+            ..Default::default()
+        };
 
         // 1. With CORS allowed
         let (_tx, rx1) = watch::channel(PublishedPacket::new(sample.clone()).expect("serialize"));

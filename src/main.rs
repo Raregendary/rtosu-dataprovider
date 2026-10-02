@@ -906,10 +906,11 @@ async fn run_serve_loop(
                     // last-known state is published -- but it must still reach
                     // clients, because it is what turns the `/json*` routes from
                     // `200` into tosu's `500`.
-                    if let Some(last) = &last_published {
-                        if last.attached == attached && *last.packet == packet {
-                            continue;
-                        }
+                    if let Some(last) = &last_published
+                        && last.attached == attached
+                        && *last.packet == packet
+                    {
+                        continue;
                     }
                     if let Some(published) = rtosu_dataprovider::server::PublishedPacket::new(packet) {
                         let published = if attached { published } else { published.detached() };

@@ -498,7 +498,7 @@ impl TournamentSession {
                         .iter()
                         .rev()
                         .find(|ep| ep.time <= live)
-                        .map_or(false, |ep| ep.kiai);
+                        .is_some_and(|ep| ep.kiai);
                     beatmap_mut.is_break = map
                         .breaks
                         .iter()
@@ -831,7 +831,7 @@ impl TournamentSession {
                 #[cfg(not(feature = "pp"))]
                 let live_pp: Option<crate::pp::LivePpResult> = None;
 
-                let is_playing = gameplay.as_ref().map_or(false, |g| {
+                let is_playing = gameplay.as_ref().is_some_and(|g| {
                     g.combo > 0 || (g.hit_300 + g.hit_100 + g.hit_50 + g.hit_miss) > 0
                 });
                 if !is_playing {

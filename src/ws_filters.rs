@@ -430,12 +430,11 @@ mod tests {
     /// assignment. Only narrowing *into* a null is skipped.
     #[test]
     fn a_null_leaf_is_kept_because_assigning_null_is_a_real_assignment() {
-        assert_eq!(
+        assert!(
             filtered(r#"["play"]"#)
                 .as_deref()
                 .unwrap()
-                .contains(r#""matchmaking":null"#),
-            true
+                .contains(r#""matchmaking":null"#)
         );
         assert_eq!(
             filtered(r#"[{"field":"play","keys":["matchmaking"]}]"#).as_deref(),

@@ -2787,7 +2787,7 @@ const LANDING_SCRIPT: &str = r#"(function () {
       var cur = obj;
       for (var i = 0; i < parts.length; i++) {
         var p = parts[i];
-        var arrMatch = p.match(/^(\w+)\[(\d+)\]$/);
+        var arrMatch = p.match(/^([^\[\]]+)\[(\d+)\]$/);
         if (arrMatch) {
           var key = arrMatch[1];
           var idx = parseInt(arrMatch[2], 10);

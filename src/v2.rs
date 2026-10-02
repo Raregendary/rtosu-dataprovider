@@ -825,6 +825,51 @@ fn md5_hex(input: &[u8]) -> String {
     hex
 }
 
+/// Compute an RFC 7396 merge diff between two JSON values.
+/// Returns `None` if `prev == curr`.
+/// For objects: returns a map containing only keys whose values changed,
+/// or key mapped to Value::Null if the key was deleted in `curr`.
+/// For arrays or primitives: returns `Some(curr.clone())` if `prev != curr`.
+pub fn compute_json_delta(prev: &Value, curr: &Value) -> Option<Value> {
+    if prev == curr {
+        return None;
+    }
+
+    match (prev, curr) {
+        (Value::Object(prev_map), Value::Object(curr_map)) => {
+            let mut delta_map = serde_json::Map::new();
+
+            // Keys in curr that differ from prev or are newly added
+            for (key, curr_val) in curr_map {
+                match prev_map.get(key) {
+                    Some(prev_val) => {
+                        if let Some(child_delta) = compute_json_delta(prev_val, curr_val) {
+                            delta_map.insert(key.clone(), child_delta);
+                        }
+                    }
+                    None => {
+                        delta_map.insert(key.clone(), curr_val.clone());
+                    }
+                }
+            }
+
+            // Keys in prev that were removed in curr (RFC 7396 null tombstone)
+            for key in prev_map.keys() {
+                if !curr_map.contains_key(key) {
+                    delta_map.insert(key.clone(), Value::Null);
+                }
+            }
+
+            if delta_map.is_empty() {
+                None
+            } else {
+                Some(Value::Object(delta_map))
+            }
+        }
+        _ => Some(curr.clone()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1152,12 +1197,14 @@ mod tests {
 
     #[test]
     fn test_v2_packet_serialization() {
-        let mut packet = TosuV2Packet::default();
-        packet.client = "stable".to_string();
-        packet.server = "ppy.sh".to_string();
-        packet.state = OsuStatusState {
-            number: 2,
-            name: "play".to_string(),
+        let mut packet = TosuV2Packet {
+            client: "stable".to_string(),
+            server: "ppy.sh".to_string(),
+            state: OsuStatusState {
+                number: 2,
+                name: "play".to_string(),
+            },
+            ..Default::default()
         };
         packet.play.score = 1234567;
         packet.play.mods = create_mods_state(16, "HR");
@@ -1267,50 +1314,5 @@ mod tests {
             compute_json_delta(&prev_arr, &curr_arr).unwrap(),
             json!({ "arr": [1, 2, 3] })
         );
-    }
-}
-
-/// Compute an RFC 7396 merge diff between two JSON values.
-/// Returns `None` if `prev == curr`.
-/// For objects: returns a map containing only keys whose values changed,
-/// or key mapped to Value::Null if the key was deleted in `curr`.
-/// For arrays or primitives: returns `Some(curr.clone())` if `prev != curr`.
-pub fn compute_json_delta(prev: &Value, curr: &Value) -> Option<Value> {
-    if prev == curr {
-        return None;
-    }
-
-    match (prev, curr) {
-        (Value::Object(prev_map), Value::Object(curr_map)) => {
-            let mut delta_map = serde_json::Map::new();
-
-            // Keys in curr that differ from prev or are newly added
-            for (key, curr_val) in curr_map {
-                match prev_map.get(key) {
-                    Some(prev_val) => {
-                        if let Some(child_delta) = compute_json_delta(prev_val, curr_val) {
-                            delta_map.insert(key.clone(), child_delta);
-                        }
-                    }
-                    None => {
-                        delta_map.insert(key.clone(), curr_val.clone());
-                    }
-                }
-            }
-
-            // Keys in prev that were removed in curr (RFC 7396 null tombstone)
-            for key in prev_map.keys() {
-                if !curr_map.contains_key(key) {
-                    delta_map.insert(key.clone(), Value::Null);
-                }
-            }
-
-            if delta_map.is_empty() {
-                None
-            } else {
-                Some(Value::Object(delta_map))
-            }
-        }
-        _ => Some(curr.clone()),
     }
 }
