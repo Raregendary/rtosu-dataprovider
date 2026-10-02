@@ -886,6 +886,29 @@ pub fn landing_html(view: &LandingView<'_>) -> String {
     html.push_str(&settings_html(view));
     html.push_str(&overlays_html(view));
     html.push_str(&links_html());
+    html.push_str(&logs_html(false));
+    html.push_str("</main>\n");
+    html.push_str(&footer_html());
+    html.push_str("<script id=\"rtosu-data\" type=\"application/json\">");
+    html.push_str(&page_meta_json(view));
+    html.push_str("</script>\n<script>\n");
+    html.push_str(LANDING_SCRIPT);
+    html.push_str("</script>\n</body>\n</html>");
+    html
+}
+
+/// Render the dedicated standalone log viewer page at `/logs`.
+pub fn logs_page_html(view: &LandingView<'_>) -> String {
+    let mut html = String::with_capacity(32 * 1024);
+    html.push_str("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n");
+    html.push_str("<meta charset=\"utf-8\">\n");
+    html.push_str("<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n");
+    html.push_str("<title>rtosu-dataprovider - System Logs</title>\n<style>\n");
+    html.push_str(LANDING_STYLE);
+    html.push_str("\n</style>\n</head>\n<body>\n");
+    html.push_str(&header_html(view));
+    html.push_str("<main class=\"wrap logs-standalone-wrap\">\n");
+    html.push_str(&logs_html(true));
     html.push_str("</main>\n");
     html.push_str(&footer_html());
     html.push_str("<script id=\"rtosu-data\" type=\"application/json\">");
@@ -1288,6 +1311,81 @@ fn overlays_html(view: &LandingView<'_>) -> String {
     html
 }
 
+/// The system logs panel with live tail and historic file inspection.
+fn logs_html(standalone: bool) -> String {
+    let open_class = if standalone { " open" } else { "" };
+    let popout_btn = if standalone {
+        r#"<a href="/" class="ghost">← Back to Settings</a>"#
+    } else {
+        r#"<a href="/logs" target="_blank" class="ghost" onclick="event.stopPropagation()">Pop-out ↗</a>"#
+    };
+    let height_style = if standalone {
+        "height: calc(100vh - 300px); min-height: 480px;"
+    } else {
+        "max-height: 440px;"
+    };
+
+    format!(
+        r#"<section class="panel logs-panel">
+<div class="logs-collapsible{open_class}" id="logs-collapsible">
+<div class="panel-head logs-summary" id="logs-toggle-head">
+  <div class="logs-summary-left">
+    <span class="chevron" id="logs-chevron">▶</span>
+    <h2>System Logs &amp; Live Tail</h2>
+    <span class="badge live-badge" id="log-status-badge">● Live Tail</span>
+  </div>
+  <div class="logs-summary-right">
+    <button type="button" class="ghost small" id="logs-toggle-btn">Toggle View</button>
+    {popout_btn}
+  </div>
+</div>
+<div class="logs-body" id="logs-panel-body">
+  <div class="logs-toolbar">
+    <div class="logs-toolbar-group">
+      <label for="log-source-select" class="logs-label">Log File:</label>
+      <select id="log-source-select" class="logs-select">
+        <option value="live">🔴 Live Stream (Current)</option>
+      </select>
+    </div>
+    <div class="logs-toolbar-group logs-levels" id="log-level-filters">
+      <button type="button" class="btn-chip active" data-level="ALL">ALL</button>
+      <button type="button" class="btn-chip chip-info" data-level="INFO">INFO</button>
+      <button type="button" class="btn-chip chip-warn" data-level="WARN">WARN</button>
+      <button type="button" class="btn-chip chip-error" data-level="ERROR">ERROR</button>
+      <button type="button" class="btn-chip chip-debug" data-level="DEBUG">DEBUG</button>
+    </div>
+    <div class="logs-toolbar-group logs-search-group">
+      <input type="text" id="log-search-input" class="logs-search" placeholder="Filter messages..." spellcheck="false">
+    </div>
+    <div class="logs-toolbar-group logs-actions">
+      <label class="logs-autoscroll-label">
+        <input type="checkbox" id="log-autoscroll" checked> Auto-scroll
+      </label>
+      <button type="button" id="log-copy-50" class="ghost small" title="Copy last 50 lines to clipboard">Copy 50</button>
+      <button type="button" id="log-copy-all" class="ghost small" title="Copy all visible lines">Copy All</button>
+      <button type="button" id="log-download-btn" class="ghost small" title="Download log file">Download</button>
+      <button type="button" id="log-clear-btn" class="ghost small" title="Clear console view">Clear</button>
+    </div>
+  </div>
+  <div class="logs-console-wrapper" style="{height_style}">
+    <div id="log-console" class="logs-console" tabindex="0" role="region" aria-label="Log output">
+      <div class="log-empty-msg">Connecting to live log stream...</div>
+    </div>
+  </div>
+  <div class="logs-statusbar">
+    <span id="log-count-info">0 lines displayed</span>
+    <span id="log-file-info">Stream: /api/logs/tail</span>
+  </div>
+</div>
+</div>
+</section>
+"#,
+        open_class = open_class,
+        popout_btn = popout_btn,
+        height_style = height_style
+    )
+}
+
 /// Links to everything the server serves, so the page is a usable index rather
 /// than only a settings form.
 fn links_html() -> String {
@@ -1296,6 +1394,7 @@ fn links_html() -> String {
         ("/json", "gosumemory-compatible payload"),
         ("/json/sc", "StreamCompanion payload"),
         (overlays::OVERLAYS_BASE, "overlay dashboard"),
+        ("/logs", "system logs & live tail"),
         ("/health", "attachment status"),
     ];
     let mut html = String::from(
@@ -1309,7 +1408,7 @@ fn links_html() -> String {
         ));
     }
     html.push_str(
-        "</ul>\n<p class=\"hint\">Sockets: <code>/websocket/v2</code>, <code>/ws</code>, \
+        "</ul>\n<p class=\"hint\">Sockets: <code>/websocket/v2</code>, <code>/websocket/v2/delta</code>, <code>/websocket/v2/precise</code>, <code>/ws</code>, \
          <code>/tokens</code>, <code>/websocket/commands</code>.</p>\n</section>\n",
     );
     html
@@ -1540,6 +1639,96 @@ ul.links span { font-size: 11.5px; color: var(--faint); }
 .credit { max-width: 56ch; }
 .credit strong { color: var(--pink); font-weight: 650; }
 
+/* Logs Panel and Console */
+.logs-panel { margin-bottom: 24px; }
+.logs-collapsible #logs-toggle-head { cursor: pointer; user-select: none; }
+.logs-collapsible .chevron { display: inline-block; font-size: 11px; color: var(--muted); transition: transform .2s ease; }
+.logs-collapsible.open .chevron { transform: rotate(90deg); }
+.logs-collapsible:not(.open) .logs-body { display: none; }
+
+.badge.live-badge {
+  font-size: 11.5px; font-weight: 600; padding: 3px 9px; border-radius: 999px;
+  background: rgba(98, 212, 146, 0.12); color: var(--ok); border: 1px solid rgba(98, 212, 146, 0.25);
+  display: inline-flex; align-items: center; gap: 5px;
+}
+.badge.historic-badge {
+  font-size: 11.5px; font-weight: 600; padding: 3px 9px; border-radius: 999px;
+  background: rgba(122, 167, 255, 0.12); color: var(--blue); border: 1px solid rgba(122, 167, 255, 0.25);
+}
+.badge.err-badge {
+  font-size: 11.5px; font-weight: 600; padding: 3px 9px; border-radius: 999px;
+  background: rgba(255, 139, 139, 0.12); color: var(--err); border: 1px solid rgba(255, 139, 139, 0.25);
+}
+
+.logs-body { margin-top: 14px; display: flex; flex-direction: column; gap: 10px; }
+.logs-toolbar {
+  display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+  padding: 8px 12px; background: rgba(13, 16, 24, .65); border: 1px solid var(--line); border-radius: 8px;
+}
+.logs-toolbar-group { display: flex; align-items: center; gap: 6px; }
+.logs-label { font-size: 12px; color: var(--muted); font-weight: 600; }
+.logs-select {
+  padding: 4px 8px; font-size: 12.5px; color: var(--text); background: var(--panel-2);
+  border: 1px solid var(--line-2); border-radius: 6px; cursor: pointer; outline: none;
+}
+.logs-select:focus { border-color: var(--blue); }
+
+.btn-chip {
+  padding: 3px 9px; font-size: 11px; font-weight: 650; color: var(--muted);
+  background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+  cursor: pointer; transition: all .15s ease;
+}
+.btn-chip:hover { border-color: var(--line-2); color: var(--text); }
+.btn-chip.active { background: var(--panel-2); color: var(--text); border-color: var(--blue); }
+.btn-chip.chip-info.active { color: #62d492; border-color: #62d492; }
+.btn-chip.chip-warn.active { color: #ffc46b; border-color: #ffc46b; }
+.btn-chip.chip-error.active { color: #ff8b8b; border-color: #ff8b8b; }
+.btn-chip.chip-debug.active { color: #c48eff; border-color: #c48eff; }
+
+.logs-search {
+  padding: 4px 10px; font-size: 12px; color: var(--text); background: var(--panel-2);
+  border: 1px solid var(--line); border-radius: 6px; min-width: 170px; outline: none;
+}
+.logs-search:focus { border-color: var(--blue); }
+.logs-autoscroll-label { font-size: 12px; color: var(--muted); display: inline-flex; align-items: center; gap: 4px; cursor: pointer; margin-right: 4px; }
+
+.ghost.small { padding: 4px 9px; font-size: 11.5px; }
+
+.logs-console-wrapper {
+  display: flex; flex-direction: column; overflow: hidden;
+  border: 1px solid var(--line); border-radius: 8px; background: #07090e;
+}
+.logs-console {
+  flex: 1 1 auto; overflow-y: auto; overflow-x: auto; padding: 12px 14px;
+  font-family: ui-monospace, "Cascadia Mono", Consolas, monospace; font-size: 12px; line-height: 1.6;
+  white-space: pre-wrap; word-break: break-word; color: #d0d7de;
+}
+.logs-console:focus-visible { outline: 1px solid var(--blue); }
+
+.log-entry-row {
+  display: flex; gap: 8px; padding: 1px 4px; border-radius: 4px;
+}
+.log-entry-row:hover { background: rgba(255, 255, 255, .04); }
+.log-col-time { color: var(--faint); flex-shrink: 0; font-size: 11px; }
+.log-col-level {
+  font-size: 10px; font-weight: 750; letter-spacing: .3px; padding: 0 4px;
+  border-radius: 3px; flex-shrink: 0; height: 18px; line-height: 18px; text-align: center;
+}
+.log-lvl-info { color: #62d492; background: rgba(98, 212, 146, 0.12); }
+.log-lvl-warn { color: #ffc46b; background: rgba(255, 196, 107, 0.12); }
+.log-lvl-error { color: #ff8b8b; background: rgba(255, 139, 139, 0.15); }
+.log-lvl-debug, .log-lvl-trace { color: #c48eff; background: rgba(196, 142, 255, 0.12); }
+
+.log-col-target { color: var(--blue); flex-shrink: 0; font-size: 11.5px; opacity: .85; }
+.log-col-msg { color: var(--text); flex: 1 1 auto; }
+.log-empty-msg { color: var(--faint); font-style: italic; padding: 16px; text-align: center; }
+
+.logs-statusbar {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 4px 8px; font-size: 11.5px; color: var(--faint);
+}
+.logs-standalone-wrap { max-width: 1400px; }
+
 @media (max-width: 720px) {
   .field { grid-template-columns: minmax(0, 1fr); }
   summary .s-note { display: none; }
@@ -1768,6 +1957,343 @@ const LANDING_SCRIPT: &str = r#"(function () {
       });
     });
   }
+
+  // ---- System Logs & Live Tail Controller ----
+  (function initLogs() {
+    var consoleElem = document.getElementById('log-console');
+    if (!consoleElem) return;
+
+    var sourceSelect = document.getElementById('log-source-select');
+    var searchInput = document.getElementById('log-search-input');
+    var autoscrollCheck = document.getElementById('log-autoscroll');
+    var badge = document.getElementById('log-status-badge');
+    var countInfo = document.getElementById('log-count-info');
+    var fileInfo = document.getElementById('log-file-info');
+    var levelFilters = document.getElementById('log-level-filters');
+    var copy50Btn = document.getElementById('log-copy-50');
+    var copyAllBtn = document.getElementById('log-copy-all');
+    var downloadBtn = document.getElementById('log-download-btn');
+    var clearBtn = document.getElementById('log-clear-btn');
+
+    var currentEntries = [];
+    var activeLevel = 'ALL';
+    var activeSearch = '';
+    var eventSource = null;
+    var userScrolledUp = false;
+    var collapsible = document.getElementById('logs-collapsible');
+    var toggleHead = document.getElementById('logs-toggle-head');
+    var toggleBtn = document.getElementById('logs-toggle-btn');
+    var toggleCollapse = function (e) {
+      if (e.target.closest('a') || e.target.closest('select') || e.target.closest('input') || e.target.closest('button:not(#logs-toggle-btn)')) return;
+      if (collapsible) {
+        collapsible.classList.toggle('open');
+      }
+    };
+    if (toggleHead) toggleHead.addEventListener('click', toggleCollapse);
+    if (toggleBtn) toggleBtn.addEventListener('click', function (e) {
+      e.stopPropagation();
+      if (collapsible) collapsible.classList.toggle('open');
+    });
+
+    consoleElem.addEventListener('scroll', function () {
+      var atBottom = consoleElem.scrollHeight - consoleElem.scrollTop - consoleElem.clientHeight < 30;
+      userScrolledUp = !atBottom;
+    });
+
+    function scrollToBottom() {
+      if (autoscrollCheck && autoscrollCheck.checked && !userScrolledUp) {
+        consoleElem.scrollTop = consoleElem.scrollHeight;
+      }
+    }
+
+    function renderRow(entry) {
+      var row = document.createElement('div');
+      row.className = 'log-entry-row';
+      row.dataset.level = (entry.level || 'INFO').toUpperCase();
+
+      var timeCol = document.createElement('span');
+      timeCol.className = 'log-col-time';
+      timeCol.textContent = entry.timestamp ? (entry.timestamp.split('T')[1] || entry.timestamp) : '';
+
+      var lvlCol = document.createElement('span');
+      var lvlUpper = (entry.level || 'INFO').toUpperCase();
+      lvlCol.className = 'log-col-level log-lvl-' + lvlUpper.toLowerCase();
+      lvlCol.textContent = lvlUpper;
+
+      var tgtCol = document.createElement('span');
+      tgtCol.className = 'log-col-target';
+      tgtCol.textContent = entry.target ? entry.target + ':' : '';
+
+      var msgCol = document.createElement('span');
+      msgCol.className = 'log-col-msg';
+      msgCol.textContent = entry.message || entry.raw || '';
+
+      row.appendChild(timeCol);
+      row.appendChild(lvlCol);
+      if (entry.target) row.appendChild(tgtCol);
+      row.appendChild(msgCol);
+
+      return row;
+    }
+
+    function matchesFilter(entry) {
+      if (activeLevel !== 'ALL') {
+        var lvl = (entry.level || 'INFO').toUpperCase();
+        if (lvl !== activeLevel) return false;
+      }
+      if (activeSearch) {
+        var q = activeSearch.toLowerCase();
+        var full = (entry.raw || ((entry.target || '') + ' ' + (entry.message || ''))).toLowerCase();
+        if (full.indexOf(q) === -1) return false;
+      }
+      return true;
+    }
+
+    function refreshConsoleView() {
+      consoleElem.innerHTML = '';
+      var matchedCount = 0;
+      var frag = document.createDocumentFragment();
+
+      for (var i = 0; i < currentEntries.length; i++) {
+        var e = currentEntries[i];
+        if (matchesFilter(e)) {
+          frag.appendChild(renderRow(e));
+          matchedCount++;
+        }
+      }
+
+      if (matchedCount === 0) {
+        var empty = document.createElement('div');
+        empty.className = 'log-empty-msg';
+        empty.textContent = currentEntries.length === 0 ? 'No log entries available.' : 'No log entries match the current filter.';
+        consoleElem.appendChild(empty);
+      } else {
+        consoleElem.appendChild(frag);
+      }
+
+      if (countInfo) {
+        countInfo.textContent = matchedCount + ' of ' + currentEntries.length + ' lines';
+      }
+      scrollToBottom();
+    }
+
+    function appendEntry(entry) {
+      currentEntries.push(entry);
+      if (currentEntries.length > 2000) {
+        currentEntries.shift();
+      }
+
+      if (matchesFilter(entry)) {
+        var emptyMsg = consoleElem.querySelector('.log-empty-msg');
+        if (emptyMsg) consoleElem.removeChild(emptyMsg);
+
+        consoleElem.appendChild(renderRow(entry));
+        if (countInfo) {
+          countInfo.textContent = currentEntries.length + ' lines';
+        }
+        scrollToBottom();
+      }
+    }
+
+    function connectLiveStream() {
+      if (eventSource) {
+        eventSource.close();
+        eventSource = null;
+      }
+
+      currentEntries = [];
+      refreshConsoleView();
+      if (badge) {
+        badge.className = 'badge live-badge';
+        badge.textContent = '● Connecting...';
+      }
+      if (fileInfo) fileInfo.textContent = 'Stream: /api/logs/tail';
+
+      eventSource = new EventSource('/api/logs/tail');
+
+      eventSource.addEventListener('init', function (ev) {
+        try {
+          var entry = JSON.parse(ev.data);
+          appendEntry(entry);
+        } catch (e) {}
+      });
+
+      eventSource.addEventListener('log', function (ev) {
+        try {
+          var entry = JSON.parse(ev.data);
+          appendEntry(entry);
+        } catch (e) {}
+      });
+
+      eventSource.onopen = function () {
+        if (badge) {
+          badge.className = 'badge live-badge';
+          badge.textContent = '● Live Tail';
+        }
+        refreshConsoleView();
+      };
+
+      eventSource.onerror = function () {
+        if (badge) {
+          badge.className = 'badge err-badge';
+          badge.textContent = 'Disconnected (Reconnecting...)';
+        }
+      };
+    }
+
+    function loadHistoricFile(filename) {
+      if (eventSource) {
+        eventSource.close();
+        eventSource = null;
+      }
+
+      if (badge) {
+        badge.className = 'badge historic-badge';
+        badge.textContent = 'Historic: ' + filename;
+      }
+      if (fileInfo) fileInfo.textContent = 'File: logs/' + filename;
+
+      consoleElem.innerHTML = '<div class="log-empty-msg">Loading ' + filename + '...</div>';
+
+      fetch('/api/logs/view?file=' + encodeURIComponent(filename) + '&lines=1000')
+        .then(function (res) { return res.json(); })
+        .then(function (data) {
+          currentEntries = [];
+          if (data && data.lines) {
+            data.lines.forEach(function (line) {
+              var tokens = line.trim().split(/\s+/);
+              var ts = tokens[0] || '';
+              var lvl = tokens[1] || 'INFO';
+              var rem = line.slice(line.indexOf(lvl) + lvl.length).trim();
+              var colon = rem.indexOf(':');
+              var tgt = colon !== -1 ? rem.slice(0, colon).trim() : '';
+              var msg = colon !== -1 ? rem.slice(colon + 1).trim() : rem;
+
+              currentEntries.push({
+                timestamp: ts,
+                level: lvl,
+                target: tgt,
+                message: msg,
+                raw: line
+              });
+            });
+          }
+          userScrolledUp = false;
+          refreshConsoleView();
+        })
+        .catch(function (err) {
+          consoleElem.innerHTML = '<div class="log-empty-msg">Failed to load log file: ' + err + '</div>';
+        });
+    }
+
+    function fetchLogFileList() {
+      fetch('/api/logs')
+        .then(function (res) { return res.json(); })
+        .then(function (files) {
+          if (!sourceSelect || !Array.isArray(files)) return;
+          sourceSelect.innerHTML = '<option value="live">🔴 Live Stream (Current)</option>';
+          files.forEach(function (f) {
+            var opt = document.createElement('option');
+            opt.value = f.name;
+            var kb = (f.size_bytes / 1024).toFixed(1);
+            opt.textContent = f.name + ' (' + kb + ' KB)' + (f.is_current ? ' [Today]' : '');
+            sourceSelect.appendChild(opt);
+          });
+        })
+        .catch(function () {});
+    }
+
+    if (sourceSelect) {
+      sourceSelect.addEventListener('change', function () {
+        if (sourceSelect.value === 'live') {
+          connectLiveStream();
+        } else {
+          loadHistoricFile(sourceSelect.value);
+        }
+      });
+    }
+
+    if (levelFilters) {
+      levelFilters.addEventListener('click', function (e) {
+        var btn = e.target.closest('.btn-chip');
+        if (!btn) return;
+        levelFilters.querySelectorAll('.btn-chip').forEach(function (b) { b.classList.remove('active'); });
+        btn.classList.add('active');
+        activeLevel = btn.dataset.level || 'ALL';
+        refreshConsoleView();
+      });
+    }
+
+    if (searchInput) {
+      searchInput.addEventListener('input', function () {
+        activeSearch = searchInput.value.trim();
+        refreshConsoleView();
+      });
+    }
+
+    function copyText(str, btn) {
+      var done = function () {
+        var old = btn.textContent;
+        btn.textContent = 'Copied!';
+        setTimeout(function () { btn.textContent = old; }, 1200);
+      };
+      if (navigator.clipboard) {
+        navigator.clipboard.writeText(str).then(done, done);
+      } else {
+        done();
+      }
+    }
+
+    if (copy50Btn) {
+      copy50Btn.addEventListener('click', function () {
+        var matching = currentEntries.filter(matchesFilter);
+        var slice = matching.slice(-50).map(function (e) { return e.raw; }).join('\n');
+        copyText(slice, copy50Btn);
+      });
+    }
+
+    if (copyAllBtn) {
+      copyAllBtn.addEventListener('click', function () {
+        var matching = currentEntries.filter(matchesFilter);
+        var all = matching.map(function (e) { return e.raw; }).join('\n');
+        copyText(all, copyAllBtn);
+      });
+    }
+
+    if (downloadBtn) {
+      downloadBtn.addEventListener('click', function () {
+        if (sourceSelect && sourceSelect.value !== 'live') {
+          window.location.href = '/api/logs/download?file=' + encodeURIComponent(sourceSelect.value);
+        } else {
+          var text = currentEntries.map(function (e) { return e.raw; }).join('\n');
+          var blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
+          var a = document.createElement('a');
+          a.href = URL.createObjectURL(blob);
+          a.download = 'rtosu-live-' + new Date().toISOString().slice(0, 10) + '.log';
+          a.click();
+        }
+      });
+    }
+
+    if (clearBtn) {
+      clearBtn.addEventListener('click', function () {
+        currentEntries = [];
+        refreshConsoleView();
+      });
+    }
+
+    if (autoscrollCheck) {
+      autoscrollCheck.addEventListener('change', function () {
+        if (autoscrollCheck.checked) {
+          userScrolledUp = false;
+          scrollToBottom();
+        }
+      });
+    }
+
+    fetchLogFileList();
+    connectLiveStream();
+  })();
 
   if (meta.writable) {
     setStatus('Ready. ' + controls.length + ' settings loaded.', '');

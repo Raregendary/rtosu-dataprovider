@@ -6,15 +6,17 @@ use axum::Router;
 use axum::body::{Body, Bytes};
 use axum::extract::connect_info::{ConnectInfo, MockConnectInfo};
 use axum::extract::ws::{Message, Utf8Bytes, WebSocket, WebSocketUpgrade};
-use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, RawQuery, State};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, Query, RawQuery, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Redirect, Response};
 use axum::routing::{get, post};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::watch;
+use tower_http::compression::CompressionLayer;
 use tower_http::cors::CorsLayer;
 
 /// One poll's packet plus the JSON every consumer receives.
@@ -101,6 +103,24 @@ fn not_ready() -> Response {
         .into_response()
 }
 
+/// Tunable WebSocket configuration for send buffers and frame limits.
+#[derive(Clone, Copy, Debug)]
+pub struct WsConfig {
+    pub write_buffer_size: usize,
+    pub max_write_buffer_size: usize,
+    pub max_frame_size: usize,
+}
+
+impl Default for WsConfig {
+    fn default() -> Self {
+        Self {
+            write_buffer_size: 64 * 1024,
+            max_write_buffer_size: 512 * 1024,
+            max_frame_size: 16 * 1024 * 1024,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub packet_rx: watch::Receiver<PublishedPacket>,
@@ -117,6 +137,10 @@ pub struct AppState {
     /// library embedder that never wired one must not see a request that
     /// silently does nothing.
     pub restart: Option<RestartSignal>,
+    /// Tuned WebSocket options for send buffers and frame limits.
+    pub ws_config: WsConfig,
+    /// Directory containing daily log files (default: "logs").
+    pub logs_dir: std::path::PathBuf,
 }
 
 /// A one-shot request to restart the process, wired by the CLI `serve` path.
@@ -151,6 +175,8 @@ impl AppState {
             bound_host: String::new(),
             bound_port: 0,
             restart: None,
+            ws_config: WsConfig::default(),
+            logs_dir: std::path::PathBuf::from("logs"),
         }
     }
 
@@ -166,6 +192,8 @@ impl AppState {
             bound_host: String::new(),
             bound_port: 0,
             restart: None,
+            ws_config: WsConfig::default(),
+            logs_dir: std::path::PathBuf::from("logs"),
         }
     }
 
@@ -186,6 +214,18 @@ impl AppState {
     /// Wire the restart request so `POST /api/restart` can be honoured.
     pub fn with_restart(mut self, restart: RestartSignal) -> Self {
         self.restart = Some(restart);
+        self
+    }
+
+    /// Set customized WebSocket configuration for send buffers and limits.
+    pub fn with_ws_config(mut self, config: WsConfig) -> Self {
+        self.ws_config = config;
+        self
+    }
+
+    /// Set custom logs directory path.
+    pub fn with_logs_dir(mut self, logs_dir: impl Into<std::path::PathBuf>) -> Self {
+        self.logs_dir = logs_dir.into();
         self
     }
 }
@@ -252,13 +292,13 @@ pub fn create_router_with(
 
     if enable_http {
         router = router
-            .route("/json/v2", get(handle_json_v2))
-            .route("/json/v2/precise", get(handle_json_v2_precise))
-            .route("/json/v1", get(handle_json_v1))
+            .route("/json/v2", get(handle_json_v2).layer(CompressionLayer::new()))
+            .route("/json/v2/precise", get(handle_json_v2_precise).layer(CompressionLayer::new()))
+            .route("/json/v1", get(handle_json_v1).layer(CompressionLayer::new()))
             // The StreamCompanion payload, for overlays written against
             // StreamCompanion rather than against tosu. Flat and 136 keys, so
             // nothing else in this router can be confused with it.
-            .route("/json/sc", get(handle_json_sc))
+            .route("/json/sc", get(handle_json_sc).layer(CompressionLayer::new()))
             .route("/health", get(handle_health))
             // The landing page and its API. Registered inside the HTTP block so
             // the zero-port bypass still means what it says: with HTTP off,
@@ -276,6 +316,12 @@ pub fn create_router_with(
             // Hot restart for restart-required settings, CLI `serve` only. No
             // body at all; the guard is in the handler.
             .route("/api/restart", post(handle_restart))
+            // Log listing, historical file viewing, log downloading, live SSE tail, and standalone page.
+            .route("/api/logs", get(handle_logs_list))
+            .route("/api/logs/view", get(handle_logs_view).layer(CompressionLayer::new()))
+            .route("/api/logs/download", get(handle_logs_download))
+            .route("/api/logs/tail", get(handle_logs_tail))
+            .route("/logs", get(handle_logs_page))
             // tosu file endpoints that overlays use to display the current
             // beatmap background, so drop-in overlays render unchanged.
             .route("/files/beatmap/background", get(handle_beatmap_background))
@@ -293,6 +339,7 @@ pub fn create_router_with(
     if enable_ws {
         router = router
             .route("/websocket/v2", get(handle_ws_upgrade))
+            .route("/websocket/v2/delta", get(handle_ws_upgrade_delta))
             .route("/websocket/v2/precise", get(handle_ws_upgrade_precise))
             // tosu's v1 socket, serving the same shape as `/json/v1`. The overlay
             // shim passes `/ws` straight through to here.
@@ -326,9 +373,9 @@ pub fn create_router_with(
         // `get(...)` because the two handlers have distinct `impl Future` return
         // types, which cannot be unified behind one call.
         router = if json_payload == JsonPayload::V2 {
-            router.route("/json", get(handle_json_v2))
+            router.route("/json", get(handle_json_v2).layer(CompressionLayer::new()))
         } else {
-            router.route("/json", get(handle_json_v1))
+            router.route("/json", get(handle_json_v1).layer(CompressionLayer::new()))
         };
     }
 
@@ -492,12 +539,19 @@ fn server_error(message: &str) -> Response {
         .into_response()
 }
 
+fn apply_ws_config(ws: WebSocketUpgrade, config: &WsConfig) -> WebSocketUpgrade {
+    ws.write_buffer_size(config.write_buffer_size)
+        .max_write_buffer_size(config.max_write_buffer_size)
+        .max_frame_size(config.max_frame_size)
+}
+
 /// Upgrade handler for the v1 socket, the tosu-compatible `/ws`.
 async fn handle_ws_upgrade_v1(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     tracing::debug!("Incoming v1 WebSocket upgrade request");
+    let ws = apply_ws_config(ws, &state.ws_config);
     ws.on_upgrade(move |socket| handle_ws_stream_v1(socket, state.packet_rx))
 }
 
@@ -893,6 +947,138 @@ async fn handle_restart(
         "note": "a new process is starting on this port; reload this page in a few seconds",
     }))
     .into_response()
+}
+
+#[derive(Deserialize)]
+struct LogViewQuery {
+    file: Option<String>,
+    name: Option<String>,
+    lines: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct LogDownloadQuery {
+    file: Option<String>,
+    name: Option<String>,
+}
+
+async fn handle_logs_list(State(state): State<AppState>) -> Response {
+    match crate::logging::list_log_files(&state.logs_dir) {
+        Ok(files) => Json(files).into_response(),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "error": err.to_string() }).to_string(),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_logs_view(
+    State(state): State<AppState>,
+    Query(query): Query<LogViewQuery>,
+) -> Response {
+    let filename = query.file.or(query.name).unwrap_or_default();
+    let max_lines = query.lines.map(|l| l.min(5000));
+    match crate::logging::read_log_file(&state.logs_dir, &filename, max_lines) {
+        Ok(content) => Json(content).into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            [(header::CONTENT_TYPE, "application/json")],
+            serde_json::json!({ "error": err.to_string() }).to_string(),
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_logs_download(
+    State(state): State<AppState>,
+    Query(query): Query<LogDownloadQuery>,
+) -> Response {
+    let filename = query.file.or(query.name).unwrap_or_default();
+    if filename.is_empty() || filename.contains('/') || filename.contains('\\') || filename.contains("..") {
+        return (StatusCode::BAD_REQUEST, "invalid file name").into_response();
+    }
+    let path = state.logs_dir.join(&filename);
+    match tokio::fs::read(&path).await {
+        Ok(bytes) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+                (
+                    header::CONTENT_DISPOSITION,
+                    &format!("attachment; filename=\"{}\"", filename),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => (StatusCode::NOT_FOUND, "log file not found").into_response(),
+    }
+}
+
+async fn handle_logs_tail() -> Sse<impl futures_util::Stream<Item = std::result::Result<Event, std::convert::Infallible>>> {
+    let rx = crate::logging::get_log_receiver();
+    let initial_entries = crate::logging::get_recent_logs(100);
+
+    let stream = futures_util::stream::unfold(
+        (initial_entries, rx),
+        |(mut initial, mut rx)| async move {
+            if !initial.is_empty() {
+                let entry = initial.remove(0);
+                let json = serde_json::to_string(&entry).unwrap_or_default();
+                let event = Event::default().event("init").data(json);
+                Some((Ok(event), (initial, rx)))
+            } else {
+                match rx.recv().await {
+                    Ok(entry) => {
+                        let json = serde_json::to_string(&entry).unwrap_or_default();
+                        let event = Event::default().event("log").data(json);
+                        Some((Ok(event), (initial, rx)))
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        let entry = crate::logging::LogEntry {
+                            timestamp: chrono::Local::now().to_rfc3339(),
+                            level: "WARN".to_string(),
+                            target: "rtosu::logging".to_string(),
+                            message: "Log buffer lagged; some live entries were skipped".to_string(),
+                            raw: "[WARN rtosu::logging: Log buffer lagged; some live entries were skipped]".to_string(),
+                        };
+                        let json = serde_json::to_string(&entry).unwrap_or_default();
+                        let event = Event::default().event("log").data(json);
+                        Some((Ok(event), (initial, rx)))
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+                }
+            }
+        },
+    );
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+async fn handle_logs_page(State(state): State<AppState>, peer: PeerAddress) -> Response {
+    let found = match state.overlays.as_ref() {
+        Some(store) => Some((store.list().await, store.root.clone())),
+        None => None,
+    };
+    let settings = state
+        .settings
+        .as_ref()
+        .map(|store| settings::settings_response(store, peer_is_loopback(peer)));
+    let overlays = found
+        .as_ref()
+        .map(|(overlays, root)| (overlays.as_slice(), root.as_path()));
+
+    let html = settings::logs_page_html(&settings::LandingView {
+        host: &state.bound_host,
+        port: state.bound_port,
+        config_path: state.settings.as_ref().map(|store| store.path()),
+        settings,
+        overlays,
+        can_restart: state.restart.is_some() && state.settings.is_some() && peer_is_loopback(peer),
+    });
+    text_response(html, "text/html; charset=utf-8")
 }
 
 /// Read a single value out of a raw query string.
@@ -1391,7 +1577,98 @@ async fn handle_ws_upgrade(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     tracing::debug!("Incoming WebSocket upgrade request");
+    let ws = apply_ws_config(ws, &state.ws_config);
     ws.on_upgrade(move |socket| handle_ws_stream(socket, state.packet_rx))
+}
+
+/// Upgrade handler for `/websocket/v2/delta`: sends RFC 7396 merge diffs to cut bandwidth.
+async fn handle_ws_upgrade_delta(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    tracing::debug!("Incoming delta WebSocket upgrade request");
+    let ws = apply_ws_config(ws, &state.ws_config);
+    ws.on_upgrade(move |socket| handle_ws_stream_delta(socket, state.packet_rx))
+}
+
+/// Stream RFC 7396 merge patches of the v2 payload.
+async fn handle_ws_stream_delta(
+    mut socket: WebSocket,
+    mut packet_rx: watch::Receiver<PublishedPacket>,
+) {
+    tracing::debug!("delta WebSocket client connected");
+    let mut prev_state: Option<serde_json::Value> = None;
+
+    // Send immediate initial state if attached
+    let (attached, packet, full_json) = {
+        let borrowed = packet_rx.borrow();
+        (borrowed.attached, borrowed.packet.clone(), borrowed.json.clone())
+    };
+
+    if attached {
+        if let Some(frame) = ws_text(full_json) {
+            if socket.send(frame).await.is_err() {
+                tracing::debug!("delta WebSocket client disconnected during initial handshake");
+                return;
+            }
+            if let Ok(curr_val) = serde_json::to_value(&*packet) {
+                prev_state = Some(curr_val);
+            }
+        }
+    }
+
+    loop {
+        tokio::select! {
+            biased;
+            inbound = socket.recv() => {
+                if !drain_inbound_frame(inbound, "/websocket/v2/delta") {
+                    break;
+                }
+            }
+            changed = packet_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let (attached, packet, full_json) = {
+                    let borrowed = packet_rx.borrow();
+                    (borrowed.attached, borrowed.packet.clone(), borrowed.json.clone())
+                };
+                if !attached {
+                    prev_state = None;
+                    continue;
+                }
+
+                let Ok(curr_val) = serde_json::to_value(&*packet) else {
+                    continue;
+                };
+
+                match &prev_state {
+                    None => {
+                        if let Some(frame) = ws_text(full_json) {
+                            if socket.send(frame).await.is_err() {
+                                break;
+                            }
+                        }
+                        prev_state = Some(curr_val);
+                    }
+                    Some(prev) => {
+                        if let Some(delta) = crate::v2::compute_json_delta(prev, &curr_val) {
+                            if let Ok(delta_bytes) = serde_json::to_vec(&delta) {
+                                if let Some(frame) = ws_text(Bytes::from(delta_bytes)) {
+                                    if socket.send(frame).await.is_err() {
+                                        break;
+                                    }
+                                }
+                            }
+                            prev_state = Some(curr_val);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    tracing::debug!("delta WebSocket client disconnected");
 }
 
 /// tosu's `/websocket/v2/precise`: the same three-key payload as
@@ -1409,6 +1686,7 @@ async fn handle_ws_upgrade_precise(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     tracing::debug!("Incoming precise WebSocket upgrade request");
+    let ws = apply_ws_config(ws, &state.ws_config);
     ws.on_upgrade(move |socket| handle_ws_stream_precise(socket, state.packet_rx))
 }
 
@@ -1526,6 +1804,7 @@ async fn handle_ws_upgrade_tokens(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
+    let ws = apply_ws_config(ws, &state.ws_config);
     ws.on_upgrade(move |socket| handle_ws_tokens(socket, state.packet_rx, TokensRoute::Sc))
 }
 
@@ -1540,6 +1819,7 @@ async fn handle_ws_upgrade_commands(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
+    let ws = apply_ws_config(ws, &state.ws_config);
     ws.on_upgrade(move |socket| handle_ws_tokens(socket, state.packet_rx, TokensRoute::Commands))
 }
 
@@ -1909,11 +2189,18 @@ pub async fn serve_with_listener(
     if let Some(store) = settings {
         // `local_addr` is the address actually bound, so a configured port of
         // `0` shows the port the OS picked rather than `0`.
-        state = state.with_settings(
-            store,
-            bound.map(|addr| addr.ip().to_string()).unwrap_or_default(),
-            bound.map(|addr| addr.port()).unwrap_or(0),
-        );
+        let cfg = store.config();
+        state = state
+            .with_settings(
+                store,
+                bound.map(|addr| addr.ip().to_string()).unwrap_or_default(),
+                bound.map(|addr| addr.port()).unwrap_or(0),
+            )
+            .with_ws_config(WsConfig {
+                write_buffer_size: cfg.server.ws_write_buffer_size,
+                max_write_buffer_size: cfg.server.ws_max_write_buffer_size,
+                max_frame_size: cfg.server.ws_max_frame_size,
+            });
     }
     let shutdown_restart = restart.clone();
     if let Some(signal) = restart {

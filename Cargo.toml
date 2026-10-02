@@ -1,6 +1,6 @@
 [package]
 name = "rtosu-dataprovider"
-version = "1.0.8"
+version = "1.0.9"
 edition = "2024"
 authors = ["Raregendary <raregendary@gmail.com>"]
 license = "MIT"
@@ -30,8 +30,9 @@ serde_json = { version = "1.0", features = ["raw_value"] }
 md-5 = "0.11"
 toml = "1.1"
 tokio = { version = "1", features = ["full"] }
+futures-util = "0.3"
 axum = { version = "0.8", features = ["ws"] }
-tower-http = { version = "0.7", features = ["cors"] }
+tower-http = { version = "0.7", features = ["cors", "compression-gzip", "compression-deflate"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

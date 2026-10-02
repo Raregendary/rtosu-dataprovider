@@ -18,6 +18,7 @@ pub mod tournament;
 pub mod v1;
 pub mod v2;
 pub mod ws_filters;
+pub mod schema_parity;
 
 #[cfg(feature = "instr")]
 pub mod instr;

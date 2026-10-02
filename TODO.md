@@ -158,3 +158,21 @@ Allow overlays, bots, and analytics tools written in Python, C#, or Go to levera
   - [x] Memory usage reduced to **~6–12 MB RAM**, CPU to **~0.1%–0.2%**.
 - [x] **6.3. Comprehensive Test Suite**:
   - [x] 22 passing unit tests covering serialization, addresses, mods, patterns, profiles, tournaments, and PP calculations.
+
+---
+
+## 🌟 Milestone 7: 1.0.9 Production Enhancements
+
+- [x] **7.1. Live Log Tail & Historical Log Viewer**:
+  - [x] Real-time SSE streaming via `GET /api/logs/tail` broadcasting non-ANSI log entries from `tracing`.
+  - [x] Collapsible dark terminal log console embedded in the settings landing page (`/`) with pop-out standalone page at `GET /logs`.
+  - [x] Historical log enumeration (`GET /api/logs`), slicing (`GET /api/logs/view`), and direct downloading (`GET /api/logs/download`).
+  - [x] Client-side level filtering, search filtering, copy last 50 lines, copy all matching lines, and auto-scroll locking.
+- [x] **7.2. Per-Socket Send Tuning & Delta Streaming**:
+  - [x] Configurable WebSocket write buffer sizes (`ws_write_buffer_size`, `ws_max_write_buffer_size`, `ws_max_frame_size`).
+  - [x] Opt-in RFC 7396 JSON merge diff WebSocket endpoint `WS /websocket/v2/delta`, cutting network traffic by ~95–99%.
+  - [x] HTTP response compression (gzip/deflate) on large JSON payloads (`/json/v2`, `/json/v2/precise`, `/json/v1`, `/json/sc`).
+- [x] **7.3. Schema-Level Parity Drift Detection**:
+  - [x] Recursive JSON schema validator (`src/schema_parity.rs`) checking keys and types across all 4 shapes against tosu on 24050 (ignoring `settings` in v2).
+  - [x] Automated integration test `tests/schema_parity.rs` in `cargo test`.
+  - [x] CLI subcommand `rtosu-dataprovider schema-check [--port 24050]`.

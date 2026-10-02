@@ -70,6 +70,13 @@ pub struct ServerConfig {
     /// socket from the host machine is still inside it, which is why the
     /// landing page must never be exposed beyond a trusted network.
     pub settings_write_local_only: bool,
+    /// WebSocket per-socket initial write buffer size in bytes (default: 64 KB).
+    pub ws_write_buffer_size: usize,
+    /// WebSocket per-socket max write buffer size in bytes (default: 512 KB).
+    /// Bounds backpressure memory for slow or congested clients.
+    pub ws_max_write_buffer_size: usize,
+    /// WebSocket per-socket max frame size in bytes (default: 16 MB).
+    pub ws_max_frame_size: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,6 +177,9 @@ impl Default for ServerConfig {
             // Local writes only. The default host is loopback anyway, so this
             // only has an effect once the operator publishes the port.
             settings_write_local_only: true,
+            ws_write_buffer_size: 64 * 1024,
+            ws_max_write_buffer_size: 512 * 1024,
+            ws_max_frame_size: 16 * 1024 * 1024,
         }
     }
 }
@@ -275,6 +285,26 @@ impl AppConfig {
             if self.server.overlays_dir.trim().is_empty() {
                 anyhow::bail!("server.overlays_dir must not be empty when overlays are enabled");
             }
+        }
+        if self.server.ws_write_buffer_size < 1024 || self.server.ws_write_buffer_size > 16 * 1024 * 1024 {
+            anyhow::bail!(
+                "server.ws_write_buffer_size must be between 1024 and 16777216 bytes (got {})",
+                self.server.ws_write_buffer_size
+            );
+        }
+        if self.server.ws_max_write_buffer_size < self.server.ws_write_buffer_size
+            || self.server.ws_max_write_buffer_size > 64 * 1024 * 1024
+        {
+            anyhow::bail!(
+                "server.ws_max_write_buffer_size must be >= ws_write_buffer_size and <= 67108864 bytes (got {})",
+                self.server.ws_max_write_buffer_size
+            );
+        }
+        if self.server.ws_max_frame_size < 1024 || self.server.ws_max_frame_size > 64 * 1024 * 1024 {
+            anyhow::bail!(
+                "server.ws_max_frame_size must be between 1024 and 67108864 bytes (got {})",
+                self.server.ws_max_frame_size
+            );
         }
         if self.poll.poll_rate_hz == 0 || self.poll.poll_rate_hz > MAX_POLL_RATE_HZ {
             anyhow::bail!(
@@ -568,6 +598,19 @@ overlays_dir = "browser_overlays"
 # the host machine is still inside it.
 # Default: true
 settings_write_local_only = true
+
+# WebSocket per-socket initial write buffer size in bytes.
+# Default: 65536 (64 KB)
+ws_write_buffer_size = 65536
+
+# WebSocket per-socket maximum write buffer size in bytes.
+# Caps outbound buffering for slow or congested clients.
+# Default: 524288 (512 KB)
+ws_max_write_buffer_size = 524288
+
+# WebSocket per-socket maximum frame size in bytes.
+# Default: 16777216 (16 MB)
+ws_max_frame_size = 16777216
 
 
 [poll]

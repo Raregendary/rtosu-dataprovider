@@ -10,6 +10,7 @@ use rtosu_dataprovider::process::{ProcessMemory, list_modules, list_processes, m
 use rtosu_dataprovider::profile::{available_profiles, load_profile};
 use rtosu_dataprovider::session::TournamentSession;
 use rtosu_dataprovider::tournament::read_tournament_state;
+use rtosu_dataprovider::OsuReader;
 use std::time::Duration;
 
 #[derive(Parser)]
@@ -89,6 +90,11 @@ enum Command {
     CompareTosu {
         #[arg(long, default_value = "http://127.0.0.1:24050/json/v2")]
         url: String,
+    },
+    /// Check schema-level parity against tosu across all 4 shapes (v1, v2, precise, sc).
+    SchemaCheck {
+        #[arg(long, default_value_t = 24050)]
+        port: u16,
     },
     Scan {
         pid: u32,
@@ -368,6 +374,9 @@ fn execute(
         }
         Command::CompareTosu { url } => {
             run_compare_tosu(&url, pointer_width)?;
+        }
+        Command::SchemaCheck { port } => {
+            run_schema_check(port)?;
         }
         Command::Scan {
             pid,
@@ -974,6 +983,37 @@ fn http_get_localhost(port: u16, path: &str) -> Result<String> {
         Ok(response_str[pos + 4..].to_string())
     } else {
         Ok(response_str.to_string())
+    }
+}
+
+fn run_schema_check(port: u16) -> Result<()> {
+    println!("Checking schema-level parity against tosu on port {port}...");
+    let mut reader = OsuReader::builder().build().context("building OsuReader")?;
+    let packet = reader.poll().context("polling osu! process")?;
+    if !reader.is_attached() {
+        bail!("osu! is not attached; start osu! to run schema drift validation");
+    }
+
+    let reports = rtosu_dataprovider::schema_parity::check_all_schemas(port, &packet)?;
+    let mut any_drift = false;
+    for report in reports {
+        println!("\n=== {} ===", report.endpoint);
+        if report.passed {
+            println!("  [PASS] 0 schema drifts. Perfect match with tosu.");
+        } else {
+            any_drift = true;
+            println!("  [FAIL] {} schema drift(s) detected:", report.drifts.len());
+            for d in report.drifts {
+                println!("    - [{:?}] {}: {}", d.kind, d.path, d.detail);
+            }
+        }
+    }
+
+    if any_drift {
+        bail!("Schema parity drift detected!");
+    } else {
+        println!("\nAll 4 payload schemas (/json/v2, /json/v2/precise, /json/v1, /json/sc) match tosu perfectly!");
+        Ok(())
     }
 }
 

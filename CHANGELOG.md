@@ -17,6 +17,27 @@ Two notes on how to read this file:
 ## [Unreleased]
 
 
+## [1.0.9] - 2026-10-01
+
+The 1.0.9 line.
+
+### Added
+
+* **Live log tail & historical log viewer** (`1.8` in `validations/ClineIdeas.md`):
+  * Real-time Server-Sent Events (SSE) streaming at `GET /api/logs/tail` broadcasting structured log entries directly from `tracing` without ANSI escapes.
+  * Collapsible dark terminal log console embedded directly in the settings landing page (`/`) with toggle view and pop-out link to a dedicated full-page log viewer at `GET /logs`.
+  * Historical log inspection via `GET /api/logs` (enumerating daily rolling log files `rtosu-YYYY-MM-DD.log` sorted newest first) and `GET /api/logs/view` with path-traversal protection and line limits.
+  * Direct log download at `GET /api/logs/download` and client-side download button for live buffer snapshots.
+  * Rich client controls: log level filter chips (`ALL`, `INFO`, `WARN`, `ERROR`, `DEBUG`), keyword/regex search filtering, copy last 50 lines to clipboard, copy all matching lines, buffer clear, and auto-scroll locking.
+* **Per-socket send tuning & delta mode** (`2.4` in `validations/ClineIdeas.md`):
+  * Configurable per-socket buffer and backpressure tuning via `server.ws_write_buffer_size` (default: 64 KB), `server.ws_max_write_buffer_size` (default: 512 KB), and `server.ws_max_frame_size` (default: 16 MB) in `config.toml` and the settings landing page.
+  * Opt-in RFC 7396 JSON merge patch WebSocket stream at `WS /websocket/v2/delta`: sends an initial full frame on connect/attach, followed only by compact diffs when state changes. Identical ticks emit 0 bytes, reducing bandwidth and Wi-Fi congestion by ~95–99% without requiring WebSocket deflate compression.
+  * Transparent HTTP response compression (`gzip` and `deflate`) on large JSON REST endpoints (`/json/v2`, `/json/v2/precise`, `/json/v1`, `/json/sc`, and `/json`) via `tower-http`.
+* **Schema-level parity drift detection** (`6.3` in `validations/ClineIdeas.md`):
+  * Recursive JSON schema comparison engine (`src/schema_parity.rs`) verifying keys, nesting, and type compatibility across all four payload shapes (`/json/v2`, `/json/v2/precise`, `/json/v1`, and `/json/sc`) against tosu on port 24050, explicitly ignoring `settings` under v2.
+  * Live test suite integration (`tests/schema_parity.rs`) executing as part of `cargo test` when tosu and osu! are active, reporting 0 schema drifts across all shapes.
+  * CLI verification command `rtosu-dataprovider schema-check [--port 24050]` for automated drift reports in CI and local setups.
+
 ## [1.0.8] - 2026-09-30
 
 The 1.0.8 line.
@@ -296,7 +317,8 @@ Initial release: a native Rust, tosu-compatible data provider for osu!.
   init`, and `config validate`.
 * Windows release packaging and CI (`.github/workflows/{ci,release}.yml`), tag-triggered.
 
-[Unreleased]: https://github.com/Raregendary/rtosu-dataprovider/compare/v1.0.8...HEAD
+[Unreleased]: https://github.com/Raregendary/rtosu-dataprovider/compare/v1.0.9...HEAD
+[1.0.9]: https://github.com/Raregendary/rtosu-dataprovider/compare/v1.0.8...v1.0.9
 [1.0.8]: https://github.com/Raregendary/rtosu-dataprovider/compare/v1.0.7...v1.0.8
 [1.0.7]: https://github.com/Raregendary/rtosu-dataprovider/compare/v1.0.6...v1.0.7
 [1.0.6]: https://github.com/Raregendary/rtosu-dataprovider/compare/v1.0.5...v1.0.6
