@@ -639,6 +639,11 @@ impl TournamentSession {
                         let mode = beatmap.as_ref().map_or(0, |b| b.mode.number);
                         let entries = crate::client::read_leaderboard(&client.memory, ruleset_addr, mode);
                         if !entries.is_empty() {
+                            tracing::info!(
+                                "Multiplayer lobby client (PID {}) provided {} leaderboard entries",
+                                client.pid,
+                                entries.len()
+                            );
                             new_leaderboard = Some(entries);
                         }
                     }
