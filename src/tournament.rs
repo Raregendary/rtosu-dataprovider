@@ -118,8 +118,11 @@ pub fn read_tournament_state(
         .read_pointer(field(ruleset_address, TEAM_RIGHT_POINTER_OFFSET)?)
         .unwrap_or(0);
 
-    if ipc_state == 0 && left_team_address == 0 && right_team_address == 0 {
-        bail!("process is not a tournament manager");
+    // In osu!tourney, IPC state is strictly 1 (Idle), 2 (Playing), 3 (Ranking), or 4.
+    // Regular osu! rulesets have arbitrary object pointers at these offsets (e.g. >100_000_000)
+    // and must never be misclassified as a tournament manager.
+    if !(1..=4).contains(&ipc_state) || (left_team_address == 0 && right_team_address == 0) {
+        bail!("process is not a tournament manager: invalid ipc_state {ipc_state}");
     }
 
     let (left_score, left_stars, first_team_name, left_finalized) = if left_team_address != 0 {
@@ -176,6 +179,13 @@ pub fn read_tournament_state(
     } else {
         (0, 0, String::new(), false, false, false, 0)
     };
+
+    if !(0..=30).contains(&best_of)
+        || !(0..=30).contains(&left_stars)
+        || !(0..=30).contains(&right_stars)
+    {
+        bail!("process is not a tournament manager: team properties out of range");
+    }
 
     Ok(TournamentState {
         ruleset_address,
