@@ -421,6 +421,27 @@ pub struct V1LeaderboardPlayer {
     pub is_passing: i32,
 }
 
+impl From<&crate::v2::LeaderboardEntry> for V1LeaderboardPlayer {
+    fn from(e: &crate::v2::LeaderboardEntry) -> Self {
+        Self {
+            name: e.name.clone(),
+            score: e.score,
+            combo: e.combo.current,
+            max_combo: e.combo.max,
+            mods: e.mods.name.clone(),
+            h300: e.hits.n300,
+            geki: e.hits.geki,
+            h100: e.hits.n100,
+            katu: e.hits.katu,
+            h50: e.hits.n50,
+            h0: e.hits.n0,
+            team: e.team,
+            position: e.position,
+            is_passing: if e.is_failed { 0 } else { 1 },
+        }
+    }
+}
+
 /// v1's `resultsScreen` is a different shape from v2's: the six legacy judgements
 /// sit at the top level rather than under `hits`, `maxCombo` and `mods` are split
 /// out, the grade key is `grade` where v2 says `rank`, and there is no `scoreId` or
@@ -851,10 +872,18 @@ impl GosuCompatibleApi {
                 // `validations/audits/audit-1.0.5.md` `B-02` is now closed rather than deferred.
                 key_overlay: V1KeyOverlay::from(&play.key_overlay),
                 leaderboard: V1Leaderboard {
-                    has_leaderboard: false,
-                    is_visible: false,
-                    ourplayer: V1LeaderboardPlayer::default(),
-                    slots: Vec::new(),
+                    has_leaderboard: !packet.leaderboard.is_empty(),
+                    is_visible: !packet.leaderboard.is_empty(),
+                    ourplayer: packet
+                        .leaderboard
+                        .first()
+                        .map(V1LeaderboardPlayer::from)
+                        .unwrap_or_default(),
+                    slots: packet
+                        .leaderboard
+                        .iter()
+                        .map(V1LeaderboardPlayer::from)
+                        .collect(),
                 },
                 // tosu declares this, initialises it false and never assigns it:
                 // the real read lands on `global.isReplayUiHidden`, and v1 reads the

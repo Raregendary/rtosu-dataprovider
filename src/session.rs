@@ -60,6 +60,7 @@ pub struct TournamentSnapshot {
     pub clients: Vec<TournamentClientView>,
     pub performance: crate::v2::PerformanceState,
     pub focused: bool,
+    pub leaderboard: Vec<crate::v2::LeaderboardEntry>,
 }
 
 pub struct CachedClientState {
@@ -157,6 +158,8 @@ pub struct TournamentSession {
     pub cached_stats_by_mods: HashMap<u32, crate::beatmap::BeatmapStats>,
     pub cached_accuracy: crate::v2::PerformanceAccuracy,
     pub cached_graph: crate::v2::PrecomputedGraph,
+    pub last_leaderboard_read: Instant,
+    pub cached_leaderboard: Vec<crate::v2::LeaderboardEntry>,
 }
 
 impl TournamentSession {
@@ -196,6 +199,8 @@ impl TournamentSession {
             cached_stats_by_mods: HashMap::new(),
             cached_accuracy: crate::v2::PerformanceAccuracy::default(),
             cached_graph: crate::v2::PrecomputedGraph::default(),
+            last_leaderboard_read: Instant::now() - LEADERBOARD_INTERVAL,
+            cached_leaderboard: Vec::new(),
         })
     }
 
@@ -303,6 +308,10 @@ impl TournamentSession {
         let mut game_time = 0;
         let mut spectator_views = Vec::new();
         let mut spectator_teams = HashMap::new();
+        let now = Instant::now();
+        let should_read_leaderboard =
+            now.duration_since(self.last_leaderboard_read) >= LEADERBOARD_INTERVAL;
+        let mut new_leaderboard = None;
 
         // Pre-pass: map spectator usernames to their assigned team for chat mapping
         for client in self.clients.values_mut() {
@@ -418,6 +427,8 @@ impl TournamentSession {
                 {
                     self.current_checksum = beatmap_ref.checksum.clone();
                     self.cached_stats_by_mods.clear();
+                    self.cached_leaderboard.clear();
+                    self.last_leaderboard_read = Instant::now() - LEADERBOARD_INTERVAL;
                     if let Some(beatmap_mut) = beatmap.as_mut() {
                         // Same contract as the solo path: the game's current
                         // ruleset is what `mode.number` holds until the file's
@@ -607,6 +618,30 @@ impl TournamentSession {
                     if root_beatmap.is_none() {
                         root_beatmap = beatmap.clone();
                     }
+                    continue;
+                }
+
+                if client.is_manager {
+                    continue;
+                }
+
+                // Non-manager osu! process without an ipc_id: this is an active Lobby /
+                // Referee osu! client joined in the multiplayer room alongside the tournament instances.
+                if game_folder.is_empty() {
+                    game_folder = client.game_folder.clone();
+                    songs_folder = client.songs_folder.clone();
+                }
+                if root_beatmap.is_none() {
+                    root_beatmap = beatmap.clone();
+                }
+                if should_read_leaderboard && new_leaderboard.is_none() {
+                    if let Some(ruleset_addr) = ruleset_addr {
+                        let mode = beatmap.as_ref().map_or(0, |b| b.mode.number);
+                        let entries = crate::client::read_leaderboard(&client.memory, ruleset_addr, mode);
+                        if !entries.is_empty() {
+                            new_leaderboard = Some(entries);
+                        }
+                    }
                 }
                 continue;
             }
@@ -669,6 +704,17 @@ impl TournamentSession {
                     )
                     .ok()
                 });
+                if should_read_leaderboard && new_leaderboard.is_none() {
+                    if let Some(ruleset) = ruleset_addr {
+                        let mode = gameplay
+                            .as_ref()
+                            .map_or_else(|| beatmap.as_ref().map_or(0, |b| b.mode.number), |g| g.mode);
+                        let entries = crate::client::read_leaderboard(&client.memory, ruleset, mode);
+                        if !entries.is_empty() {
+                            new_leaderboard = Some(entries);
+                        }
+                    }
+                }
                 if let Some(ref mut g) = gameplay {
                     let total_hits = (g.hit_300 + g.hit_100 + g.hit_50 + g.hit_miss) as u32;
                     client.cached_total_hits = total_hits;
@@ -856,6 +902,22 @@ impl TournamentSession {
             }
         }
 
+        if should_read_leaderboard {
+            self.last_leaderboard_read = now;
+            if let Some(lb) = new_leaderboard {
+                self.cached_leaderboard = lb;
+            } else {
+                let any_active = spectator_views.iter().any(|v| {
+                    v.gameplay.as_ref().map_or(false, |g| {
+                        g.combo > 0 || (g.hit_300 + g.hit_100 + g.hit_50 + g.hit_miss) > 0
+                    })
+                });
+                if !any_active {
+                    self.cached_leaderboard.clear();
+                }
+            }
+        }
+
         // Sort spectator views strictly by ipc_id
         spectator_views.sort_by_key(|c| c.ipc_id);
 
@@ -988,6 +1050,7 @@ impl TournamentSession {
                 graph: self.cached_graph.clone(),
             },
             focused,
+            leaderboard: self.cached_leaderboard.clone(),
         })
     }
 

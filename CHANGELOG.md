@@ -14,8 +14,19 @@ Two notes on how to read this file:
   commit-by-commit log. From `1.0.8` onward, each release section is written as the work
   lands (see `1.0.8-updateplan.md` §1.3).
 
-## [Unreleased]
+## [1.0.10] - 2026-10-17
 
+The 1.0.10 line.
+
+### Added
+
+* **Multiplayer Lobby Leaderboard in Tournament Mode**:
+  * Added live multiplayer room scoreboard extraction during tournament mode. When running `osu!tourney` with a limited number of visual spectator clients (e.g. 2 or 8 spectator windows in a cup/battle royale), `rtosu` now reads the full lobby scoreboard containing all 12–16 players in the match.
+  * Automatic Lobby/Referee client detection: If an `osu!.exe` instance is running in the room alongside the tournament instances (neither the manager nor carrying an IPC ID), `TournamentSession` reads its live in-game multiplayer scoreboard.
+  * Spectator fallback: If no separate lobby client is detected, `TournamentSession` automatically falls back to inspecting the spectator clients' in-game leaderboard.
+  * Rate-limited to 1 Hz (`LEADERBOARD_INTERVAL = 1s`) to protect system performance and avoid syscall storms across multiple attached processes.
+  * Automatically resets and backdates the read timer on map checksum changes so new plays populate immediately.
+  * Populates `packet.leaderboard` in v2 JSON/WebSocket payloads, and maps into `gameplay.leaderboard` in v1 payloads (`hasLeaderboard`, `isVisible`, `ourplayer`, `slots`).
 
 ## [1.0.9] - 2026-10-02
 

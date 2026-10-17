@@ -427,6 +427,7 @@ pub fn format_tourney_packet(
             number: 22,
             name: "tourney".to_string(),
         },
+        leaderboard: snap.leaderboard.clone(),
         ..Default::default()
     };
 
@@ -1138,6 +1139,7 @@ mod tests {
             clients,
             performance: Default::default(),
             focused: false,
+            leaderboard: Vec::new(),
         }
     }
 
@@ -1250,5 +1252,38 @@ mod tests {
         assert_eq!(packet.tourney.clients[0].play.score, 0);
         assert_eq!(packet.tourney.total_score.left, 0);
         assert_eq!(packet.tourney.total_score.right, 1_000_000);
+    }
+
+    #[test]
+    fn tournament_packet_propagates_leaderboard() {
+        let clients = vec![tourney_client(0, "left", 0, 100_000)];
+        let mut snap = tourney_snapshot(clients, manager(100_000, 0));
+        snap.leaderboard = vec![
+            crate::v2::LeaderboardEntry {
+                name: "Player1".to_string(),
+                score: 500_000,
+                position: 1,
+                team: 1,
+                ..Default::default()
+            },
+            crate::v2::LeaderboardEntry {
+                name: "Player2".to_string(),
+                score: 450_000,
+                position: 2,
+                team: 2,
+                ..Default::default()
+            },
+        ];
+
+        let packet = format_tourney_packet(&snap, true, &multipliers(&[]));
+        assert_eq!(packet.leaderboard.len(), 2);
+        assert_eq!(packet.leaderboard[0].name, "Player1");
+        assert_eq!(packet.leaderboard[1].name, "Player2");
+
+        let v1_packet = crate::v1::GosuCompatibleApi::from_v2(&packet);
+        assert!(v1_packet.gameplay.leaderboard.has_leaderboard);
+        assert_eq!(v1_packet.gameplay.leaderboard.slots.len(), 2);
+        assert_eq!(v1_packet.gameplay.leaderboard.slots[0].name, "Player1");
+        assert_eq!(v1_packet.gameplay.leaderboard.slots[1].name, "Player2");
     }
 }
