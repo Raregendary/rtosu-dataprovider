@@ -206,6 +206,13 @@ pub const FIELD_SPECS: &[FieldSpec] = &[
         "Auto-detect single-player / tournament",
         true,
     ),
+    number(
+        "poll.leaderboard_interval_ms",
+        "Leaderboard poll interval (ms)",
+        10.0,
+        5000.0,
+        false,
+    ),
     toggle("features.enable_chat", "Tournament chat attribution", false),
     toggle("features.enable_pp", "Real-time PP calculation", false),
     toggle("features.ignore_nf_for_pp", "Ignore NoFail for PP", false),
@@ -251,6 +258,7 @@ pub fn restart_required_keys() -> Vec<&'static str> {
 #[derive(Clone, Debug)]
 pub struct LiveSettings {
     pub poll_interval: Duration,
+    pub leaderboard_interval: Duration,
     pub enable_pp: bool,
     pub enable_hit_errors: bool,
     pub enable_chat: bool,
@@ -263,6 +271,7 @@ impl LiveSettings {
     pub fn from_config(config: &AppConfig) -> Result<Self> {
         Ok(Self {
             poll_interval: Duration::from_millis(config.poll_interval_ms()),
+            leaderboard_interval: Duration::from_millis(config.poll.leaderboard_interval_ms),
             enable_pp: config.features.enable_pp,
             enable_hit_errors: config.features.enable_hit_errors,
             enable_chat: config.features.enable_chat,

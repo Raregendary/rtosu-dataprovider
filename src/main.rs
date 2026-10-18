@@ -839,6 +839,7 @@ async fn run_serve_loop(
         .opt_pointer_width(pointer_width)
         .scan_limit_bytes(limit)
         .poll_interval(interval)
+        .leaderboard_interval(Duration::from_millis(config.poll.leaderboard_interval_ms))
         .build()?;
 
     // Optional phase-instrumentation dump (build with --features instr and set

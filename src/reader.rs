@@ -21,6 +21,7 @@ pub struct OsuReaderBuilder {
     scan_limit_bytes: usize,
     poll_interval: Duration,
     proc_check_interval: Duration,
+    leaderboard_interval: Duration,
     mode: OsuReaderMode,
     enable_pp: bool,
     enable_hit_errors: bool,
@@ -38,6 +39,7 @@ impl Default for OsuReaderBuilder {
             scan_limit_bytes: 128 * 1024 * 1024,
             poll_interval: Duration::from_millis(16),
             proc_check_interval: Duration::from_millis(1500),
+            leaderboard_interval: Duration::from_millis(100),
             mode: OsuReaderMode::Auto,
             enable_pp: true,
             enable_hit_errors: true,
@@ -91,6 +93,11 @@ impl OsuReaderBuilder {
 
     pub fn proc_check_interval(mut self, interval: Duration) -> Self {
         self.proc_check_interval = interval;
+        self
+    }
+
+    pub fn leaderboard_interval(mut self, interval: Duration) -> Self {
+        self.leaderboard_interval = interval;
         self
     }
 
@@ -174,6 +181,7 @@ impl OsuReader {
         solo_session.enable_hit_errors = builder.enable_hit_errors;
         solo_session.mod_multipliers = builder.mod_multipliers.clone();
         solo_session.ignore_nf_for_pp = builder.ignore_nf_for_pp;
+        solo_session.leaderboard_interval = builder.leaderboard_interval;
 
         let mut tourney_session = TournamentSession::new(
             &builder.tournament_profile,
@@ -185,6 +193,7 @@ impl OsuReader {
         tourney_session.enable_hit_errors = builder.enable_hit_errors;
         tourney_session.mod_multipliers = builder.mod_multipliers.clone();
         tourney_session.ignore_nf_for_pp = builder.ignore_nf_for_pp;
+        tourney_session.leaderboard_interval = builder.leaderboard_interval;
 
         let mut reader = Self {
             builder,
@@ -379,7 +388,15 @@ impl OsuReader {
         self.set_enable_chat(live.enable_chat);
         self.set_ignore_nf_for_pp(live.ignore_nf_for_pp);
         self.set_mod_multipliers((*live.mod_multipliers).clone());
+        self.set_leaderboard_interval(live.leaderboard_interval);
         self.builder.poll_interval = live.poll_interval;
+    }
+
+    /// Set leaderboard polling interval.
+    pub fn set_leaderboard_interval(&mut self, interval: Duration) {
+        self.builder.leaderboard_interval = interval;
+        self.solo_session.leaderboard_interval = interval;
+        self.tourney_session.leaderboard_interval = interval;
     }
 
     pub fn into_stream(self) -> OsuReaderStream {

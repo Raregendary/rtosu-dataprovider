@@ -159,6 +159,7 @@ pub struct TournamentSession {
     pub cached_graph: crate::v2::PrecomputedGraph,
     pub last_leaderboard_read: Instant,
     pub cached_leaderboard: Vec<crate::v2::LeaderboardEntry>,
+    pub leaderboard_interval: Duration,
 }
 
 impl TournamentSession {
@@ -200,6 +201,7 @@ impl TournamentSession {
             cached_graph: crate::v2::PrecomputedGraph::default(),
             last_leaderboard_read: Instant::now() - LEADERBOARD_INTERVAL,
             cached_leaderboard: Vec::new(),
+            leaderboard_interval: LEADERBOARD_INTERVAL,
         })
     }
 
@@ -309,7 +311,7 @@ impl TournamentSession {
         let mut spectator_teams = HashMap::new();
         let now = Instant::now();
         let should_read_leaderboard =
-            now.duration_since(self.last_leaderboard_read) >= LEADERBOARD_INTERVAL;
+            now.duration_since(self.last_leaderboard_read) >= self.leaderboard_interval;
         let mut new_leaderboard = None;
 
         // Pre-pass: map spectator usernames to their assigned team for chat mapping
@@ -427,7 +429,7 @@ impl TournamentSession {
                     self.current_checksum = beatmap_ref.checksum.clone();
                     self.cached_stats_by_mods.clear();
                     self.cached_leaderboard.clear();
-                    self.last_leaderboard_read = Instant::now() - LEADERBOARD_INTERVAL;
+                    self.last_leaderboard_read = Instant::now() - self.leaderboard_interval;
                     if let Some(beatmap_mut) = beatmap.as_mut() {
                         // Same contract as the solo path: the game's current
                         // ruleset is what `mode.number` holds until the file's
@@ -1513,6 +1515,7 @@ pub struct SoloSession {
     last_scan_attempt: Instant,
     /// When the score list was last walked. See the read site in `poll`.
     last_leaderboard_read: Instant,
+    pub leaderboard_interval: Duration,
     pub cached_packet: crate::v2::TosuV2Packet,
     pub enable_pp: bool,
     pub enable_hit_errors: bool,
@@ -1724,6 +1727,7 @@ impl SoloSession {
             // Backdated so the first tick in a play reads the list immediately
             // rather than waiting out the interval on an empty leaderboard.
             last_leaderboard_read: Instant::now() - Duration::from_secs(10),
+            leaderboard_interval: LEADERBOARD_INTERVAL,
             cached_packet: crate::v2::TosuV2Packet {
                 profile: guest_profile_state(),
                 ..Default::default()
@@ -2006,7 +2010,7 @@ impl SoloSession {
             // The cached list went with the rest of the play state, so the next
             // play must not have to wait out the leaderboard interval to refill it.
             // (`Instant::now()` rather than the loop's `now`, which is bound later.)
-            self.last_leaderboard_read = Instant::now() - LEADERBOARD_INTERVAL;
+            self.last_leaderboard_read = Instant::now() - self.leaderboard_interval;
             #[cfg(feature = "pp")]
             {
                 self.cached_gameplay_hits = (0, 0, 0, 0, 0, 0);
@@ -2198,7 +2202,7 @@ impl SoloSession {
                                     // As above: a freshly loaded map starts with an
                                     // empty leaderboard, so read it on the first tick.
                                     self.last_leaderboard_read =
-                                        Instant::now() - LEADERBOARD_INTERVAL;
+                                        Instant::now() - self.leaderboard_interval;
                                     #[cfg(feature = "pp")]
                                     {
                                         self.cached_gameplay_hits = (0, 0, 0, 0, 0, 0);
@@ -2563,7 +2567,7 @@ impl SoloSession {
                     // A new map is not on that clock -- `clear_play_state_for_new_map`
                     // empties the cached list, so the timer is backdated there and
                     // the first tick of a new play reads it immediately.
-                    if now.duration_since(self.last_leaderboard_read) >= LEADERBOARD_INTERVAL {
+                    if now.duration_since(self.last_leaderboard_read) >= self.leaderboard_interval {
                         self.last_leaderboard_read = now;
                         self.cached_packet.leaderboard =
                             crate::client::read_leaderboard(memory, ruleset_addr, g.mode);

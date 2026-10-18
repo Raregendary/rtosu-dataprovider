@@ -99,6 +99,12 @@ default_profile = "tournament"
 # Default: true
 auto_mode = true
 
+# Leaderboard polling interval in milliseconds.
+# Controls how often the in-game scoreboard is re-read during gameplay.
+# Default: 100 (10 Hz)
+# Range: 10 to 5000 ms
+leaderboard_interval_ms = 100
+
 
 [features]
 # Extract and parse multiplayer tournament chat logs from memory.

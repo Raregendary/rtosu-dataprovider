@@ -99,6 +99,8 @@ pub struct PollConfig {
     pub default_profile: String,
     /// Automatically switch between Tournament mode and Single-Player mode based on running osu! processes
     pub auto_mode: bool,
+    /// How often the in-game multiplayer/solo leaderboard is polled in milliseconds (default: 100 ms, min: 10 ms, max: 5000 ms)
+    pub leaderboard_interval_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,6 +193,7 @@ impl Default for PollConfig {
             scan_budget_mb: 128,
             default_profile: "tournament".to_string(),
             auto_mode: true,
+            leaderboard_interval_ms: 100,
         }
     }
 }
@@ -319,6 +322,12 @@ impl AppConfig {
             anyhow::bail!(
                 "poll.scan_budget_mb must be between 16 and 2048 MB (got {})",
                 self.poll.scan_budget_mb
+            );
+        }
+        if self.poll.leaderboard_interval_ms < 10 || self.poll.leaderboard_interval_ms > 5000 {
+            anyhow::bail!(
+                "poll.leaderboard_interval_ms must be between 10 and 5000 ms (got {})",
+                self.poll.leaderboard_interval_ms
             );
         }
         if self.logging.max_log_files == 0 || self.logging.max_log_files > 365 {
@@ -642,6 +651,12 @@ default_profile = "tournament"
 # will only read tournament spectator/manager clients and ignore any background solo osu!).
 # Default: true
 auto_mode = true
+
+# Leaderboard polling interval in milliseconds.
+# Controls how often the in-game scoreboard is re-read during gameplay.
+# Default: 100 (10 Hz)
+# Range: 10 to 5000 ms
+leaderboard_interval_ms = 100
 
 
 [features]
