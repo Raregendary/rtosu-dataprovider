@@ -18,12 +18,11 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[cfg(feature = "pp")]
 use crate::client::mod_bits;
 
-/// How often the in-game score list is re-walked during a play.
+/// How often the in-game score list is re-walked during a play (100ms = 10 Hz).
 ///
-/// The list only changes when a score is actually submitted or the player's own
-/// row moves, so reading it on the poll tick spends kernel transitions on data
-/// that has not changed. A second is well inside what an overlay can show.
-const LEADERBOARD_INTERVAL: Duration = Duration::from_secs(1);
+/// In multiplayer lobbies, player scores and ranks update continuously on note hits,
+/// so a 100ms (10 Hz) rate provides smooth, responsive overlay animations matching tosu.
+const LEADERBOARD_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The inputs a tournament client's live PP was computed from: the raw mod bits,
 /// the five judgement numbers, and the hit total the difficulty curve is
@@ -639,7 +638,7 @@ impl TournamentSession {
                         let mode = beatmap.as_ref().map_or(0, |b| b.mode.number);
                         let entries = crate::client::read_leaderboard(&client.memory, ruleset_addr, mode);
                         if !entries.is_empty() {
-                            tracing::info!(
+                            tracing::debug!(
                                 "Multiplayer lobby client (PID {}) provided {} leaderboard entries",
                                 client.pid,
                                 entries.len()
@@ -3091,23 +3090,20 @@ mod tests {
     use crate::v2::TosuV2Packet;
     use std::time::{Duration, Instant};
 
-    /// The score list is walked on a 1 Hz timer rather than on every tick.
+    /// The score list is walked on a 10 Hz (100ms) timer rather than on every tick.
     ///
-    /// This is a rate limit, not a cache of a fixed size, so the property worth
-    /// pinning is the interval itself: a second is long enough to collapse the
-    /// 60 reads a second into one, and short enough that a score moving up the
-    /// board is not visibly stale. A regression to "every tick" (the bug this
-    /// replaced) or to something coarser than a second would both be wrong.
+    /// This matches tosu's default polling rate, ensuring smooth realtime score and
+    /// rank transitions for tournament overlays.
     #[test]
-    fn the_leaderboard_is_re_read_on_a_one_second_timer() {
+    fn the_leaderboard_is_re_read_on_a_hundred_millisecond_timer() {
         assert_eq!(
             LEADERBOARD_INTERVAL,
-            Duration::from_secs(1),
-            "the score list is re-walked at 1 Hz"
+            Duration::from_millis(100),
+            "the score list is re-walked at 10 Hz (100ms)"
         );
         // The backdating the two reset sites rely on: subtracting the interval
         // must make the very next read due, or a freshly loaded map would sit
-        // with an empty leaderboard for up to a second.
+        // with an empty leaderboard for up to an interval.
         let just_reset = Instant::now() - LEADERBOARD_INTERVAL;
         assert!(
             just_reset.elapsed() >= LEADERBOARD_INTERVAL,
