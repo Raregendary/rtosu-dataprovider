@@ -14,7 +14,7 @@ Two notes on how to read this file:
   commit-by-commit log. From `1.0.8` onward, each release section is written as the work
   lands (see `1.0.8-updateplan.md` §1.3).
 
-## [1.0.10] - 2026-10-17
+## [1.0.10] - 2026-10-18
 
 The 1.0.10 line.
 
